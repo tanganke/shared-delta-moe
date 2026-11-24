@@ -173,6 +173,10 @@ class DareDeltaMoE(DeltaMoE):
     def d_down(self) -> Tensor:  # type: ignore[override]
         return self._delta(2)
 
+    def _use_triton(self, x: Tensor) -> bool:
+        # the kernel's K tile and the block must divide one another; tiles are powers of 2
+        return self.block & (self.block - 1) == 0 and super()._use_triton(x)
+
     def _kernel_deltas(self) -> "tuple[Delta, Delta, Delta]":
         from ..triton_kernels import Delta
 

@@ -279,40 +279,23 @@ class DeltaMoE(nn.Module):
             and x.shape[0] * self.top_k >= GROUPED_MIN_PAIRS
         )
 
-    def _needs_grad(self, x: Tokens) -> bool:
-        return torch.is_grad_enabled() and (x.requires_grad or any(p.requires_grad for p in self.parameters()))
-
     def _use_triton(self, x: Tokens) -> bool:
-        """Fused Triton kernels? Triton, CUDA and a TRITON_DTYPES dtype; without gradients also a (token, slot) pair
-        count within TRITON_MIN_PAIRS .. TRITON_MAX_PAIRS_{HOPPER,OLDER} (with gradients always: the autograd
-        path saves no materialised weights)."""
-        if not (HAS_TRITON and x.is_cuda and x.dtype in TRITON_DTYPES):
+        """Fused Triton forward? Triton, CUDA, a TRITON_DTYPES dtype, no gradient needed (it is forward-only; the
+        materialised path is the faster one to train through anyway) and TRITON_MIN_PAIRS .. TRITON_MAX_PAIRS_*
+        (token, slot) pairs."""
+        if not (HAS_TRITON and x.is_cuda and x.dtype in TRITON_DTYPES and self.gate.dtype == x.dtype):
+            return False  # (weights in another dtype: e.g. an fp32 model under bf16 autocast)
+        if torch.is_grad_enabled() and (x.requires_grad or any(p.requires_grad for p in self.parameters())):
             return False
-        if self._needs_grad(x):  # weight gradients use F.grouped_mm
-            return hasattr(F, "grouped_mm") or not any(
-                p.requires_grad for n, p in self.named_parameters() if n != "router.weight"
-            )
         hopper = torch.cuda.get_device_capability(x.device) >= (9, 0)
         limit = TRITON_MAX_PAIRS_HOPPER if hopper else TRITON_MAX_PAIRS_OLDER
         return TRITON_MIN_PAIRS <= x.shape[0] * self.top_k <= limit
 
-    def _forward_param_autograd(self, x: Tokens) -> Tokens:
-        """Differentiable fused parameter aggregation (triton_kernels/train.py): the routing runs in torch autograd
-        (the router gets its gradient through the routing weights), the MoE in one autograd.Function that saves only
-        its inputs and recomputes the rest in backward. Gradients to x, the routing weights and any weight that
-        requires grad; top-k up to every expert. DARE deltas are used unpacked (dense)."""
-        from ..triton_kernels.train import fused_moe_autograd
-
-        idx, r = self.topk(x)
-        return fused_moe_autograd(x, idx, r, (self.gate, self.up, self.down),
-                                  (self.d_gate, self.d_up, self.d_down), self.n_delta)  # fmt: skip
-
     def forward_param(self, x: Tokens) -> Tokens:
-        """Parameter aggregation: the fused Triton kernels when _use_triton (differentiable when a gradient is
-        needed), else materialised W_b + Delta_e (experts with fewer than PARAM_MIN_ROWS routed rows skip the
-        materialisation)."""
+        """Parameter aggregation: the fused Triton forward when _use_triton, else materialised W_b + Delta_e
+        (experts with fewer than PARAM_MIN_ROWS routed rows skip the materialisation; differentiable)."""
         if self._use_triton(x):
-            return self._forward_param_autograd(x) if self._needs_grad(x) else self._forward_param_triton(x)
+            return self._forward_param_triton(x)
         return self._forward_param(x, min_rows=PARAM_MIN_ROWS)
 
     def forward_matrix(self, x: Tokens) -> Tokens:

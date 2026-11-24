@@ -176,15 +176,15 @@ def _smem_limit(t: Tensor) -> int:
     return torch.cuda.get_device_properties(t.device).shared_memory_per_block_optin
 
 
-def _fit(c: triton.Config, tiles: int, limit: int, rows: int = 1, tma: bool = False) -> triton.Config | None:
-    """c with fewer pipeline stages if its (stages - 1) * (rows * BM + tiles * BN) * BK bf16 buffers exceed the
-    shared memory limit (rows / tiles: activation / weight tiles per K step); None if even 2 stages do not fit, or
+def _fit(c: triton.Config, tiles: int, limit: int, tma: bool = False) -> triton.Config | None:
+    """c with fewer pipeline stages if its (stages - 1) * (BM + tiles * BN) * BK bf16 buffers exceed the shared
+    memory limit (tiles: weight tiles per K step); None if even 2 stages do not fit, or
     if c's weight box is 256 wide under TMA."""
     # ponytail: Triton 3.7.1 on H200 gives wrong results with a 256-row TMA box (down, BN 256: rel err 0.3, pointer
     # loads fine); those configs are left out under TMA until a Triton release fixes it
     if tma and c.kwargs["BN"] > 128:
         return None
-    per = (rows * c.kwargs["BM"] + tiles * c.kwargs["BN"]) * c.kwargs["BK"] * 2
+    per = (c.kwargs["BM"] + tiles * c.kwargs["BN"]) * c.kwargs["BK"] * 2
     st = min(c.num_stages, limit // per + 1)
     if st < 2:
         return None
@@ -362,20 +362,22 @@ def _split_k(P: int, G: int, N: int, K: int, sms: int, d: Delta) -> int:
     """Split K when there are too few output tiles to occupy the SMs (decode with one or two tokens); dense only."""
     if d.mode != 0:
         return 1
-    tiles, s = min(P, G + 1) * triton.cdiv(N, 64), 1
+    tiles, s = min(P, G + 1 + triton.cdiv(P, 64)) * triton.cdiv(N, 64), 1  # row tiles (64 rows) x column tiles
     while s < 8 and tiles * s < sms and K // (2 * s) >= 1024:
         s *= 2
     return s
 
 
 TMA = os.environ.get("SHARED_DELTA_MOE_TMA", "1") != "0"  # "0": pointer loads on Hopper too (for comparison)
+TMA_MIN_PAIRS = 256  # H200: pointer loads win below (1 token: 0.18 vs 0.27 ms), TMA above (8192: 3.26 vs 3.49 ms)
 
 
-def _tma(*ts: Tensor) -> bool:
-    """TMA descriptors on Hopper and newer, for tensors TMA can address: 16-byte aligned base and strides,
-    contiguous last dimension, no empty dimension."""
+def _tma(P: int, *ts: Tensor) -> bool:
+    """TMA descriptors on Hopper and newer from TMA_MIN_PAIRS pairs (below, building the descriptors costs more than
+    TMA saves), for tensors TMA can address: 16-byte aligned base and strides, contiguous last dimension, no empty
+    dimension."""
     t0 = ts[0]
-    if not (TMA and t0.is_cuda and torch.cuda.get_device_capability(t0.device) >= (9, 0)):
+    if not (TMA and P >= TMA_MIN_PAIRS and t0.is_cuda and torch.cuda.get_device_capability(t0.device) >= (9, 0)):
         return False
     return all(
         t.data_ptr() % 16 == 0 and t.stride(-1) == 1 and all(s * t.element_size() % 16 == 0 for s in t.stride()[:-1])
@@ -399,9 +401,9 @@ def _launch(kernel, grid, config: triton.Config | None, *args, **kw):
     return _launch_fixed(kernel, grid, config, 4 if kernel is _gate_up_kernel else 2, args, kw)
 
 
-def _launch_fixed(kernel, grid, config: triton.Config, tiles: int, args: tuple, kw: dict, rows: int = 1):
-    """One config, its pipeline depth fitted to shared memory (rows / tiles: see _fit)."""
-    fitted = _fit(config, tiles, _smem_limit(args[0]), rows, kw.get("TMA", False))
+def _launch_fixed(kernel, grid, config: triton.Config, tiles: int, args: tuple, kw: dict):
+    """One config, its pipeline depth fitted to shared memory (tiles: see _fit)."""
+    fitted = _fit(config, tiles, _smem_limit(args[0]), kw.get("TMA", False))
     if fitted is None:
         raise ValueError(f"config does not fit (shared memory, or a 256-wide TMA box): {config}")
     meta = fitted.all_kwargs()
@@ -415,7 +417,7 @@ def gate_up(x: Tensor, r: Routing, wg: Tensor, wu: Tensor, dg: Delta, du: Delta,
     P, (N, K), G = r.perm.numel(), wg.shape, r.n_delta
     h = torch.empty(P, N, dtype=x.dtype, device=x.device)
     grid, _ = _grid(x.device, P, G, N, 1)
-    tma = _tma(wg, wu, *((dg.d, du.d) if dg.mode == 0 else ()))
+    tma = dg.mode == 0 and _tma(P, wg, wu, dg.d, du.d)  # DARE: pointer loads (TMA on W_b alone: 2.3x slower, H200)
     descs = (_desc(wg), _desc(wu), *((_desc(dg.d), _desc(du.d)) if dg.mode == 0 else (None, None))) if tma else (None,) * 4
     with torch.cuda.device(x.device):
         _launch(_gate_up_kernel, grid, config,
@@ -435,7 +437,7 @@ def down(h: Tensor, r: Routing, w: Tensor, d: Delta, config: triton.Config | Non
     assert S == 1 or d.mode == 0, "DARE rows are read from their start: no split-K"
     grid, _ = _grid(h.device, P, G, N, S)
     o = torch.empty(P, N, dtype=h.dtype, device=h.device) if S == 1 else torch.zeros(T, N, dtype=torch.float32, device=h.device)
-    tma = _tma(h, w, *((d.d,) if d.mode == 0 else ()))
+    tma = d.mode == 0 and _tma(P, h, w, d.d)
     descs = (_desc(h), _desc(w), _desc(d.d) if d.mode == 0 else None) if tma else (None,) * 3
     with torch.cuda.device(h.device):
         _launch(_down_kernel, grid, config,
@@ -454,7 +456,7 @@ def fused_moe(x: Tensor, idx: Tensor, rw: Tensor, n_delta: int, base: tuple[Tens
     """Parameter-aggregation MoE forward: x (T, H); idx / rw (T, k) expert and routing weight per slot (>= n_delta:
     a zero expert); base = (W_g, W_u, W_d)."""
     if x.shape[0] == 0:
-        return torch.empty_like(x)
+        return x.new_empty(x.shape)
     r = route(idx, rw, n_delta)
     return down(gate_up(x, r, base[0], base[1], deltas[0], deltas[1]), r, base[2], deltas[2])
 
@@ -481,12 +483,12 @@ def fused_moe_dare(x: Tensor, idx: Tensor, rw: Tensor, wg: Tensor, wu: Tensor, w
 
 @fused_moe_dense.register_fake
 def _(x, *args, **kwargs):
-    return torch.empty_like(x)
+    return x.new_empty(x.shape)  # contiguous, as the op returns (empty_like would keep x's strides)
 
 
 @fused_moe_dare.register_fake
 def _(x, *args, **kwargs):
-    return torch.empty_like(x)
+    return x.new_empty(x.shape)
 
 
 def fused_moe_any(x: Tensor, idx: Tensor, rw: Tensor, n_delta: int, base: tuple[Tensor, Tensor, Tensor],
@@ -494,6 +496,7 @@ def fused_moe_any(x: Tensor, idx: Tensor, rw: Tensor, n_delta: int, base: tuple[
     """fused_moe, through the registered op while torch.compile traces."""
     if not torch.compiler.is_compiling():
         return fused_moe(x, idx, rw, n_delta, base, deltas)
+    x = x.contiguous()  # Inductor may hand the op another layout of x than the one it traced
     if deltas[0].mode == 0:
         return fused_moe_dense(x, idx, rw, *base, *(d.d for d in deltas), n_delta)
     d0 = deltas[0]

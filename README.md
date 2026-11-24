@@ -5,9 +5,8 @@ A small Python library: a top-k SwiGLU MoE written as **a shared base expert plu
 ```
 src/shared_delta_moe/models/delta_moe.py  DeltaMoE: from_experts, routing, the forward implementations
 src/shared_delta_moe/ops.py               stateless helpers: mlp, grouping routed rows, one grouped GEMM
-src/shared_delta_moe/triton_kernels/      fused Triton kernels: delta_gmm.py (grouped GEMM over W_b + Delta_g, the sum
-                                          formed in registers), dare_gmm.py (the same with seeded-DARE deltas),
-                                          configs.py (shared autotune configs)
+src/shared_delta_moe/triton_kernels/      fused.py: the fused parameter-aggregation forward (sort, gate_up + SiLU,
+                                          down + routing weight; dense or seeded-DARE deltas; Hopper TMA)
 src/shared_delta_moe/models/dare.py       seeded DARE: Philox mask, pack/unpack, DareDeltaMoE
 src/shared_delta_moe/models/qwen3_5/qwen3_5_delta_moe/
                                           transformers' Qwen3.5 MoE with DeltaMoE blocks (forward_param): modeling.py
@@ -19,6 +18,8 @@ src/shared_delta_moe/testing.py           random_experts for tests and benchmark
 tests/test_delta_moe.py                   every forward == plain MoE, token by token (Triton part needs CUDA)
 tests/test_dare.py                        Philox known-answer, CPU == CUDA == Triton masks, DARE forwards
 tests/test_qwen3_5_delta_moe.py           tiny Qwen3.5 MoE: converted == stock MoE at top-1, top-2, soft routing
+tests/test_fused.py                       the fused kernels: sort, every autotune config, split-K, int64 offsets,
+                                          CUDA graph, torch.compile
 benchmarks/bench.py                       per-layer time of each implementation (CUDA)
 ```
 
@@ -42,13 +43,13 @@ $$y = \sum_{i=1}^{k} r_i\,\mathrm{MLP}(x;\,W_b + \Delta_{e_i})$$
 
 | Public method | Computation | Implementations (private), picked automatically |
 |---|---|---|
-| `forward_param` | Parameter aggregation: each (token, slot) pair is multiplied by $W_b + \Delta_e$ of its expert, weighted by $r_i$ | `_forward_param_triton`: one Triton launch per projection for all pairs, adding $W_b$ and $\Delta_e$ tiles in registers (no weights written, 1× FLOPs); `_forward_param(x, min_rows)`: materialise $W_b + \Delta_e$ per expert and run cuBLAS (experts with fewer than `min_rows` rows compute $W_b x + \Delta_e x$ instead) |
+| `forward_param` | Parameter aggregation: each (token, slot) pair is multiplied by $W_b + \Delta_e$ of its expert, weighted by $r_i$ | `_forward_param_triton`: three Triton launches for all pairs (sort; gate/up with SiLU·up; down with the routing weight), adding $W_b$ and $\Delta_e$ tiles in registers (no weights written, 1× FLOPs); `_forward_param(x, min_rows)`: materialise $W_b + \Delta_e$ per expert and run cuBLAS (experts with fewer than `min_rows` rows compute $W_b x + \Delta_e x$ instead) |
 | `forward_matrix` | Per-matrix output aggregation: gate/up compute $W_b x$ once for all tokens, plus $\Delta_e x$ per slot. Each slot keeps its own activation $h_i$; down computes $W_b h_i + \Delta_e h_i$; the slots are summed with weights $r_i$ | `_forward_matrix_grouped`: flattens all (token, slot) pairs, sorts them by expert, one `F.grouped_mm` per projection for the deltas; `_forward_matrix`: loop over experts |
 | `forward_dense(x, experts)` | Reference: plain MoE from stored full expert weights | `_forward_dense_grouped`: one `F.grouped_mm` per projection, like transformers' `grouped_mm` path; `_forward_dense`: loop over experts |
 
 Selection rules (thresholds measured on an H200 and an RTX 6000 Ada at the shape below; retune for other GPUs or shapes):
 
-- `forward_param`: Triton on CUDA bf16/fp16 from 2 (token, slot) pairs up to 4096 on Hopper (sm90+) or 8192 on Ada and older. A single pair is cheaper through the loop. Beyond the limit the work is compute-bound, and cuBLAS on materialised weights wins; on Hopper that happens earlier, because cuBLAS uses wgmma and this simple kernel does not match it.
+- `forward_param`: Triton on CUDA bf16/fp16 without gradients, up to 8192 (token, slot) pairs on Hopper (sm90+) or 16384 on Ada and older. Beyond the limit the work is compute-bound, and cuBLAS on materialised weights wins; on Hopper that happens earlier, because cuBLAS's wgmma kernels are better than Triton's. With gradients (training) it always takes the materialised path; see [Training](#training).
 - `forward_matrix` / `forward_dense`: grouped GEMM when `F.grouped_mm` exists, the dtype is bf16/fp16/fp32, the device is CPU or a CUDA GPU with sm80+, and there is more than one pair; otherwise the loop.
 
 Note two things that would not be equivalent:
@@ -67,7 +68,7 @@ Build one from a plain MoE with `DeltaMoE.from_experts(base, experts, router, to
 
 transformers' fused layout maps over as `gate, up = gate_up_proj[e].chunk(2)` and `down = down_proj[e]`. In bf16, $W_b + (W_e - W_b)$ is not always exactly $W_e$ (about 0.6% of elements in our model).
 
-Apart from the Triton kernel, everything is `F.linear` (cuBLAS), `F.grouped_mm` (PyTorch's own grouped GEMM: CUDA sm80+ or CPU, bf16/fp16/fp32) and `index_add`. bf16/fp16 are the targets; fp32 is supported (and used for the CPU tests), fp64 is not.
+Apart from the Triton kernels, everything is `F.linear` (cuBLAS), `F.grouped_mm` (PyTorch's own grouped GEMM: CUDA sm80+ or CPU, bf16/fp16/fp32) and `index_add`. bf16/fp16 are the targets; fp32 is supported (and used for the CPU tests), fp64 is not.
 
 ## Qwen3.5 in transformers
 
@@ -107,7 +108,60 @@ Element-wise DARE needs one Philox per element and every expert group recomputes
 compute-bound and slow; with blocks Philox runs once per block. Accuracy of block DARE on the real model:
 ntu-projects `moe-indomain-acc` log [35] (blocks 4 to 256 at 20% match element-wise DARE).
 
+## Fused Triton kernel
+
+`triton_kernels/fused.py`, behind `forward_param` (inference):
+
+- **Three launches, no host sync.** A one-program counting sort of the (token, slot) pairs by expert group (the routing itself is `DeltaMoE.topk` in torch, so every forward picks the same experts, ties included). Then gate/up with SiLU·up in the epilogue, writing $h$ in sorted order. Then down, scaled by the routing weight and written to the pair's slot. The kernels are persistent and derive the tile list from the group starts on the device, so a whole forward can be captured in a CUDA graph.
+- **CUDA graph / `torch.compile`.** Eager calls launch directly. Under `torch.compile` the forward is one opaque custom op (`shared_delta_moe::fused_moe_dense` / `_dare`), so `fullgraph=True` and `mode="reduce-overhead"` work.
+- **Tile order.** Grouped (GROUP_M) so programs running together share weight tiles in L2.
+- **Split-K for decode.** When there are too few output tiles to occupy the SMs (one or two tokens), down splits K and adds float32 partials atomically. Dense deltas only.
+- **Hopper.** From 256 pairs on sm90+ with dense deltas, weight tiles come in through TMA (host tensor descriptors). A 3-D descriptor over the deltas makes the zero expert's reads land out of bounds, so they read as zeros without a mask. Below 256 pairs, plain pointer loads are faster, because building descriptors costs more than TMA saves. DARE stays on pointer loads: with TMA for $W_b$ alone it was 2.3× slower (2048 tokens: 5.95 vs 2.63 ms). Two Triton 3.7.1 problems: `tl.range(warp_specialize=True)` fails to compile (NVGPUWarpSpecialization pass), and a 256-wide TMA box gives wrong results; configs with BN 256 are left out under TMA.
+- **Offsets.** Row offsets are int64, which is safe past 2^31 elements (e.g. 150k pairs × inter 16384).
+- **Environment.** `SHARED_DELTA_MOE_AUTOTUNE=0` takes the first fitting config (fast tests). `SHARED_DELTA_MOE_TMA=0` forces pointer loads on Hopper.
+
+H200, top-1 / top-2, ms per layer (hidden 2560, inter 9216, 5 deltas + zero expert; "graph" = CUDA graph replay):
+
+| tokens | plain grouped | param (materialised) | **param Triton** | Triton, graph | DARE 0.2 block 64 |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 0.359 / 0.396 | 0.303 / 0.526 | 0.177 / 0.190 | **0.095 / 0.137** | 0.328 / 0.437 |
+| 8 | 0.546 / 0.552 | 1.058 / 1.083 | 0.231 / 0.244 | **0.215 / 0.223** | 0.739 / 0.747 |
+| 32 | 0.566 / 0.603 | 1.287 / 1.325 | 0.273 / 0.298 | **0.258 / 0.278** | 0.852 / 0.914 |
+| 512 | 0.566 / 0.674 | 1.339 / 1.444 | 0.378 / 0.641 | **0.358 / 0.609** | 1.153 / 1.776 |
+| 2048 | 0.972 / **1.332** | 1.641 / 2.220 | 0.970 / 1.822 | **0.929** / 1.749 | 2.645 / 4.859 |
+| 8192 | **2.450 / 4.289** | 3.301 / 5.247 | 3.306 / 6.780 | 3.168 / 6.263 | 8.854 / 17.061 |
+
+RTX 6000 Ada, top-1 / top-2:
+
+| tokens | plain grouped | param (materialised) | **param Triton** | Triton, graph | DARE 0.2 block 64 |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 0.736 / 0.822 | 0.916 / 1.057 | 0.434 / 0.469 | **0.355 / 0.357** | 0.390 / 0.438 |
+| 8 | 1.067 / 1.245 | 3.009 / 3.838 | 0.844 / 1.014 | 0.822 / 0.990 | **0.513 / 0.574** |
+| 32 | 1.432 / 1.425 | 4.058 / 4.085 | 1.014 / 1.020 | 0.992 / 1.004 | **0.630 / 0.656** |
+| 512 | 1.629 / 1.795 | 4.257 / 4.363 | 1.152 / 1.613 | **1.136** / 1.699 | 1.380 / 2.358 |
+| 2048 | **2.786** / 5.504 | 5.572 / 8.045 | 2.866 / 5.817 | 3.107 / 5.636 | 3.918 / 7.699 |
+| 8192 | 12.522 / 24.998 | 14.386 / 24.907 | 11.345 / 24.637 | **10.526 / 23.902** | 14.969 / 30.730 |
+
+- Against the previous single-projection kernel (5522b23, the per-GPU tables below), H200 top-1: 1 token 0.336 → 0.177 ms eager, 0.095 in a graph; 32 tokens 0.359 → 0.273, 0.258 in a graph. Ada 1 token: 0.538 → 0.434. The graph numbers show how much of decode is launch overhead.
+- DARE regenerates its mask with Philox, which is integer arithmetic. The H200 has no more integer throughput than the Ada, so DARE gains less there than dense deltas do. It is faster than dense deltas on the Ada at 8–32 tokens, because it reads 20% of the delta bytes, but not on the H200.
+
+### Training
+
+`forward_param` is differentiable: with a gradient needed it runs the materialised path (cuBLAS on $W_b+\Delta_e$, any top-k, gradients to x, the routing weights and every weight). Two fused alternatives were built and measured (commit e0ce27a, then removed): a Triton backward that recomputes $h$ (one kernel computing $g$, $u$ and $dh'$; $dx$ through the down kernel; weight grads via `F.grouped_mm`), and the same Function on `F.grouped_mm` over stacked experts. Both were slower than the materialised path. Router-only training, top-2 / top-6, ms per forward+backward (peak GB above the weights):
+
+| GPU, tokens, top-k | fused Triton | grouped GEMM | **materialised** |
+|---|---:|---:|---:|
+| H200, 4096, top-2 | 11.66 (0.87) | 8.53 (1.29) | **5.97** (1.19) |
+| H200, 25000, top-2 | 64.41 (2.60) | 39.91 (3.85) | **27.93** (4.03) |
+| H200, 25000, top-6 | 200.99 (6.52) | 112.32 (9.95) | **79.38** (10.84) |
+| Ada, 4096, top-2 | 36.47 (0.87) | 39.43 (1.30) | **27.78** (1.20) |
+| Ada, 25000, top-6 | 704.94 (6.52) | 610.53 (9.96) | **478.93** (10.84) |
+
+With few experts (6), the materialisation costs one pass over the weights, and cuBLAS GEMMs on dense experts beat both the Triton GEMMs and `grouped_mm`. The fused backward only saves about 40% of activation memory.
+
 ## Speed (single MoE layer, bf16, eager, ms)
+
+The per-implementation tables below were measured with the previous kernel (5522b23; one launch per projection). Its "param Triton" column is superseded by the tables above.
 
 ### H200 (sm90, 4.8 TB/s)
 
@@ -142,7 +196,7 @@ top-2:
   - **Masked delta load instead of a branch.** The zero expert's delta load is masked off rather than skipped with an `if`, so Triton can pipeline the loop. At 32 tokens: 0.57 → 0.48 ms.
   - **Summed weight as operand A.** The summed weight is the A operand, computing $y^T = (W_b+\Delta)\,x^T$; Hopper's wgmma can take A from registers. At 8192 tokens: 4.55 → 3.67 ms.
   - **No host sync for counts.** Group counts come from `scatter_add`, not `bincount`, and with few pairs the grid is sized from the pair count, not the largest group, so nothing synchronises the host. At 32 tokens: 0.48 → 0.36 ms.
-- With many tokens the work is compute-bound, and this simple Triton GEMM loses to cuBLAS (8192 tokens: 3.66 vs 2.41 plain grouped). So `forward_param` switches to the materialised version past 4096 pairs; a better GEMM kernel would be needed to close that gap.
+- With many tokens the work is compute-bound, and the Triton GEMM loses to cuBLAS (8192 tokens: 3.66 vs 2.41 plain grouped); `forward_param` switches to the materialised version past the pair limit.
 - **Per-matrix output aggregation** needs no custom kernel. It is about 1.3× the plain MoE at small token counts and about 2× at large ones, since it computes both $W_b$ and $\Delta_e$.
 - **Grouped GEMM vs loop**: from 32 to 512 tokens, the grouped versions are 1.3–2.3× faster than the per-expert loops; at a single token the sort and count cost more than they save.
 
@@ -173,7 +227,7 @@ top-2:
 | 8192 | 22.403 | 22.105 | 23.916 | 23.836 | 27.769 | 43.258 | 38.772 |
 
 - Lower bandwidth makes everything 2–4× slower than on the H200, but the ranking holds. From 8 to 512 tokens Triton is 1.2–1.3× faster than the plain MoE.
-- Hopper's wgmma advantage is absent here: with many tokens Triton is on par with cuBLAS (top-1 at 4096–8192 tokens), and it beats materialised weights up to about 8192 pairs, hence the higher limit for Ada and older.
+- Hopper's wgmma advantage is absent here: with many tokens Triton is on par with cuBLAS (top-1 at 4096–8192 tokens), and it beats materialised weights to higher pair counts, hence the higher limit for Ada and older.
 - Two Ada-friendly configs (BK 32, 4–5 stages) were added to the autotune list. They took top-1 at 4096 tokens from 6.72 to 5.94 ms. On Hopper, autotuning still picks its own.
 
 The delta form has uses beyond speed: $\Delta_e$ is a standalone tensor that can be compressed, sparsified or trained on its own; the zero expert has no parameters; and in per-matrix output aggregation the routing weight can stay in the computation graph.
