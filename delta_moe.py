@@ -18,6 +18,7 @@ Plain PyTorch only (F.linear, index_add); no custom kernels.
 
     python delta_moe.py [--top-k K] [--no-bench]   # self-check (float64, k = 1 and 2), then a benchmark if CUDA
 """
+
 import itertools
 import sys
 import time
@@ -64,8 +65,16 @@ class DeltaMoE(nn.Module):
     d_up: nn.Parameter  # N I H
     d_down: nn.Parameter  # N H I
 
-    def __init__(self, hidden: int, inter: int, n_delta: int, top_k: int = 1, num_zero_experts: int = 1,
-                 device: torch.device | str | None = None, dtype: torch.dtype | None = None) -> None:
+    def __init__(
+        self,
+        hidden: int,
+        inter: int,
+        n_delta: int,
+        top_k: int = 1,
+        num_zero_experts: int = 1,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
         """Uninitialised (torch.empty); fill with from_experts or load_state_dict."""
         super().__init__()
         factory: dict[str, Any] = {"device": device, "dtype": dtype}
@@ -75,20 +84,44 @@ class DeltaMoE(nn.Module):
             return nn.Parameter(torch.empty(*shape, **factory))
 
         self.top_k, self.num_zero_experts = top_k, num_zero_experts
-        self.router = nn.Linear(hidden, num_zero_experts + n_delta, bias=False, **factory)
-        self.gate, self.up, self.down = p(inter, hidden), p(inter, hidden), p(hidden, inter)
-        self.d_gate, self.d_up, self.d_down = p(n_delta, inter, hidden), p(n_delta, inter, hidden), p(n_delta, hidden, inter)
+        self.router = nn.Linear(
+            hidden, num_zero_experts + n_delta, bias=False, **factory
+        )
+        self.gate, self.up, self.down = (
+            p(inter, hidden),
+            p(inter, hidden),
+            p(hidden, inter),
+        )
+        self.d_gate, self.d_up, self.d_down = (
+            p(n_delta, inter, hidden),
+            p(n_delta, inter, hidden),
+            p(n_delta, hidden, inter),
+        )
 
     @classmethod
     @torch.no_grad()
-    def from_experts(cls, base: MLPWeights, experts: Sequence[MLPWeights], router: RouterWeight, top_k: int = 1,
-                     num_zero_experts: int = 1) -> "DeltaMoE":
+    def from_experts(
+        cls,
+        base: MLPWeights,
+        experts: Sequence[MLPWeights],
+        router: RouterWeight,
+        top_k: int = 1,
+        num_zero_experts: int = 1,
+    ) -> "DeltaMoE":
         """From a plain MoE: base = the base expert's (gate, up, down), experts = the other experts' full weights W_e,
         router = the MoE's router weight, rows 0..Z-1 routing to the base (Z = num_zero_experts; 0: the base is only
         shared, never an expert on its own). Stores W_b and Delta_e = W_e - W_b in the inputs' dtype."""
         gate, up, down = base
         assert router.shape[0] == num_zero_experts + len(experts)
-        m = cls(gate.shape[1], gate.shape[0], len(experts), top_k, num_zero_experts, dtype=gate.dtype, device=gate.device)
+        m = cls(
+            gate.shape[1],
+            gate.shape[0],
+            len(experts),
+            top_k,
+            num_zero_experts,
+            dtype=gate.dtype,
+            device=gate.device,
+        )
         m.router.weight.copy_(router)
         for dst, b in ((m.gate, gate), (m.up, up), (m.down, down)):
             dst.copy_(b)
@@ -103,14 +136,22 @@ class DeltaMoE(nn.Module):
     def weights(self, e: int) -> MLPWeights:
         if e < 0:
             return self.gate, self.up, self.down
-        return self.gate + self.d_gate[e], self.up + self.d_up[e], self.down + self.d_down[e]
+        return (
+            self.gate + self.d_gate[e],
+            self.up + self.d_up[e],
+            self.down + self.d_down[e],
+        )
 
     def forward_param(self, x: Tokens) -> Tokens:
         idx, r = self.route(x)
         out = torch.zeros_like(x)
         for e in idx.unique().tolist():
-            rows, slots = (idx == e).nonzero(as_tuple=True)  # under top-k two zero experts can share a row; index_add sums them
-            out = out.index_add(0, rows, r[rows, slots, None] * mlp(x[rows], *self.weights(e)))
+            rows, slots = (idx == e).nonzero(
+                as_tuple=True
+            )  # under top-k two zero experts can share a row; index_add sums them
+            out = out.index_add(
+                0, rows, r[rows, slots, None] * mlp(x[rows], *self.weights(e))
+            )
         return out
 
     def forward_matrix(self, x: Tokens) -> Tokens:
@@ -133,7 +174,14 @@ class DeltaMoE(nn.Module):
 
     def dense_experts(self) -> DenseExperts:
         """The equivalent plain MoE: [gate (N+1, I, H), up (N+1, I, H), down (N+1, H, I)], index 0 = base."""
-        return [torch.cat((b[None], b + d)) for b, d in ((self.gate, self.d_gate), (self.up, self.d_up), (self.down, self.d_down))]
+        return [
+            torch.cat((b[None], b + d))
+            for b, d in (
+                (self.gate, self.d_gate),
+                (self.up, self.d_up),
+                (self.down, self.d_down),
+            )
+        ]
 
     def forward_dense(self, x: Tokens, experts: DenseExperts) -> Tokens:
         """Plain top-k MoE with stored full experts, grouped the same way (the baseline)."""
@@ -141,46 +189,106 @@ class DeltaMoE(nn.Module):
         out = torch.zeros_like(x)
         for e in idx.unique().tolist():
             rows, slots = (idx == e).nonzero(as_tuple=True)
-            out = out.index_add(0, rows, r[rows, slots, None] * mlp(x[rows], *(w[e + 1] for w in experts)))
+            out = out.index_add(
+                0,
+                rows,
+                r[rows, slots, None] * mlp(x[rows], *(w[e + 1] for w in experts)),
+            )
         return out
 
 
-def random_experts(hidden: int, inter: int, n: int, dtype: torch.dtype, device: str) -> list[MLPWeights]:
+def random_experts(
+    hidden: int, inter: int, n: int, dtype: torch.dtype, device: str
+) -> list[MLPWeights]:
     """n random (gate, up, down), scaled 1/sqrt(fan_in) so activations stay O(1) (for the check and benchmark)."""
-    r = lambda *shape: torch.randn(*shape, dtype=dtype, device=device) * shape[-1] ** -0.5
+    r = lambda *shape: (
+        torch.randn(*shape, dtype=dtype, device=device) * shape[-1] ** -0.5
+    )
     return [(r(inter, hidden), r(inter, hidden), r(hidden, inter)) for _ in range(n)]
 
 
 def check() -> None:
     for z, k in itertools.product((0, 1, 2), (1, 2)):
         torch.manual_seed(0)
-        full = random_experts(16, 24, 4, torch.float64, "cpu")  # random weights only so that the experts differ
-        m = DeltaMoE.from_experts(full[0], full[1:], torch.randn(z + 3, 16, dtype=torch.float64), top_k=k, num_zero_experts=z)
+        full = random_experts(
+            16, 24, 4, torch.float64, "cpu"
+        )  # random weights only so that the experts differ
+        m = DeltaMoE.from_experts(
+            full[0],
+            full[1:],
+            torch.randn(z + 3, 16, dtype=torch.float64),
+            top_k=k,
+            num_zero_experts=z,
+        )
         x = torch.randn(200, 16, dtype=torch.float64)
         idx, r = m.route(x)
-        assert idx[idx >= 0].unique().tolist() == [0, 1, 2] and (idx == -1).any() == (z > 0), "hit every delta, and the zero experts iff any"
-        assert z == 0 or k == 1 or (idx == -1).any(-1).logical_and((idx >= 0).any(-1)).any(), "zero expert mixed with a delta"
-        assert z < 2 or k == 1 or (idx == -1).all(-1).any(), "two zero experts on one token"
+        assert idx[idx >= 0].unique().tolist() == [0, 1, 2] and (idx == -1).any() == (
+            z > 0
+        ), "hit every delta, and the zero experts iff any"
+        assert (
+            z == 0
+            or k == 1
+            or (idx == -1).any(-1).logical_and((idx >= 0).any(-1)).any()
+        ), "zero expert mixed with a delta"
+        assert z < 2 or k == 1 or (idx == -1).all(-1).any(), (
+            "two zero experts on one token"
+        )
         experts = m.dense_experts()
-        assert all(torch.allclose(w[e], f[j]) for e, f in enumerate(full) for j, w in enumerate(experts))
-        ref = torch.stack([sum(ri * mlp(xi, *(w[ei + 1] for w in experts)) for ei, ri in zip(es.tolist(), rs))
-                           for xi, es, rs in zip(x, idx, r)])  # token by token
-        for f in (m.forward_param, m.forward_matrix, lambda x: m.forward_dense(x, experts)):
-            assert torch.allclose(f(x), ref, atol=1e-10), (z, k, (f(x) - ref).abs().max())
-        n = sum(p.numel() for name, p in m.named_parameters() if name != "router.weight")
-        assert n == 4 * 3 * 16 * 24, "base + 3 deltas = 4 MLPs, zero experts add nothing"
+        assert all(
+            torch.allclose(w[e], f[j])
+            for e, f in enumerate(full)
+            for j, w in enumerate(experts)
+        )
+        ref = torch.stack(
+            [
+                sum(
+                    ri * mlp(xi, *(w[ei + 1] for w in experts))
+                    for ei, ri in zip(es.tolist(), rs)
+                )
+                for xi, es, rs in zip(x, idx, r)
+            ]
+        )  # token by token
+        for f in (
+            m.forward_param,
+            m.forward_matrix,
+            lambda x: m.forward_dense(x, experts),
+        ):
+            assert torch.allclose(f(x), ref, atol=1e-10), (
+                z,
+                k,
+                (f(x) - ref).abs().max(),
+            )
+        n = sum(
+            p.numel() for name, p in m.named_parameters() if name != "router.weight"
+        )
+        assert n == 4 * 3 * 16 * 24, (
+            "base + 3 deltas = 4 MLPs, zero experts add nothing"
+        )
     print("check ok (0/1/2 zero experts x top-1/top-2)")
 
 
 @torch.no_grad()
-def bench(hidden: int = 2560, inter: int = 9216, n_delta: int = 5, top_k: int = 1) -> None:
+def bench(
+    hidden: int = 2560, inter: int = 9216, n_delta: int = 5, top_k: int = 1
+) -> None:
     torch.manual_seed(0)
     full = random_experts(hidden, inter, n_delta + 1, torch.bfloat16, "cuda")
-    m = DeltaMoE.from_experts(full[0], full[1:], torch.randn(n_delta + 1, hidden, dtype=torch.bfloat16, device="cuda"), top_k)
+    m = DeltaMoE.from_experts(
+        full[0],
+        full[1:],
+        torch.randn(n_delta + 1, hidden, dtype=torch.bfloat16, device="cuda"),
+        top_k,
+    )
     del full
     experts = m.dense_experts()
-    forms: dict[str, Callable[[Tokens], Tokens]] = {"dense MoE": lambda x: m.forward_dense(x, experts), "param": m.forward_param, "matrix": m.forward_matrix}
-    print(f"{torch.cuda.get_device_name()}, hidden {hidden}, inter {inter}, {n_delta} deltas + zero expert, top-{top_k}, bf16, eager")
+    forms: dict[str, Callable[[Tokens], Tokens]] = {
+        "dense MoE": lambda x: m.forward_dense(x, experts),
+        "param": m.forward_param,
+        "matrix": m.forward_matrix,
+    }
+    print(
+        f"{torch.cuda.get_device_name()}, hidden {hidden}, inter {inter}, {n_delta} deltas + zero expert, top-{top_k}, bf16, eager"
+    )
     print(f"{'tokens':>8} " + " ".join(f"{k:>14}" for k in forms) + "   (ms per layer)")
     for t in (1, 32, 512, 8192):
         x = torch.randn(t, hidden, dtype=torch.bfloat16, device="cuda")
@@ -200,4 +308,8 @@ def bench(hidden: int = 2560, inter: int = 9216, n_delta: int = 5, top_k: int = 
 if __name__ == "__main__":
     check()
     if torch.cuda.is_available() and "--no-bench" not in sys.argv:
-        bench(top_k=int(sys.argv[sys.argv.index("--top-k") + 1]) if "--top-k" in sys.argv else 1)
+        bench(
+            top_k=int(sys.argv[sys.argv.index("--top-k") + 1])
+            if "--top-k" in sys.argv
+            else 1
+        )
