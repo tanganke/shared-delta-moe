@@ -7,14 +7,18 @@ sum_i r_i MLP(x; W_{e_i})  with experts [W_b + Delta_1, ..., W_b + Delta_n] + [W
 the addition happens:
 
   forward_param   parameter aggregation: per expert, materialise W_b + Delta_e once and run one MLP on the
-                  (token, slot) pairs routed to it, weighted by r
+                  (token, slot) pairs routed to it, weighted by r (small groups skip the materialisation)
   forward_matrix  per-matrix output aggregation: gate/up are W_b x (once for all tokens) + Delta_e x per slot; each
                   slot has its own activation h_i, down is W_b h_i + Delta_e h_i; slots summed with weights r
+  forward_dense   the plain MoE baseline, from stored full experts
+
+Each public forward picks an implementation (_forward_*) by hardware and input: grouped GEMM (F.grouped_mm) when it
+is available for the dtype and device and there is more than one (token, slot) pair, else a loop over experts.
 
 Adding r Delta_e x into one shared activation instead (merging weights per token) is not the same function when k > 1,
 because SwiGLU is nonlinear; each slot keeps its own activation here. With k = 1, r = 1 and both reduce to one MLP.
 
-Plain PyTorch only (F.linear, index_add); no custom kernels.
+Plain PyTorch only (F.linear, F.grouped_mm, index_add); no custom kernels.
 
     python delta_moe.py [--top-k K] [--no-bench]   # self-check (float32), then a benchmark if CUDA
 """
@@ -170,7 +174,7 @@ class DeltaMoE(nn.Module):
         h = F.silu(g) * u
         return F.linear(h, self.down) + F.linear(h, self.d_down[e])
 
-    def forward_param(self, x: Tokens, min_rows: int = 0) -> Tokens:
+    def _forward_param(self, x: Tokens, min_rows: int = 0) -> Tokens:
         """min_rows > 0: an expert with fewer routed rows skips materialising W_b + Delta_e and uses mlp_split
         (reads W_b and Delta_e once, writes no weights: cheaper while memory-bound, twice the FLOPs).
         """
@@ -186,7 +190,7 @@ class DeltaMoE(nn.Module):
             out = out.index_add(0, rows, r[rows, slots, None] * y)
         return out
 
-    def forward_matrix(self, x: Tokens) -> Tokens:
+    def _forward_matrix(self, x: Tokens) -> Tokens:
         idx, r = self.route(x)
         gb: Hidden = F.linear(x, self.gate)
         ub: Hidden = F.linear(x, self.up)
@@ -215,7 +219,7 @@ class DeltaMoE(nn.Module):
             )
         ]
 
-    def forward_dense(self, x: Tokens, experts: DenseExperts) -> Tokens:
+    def _forward_dense(self, x: Tokens, experts: DenseExperts) -> Tokens:
         """Plain top-k MoE with stored full experts, grouped the same way (the baseline)."""
         idx, r = self.route(x)
         out = torch.zeros_like(x)
@@ -228,7 +232,7 @@ class DeltaMoE(nn.Module):
             )
         return out
 
-    def forward_matrix_grouped(self, x: Tokens) -> Tokens:
+    def _forward_matrix_grouped(self, x: Tokens) -> Tokens:
         """forward_matrix with the deltas of all (token, slot) pairs done as one grouped GEMM per projection."""
         idx, r = self.route(x)
         tok = torch.arange(idx.numel(), device=x.device) // self.top_k  # pair -> token
@@ -244,7 +248,7 @@ class DeltaMoE(nn.Module):
         o = F.linear(h, self.down).index_add(0, rows, gmm(h[rows], self.d_down, offs))
         return (o.view(-1, self.top_k, x.shape[-1]) * r[..., None]).sum(1)
 
-    def forward_dense_grouped(self, x: Tokens, experts: DenseExperts) -> Tokens:
+    def _forward_dense_grouped(self, x: Tokens, experts: DenseExperts) -> Tokens:
         """Plain top-k MoE, all (token, slot) pairs as one grouped GEMM per projection (like transformers' grouped_mm)."""
         idx, r = self.route(x)
         tok = torch.arange(idx.numel(), device=x.device) // self.top_k
@@ -256,6 +260,41 @@ class DeltaMoE(nn.Module):
         o = torch.empty(idx.numel(), x.shape[-1], dtype=x.dtype, device=x.device)
         o[rows] = gmm(h, experts[2], offs)
         return (o.view(-1, self.top_k, x.shape[-1]) * r[..., None]).sum(1)
+
+    def _grouped(self, x: Tokens) -> bool:
+        """Use grouped GEMM? Needs F.grouped_mm with this dtype on this device, and more than one (token, slot) pair
+        (with one pair the sort and count cost more than the loop saves)."""
+        # ponytail: threshold measured on one H200 only; tune per GPU if it matters
+        if not hasattr(F, "grouped_mm") or x.dtype not in (
+            torch.bfloat16,
+            torch.float16,
+            torch.float32,
+        ):
+            return False
+        if x.device.type == "cuda" and torch.cuda.get_device_capability(x.device) < (
+            8,
+            0,
+        ):
+            return False
+        return x.device.type in ("cuda", "cpu") and x.shape[0] * self.top_k > 1
+
+    def forward_param(self, x: Tokens) -> Tokens:
+        """Parameter aggregation; experts with < 256 routed rows skip materialising W_b + Delta_e."""
+        return self._forward_param(x, min_rows=256)
+
+    def forward_matrix(self, x: Tokens) -> Tokens:
+        """Per-matrix output aggregation: grouped GEMM when available and worth it, else the per-expert loop."""
+        return (
+            self._forward_matrix_grouped(x)
+            if self._grouped(x)
+            else self._forward_matrix(x)
+        )
+
+    def forward_dense(self, x: Tokens, experts: DenseExperts) -> Tokens:
+        """Plain MoE baseline: grouped GEMM when available and worth it, else the per-expert loop."""
+        if self._grouped(x):
+            return self._forward_dense_grouped(x, experts)
+        return self._forward_dense(x, experts)
 
 
 def random_experts(
@@ -310,14 +349,18 @@ def check() -> None:
             ]
         )  # token by token
         for f in (
+            m._forward_param,
+            lambda x: m._forward_param(x, min_rows=10**9),
+            lambda x: m._forward_param(x, min_rows=100),
+            m._forward_matrix,
+            lambda x: m._forward_dense(x, experts),
+            m._forward_matrix_grouped,
+            lambda x: m._forward_dense_grouped(x, experts),
             m.forward_param,
-            lambda x: m.forward_param(x, min_rows=10**9),
-            lambda x: m.forward_param(x, min_rows=100),
             m.forward_matrix,
             lambda x: m.forward_dense(x, experts),
-            m.forward_matrix_grouped,
-            lambda x: m.forward_dense_grouped(x, experts),
         ):
+            assert torch.allclose(f(x[:1]), ref[:1], atol=1e-5), (z, k, "1 token")
             assert torch.allclose(f(x), ref, atol=1e-5), (
                 z,
                 k,
@@ -347,12 +390,14 @@ def bench(
     del full
     experts = m.dense_experts()
     forms: dict[str, Callable[[Tokens], Tokens]] = {
-        "dense MoE": lambda x: m.forward_dense(x, experts),
+        "dense loop": lambda x: m._forward_dense(x, experts),
+        "dense grouped": lambda x: m._forward_dense_grouped(x, experts),
+        "dense": lambda x: m.forward_dense(x, experts),
+        "param pure": m._forward_param,
         "param": m.forward_param,
-        "param hybrid": lambda x: m.forward_param(x, min_rows=256),
+        "matrix loop": m._forward_matrix,
+        "matrix grouped": m._forward_matrix_grouped,
         "matrix": m.forward_matrix,
-        "dense grouped": lambda x: m.forward_dense_grouped(x, experts),
-        "matrix grouped": m.forward_matrix_grouped,
     }
     print(
         f"{torch.cuda.get_device_name()}, hidden {hidden}, inter {inter}, {n_delta} deltas + zero expert, top-{top_k}, bf16, eager"
