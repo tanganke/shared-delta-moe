@@ -10,7 +10,7 @@ $$y = \sum_{i=1}^{k} r_i\,\mathrm{MLP}(x;\,W_b + \Delta_{e_i})$$
 
 | Form | Computation | Function |
 |---|---|---|
-| Parameter aggregation | Per expert, materialise $W_b + \Delta_e$ once and run one MLP on the (token, slot) pairs routed to it; multiply by $r_i$ and `index_add` back | `DeltaMoE.forward_param` |
+| Parameter aggregation | Per expert, materialise $W_b + \Delta_e$ once and run one MLP on the (token, slot) pairs routed to it; multiply by $r_i$ and `index_add` back | `DeltaMoE.forward_param` | (`min_rows=m`: experts with fewer than m routed rows skip materialisation and compute $W_b x + \Delta_e x$ per projection directly)
 | Per-matrix output aggregation | gate/up compute $W_b x$ once for all tokens, plus $\Delta_e x$ per slot. Each slot keeps its own activation $h_i$; down computes $W_b h_i + \Delta_e h_i$; the slots are summed with weights $r_i$ | `DeltaMoE.forward_matrix` |
 | Reference: plain MoE | Stored full expert weights, grouped the same way | `DeltaMoE.forward_dense` |
 | Per-matrix output aggregation, grouped GEMM | Same as above, but flattens all (token, slot) pairs, sorts them by expert, and computes the deltas for each projection in one `F.grouped_mm` call (no Python loop) | `DeltaMoE.forward_matrix_grouped` |
@@ -64,7 +64,7 @@ top-2:
 
 - **Grouped GEMM** replaces the per-expert Python loop with one kernel per projection. From 32 to 512 tokens it is 1.3–2.3× faster than the loop, and top-2 gains the most, because the loop runs every expert of every slot separately. At 1 token, the extra sort and count make it slightly slower.
 - **Per-matrix output aggregation, grouped**: 1.3× the transformers MoE at 32 tokens (top-1 0.61 vs 0.47, top-2 0.63 vs 0.50), and about 1.9× at 8192 tokens (computing both $W_b$ and $\Delta_e$ roughly doubles the compute).
-- **Parameter aggregation** writes out a full weight matrix per expert, so it is the slowest at mid-range token counts. It does not fit grouped GEMM well: you would first have to write out $W_b+\Delta_e$ for every expert, which costs even more memory traffic.
+- **Parameter aggregation** writes out a full weight matrix per expert, so it is the slowest at mid-range token counts. The hybrid (`min_rows=256`, small groups skip materialisation) only shaves this down (top-1 32 tokens 1.35 → 1.17 ms, top-2 1.33 → 1.10): each small group still reads $W_b$ once, so it can't beat per-matrix output aggregation, which shares $W_b x$ across all tokens (0.86 / 0.64). It does not fit grouped GEMM well: you would first have to write out $W_b+\Delta_e$ for every expert, which costs even more memory traffic.
 - The remaining gap between plain grouped and transformers (0.58 vs 0.47) probably comes from the `nonzero` and `bincount` here, which synchronise the CPU and GPU (transformers uses `histc` and a fixed number of groups, which needs no sync). Not profiled.
 
 The benefits of these forms are elsewhere. The delta $\Delta_e$ is a standalone tensor that can be compressed, sparsified or trained on its own; the zero expert has no parameters; and in per-matrix output aggregation the routing weight can stay in the computation graph.
@@ -93,6 +93,33 @@ How to disable it (batch 1 gets slightly slower, 31 → 28 tok/s):
 import contextlib
 from transformers.generation.utils import GenerationMixin
 GenerationMixin._optimize_model_for_decode = contextlib.contextmanager(lambda self: (yield))
+```
+
+A better fix than disabling it outright is to use `batched_mm` only when there are few tokens. Full-model decode (H200, context 512, ms per step):
+
+| batch | transformers default (always `batched_mm` in decode) | always `grouped_mm` | auto, threshold 8 |
+|---:|---:|---:|---:|
+| 1 | 31.7 | 38.2 | 33.3 |
+| 2 | 32.2 | 39.4 | 34.0 |
+| 4 | 31.8 | 39.6 | 34.0 |
+| 8 | 33.1 | 38.9 | 34.4 |
+| 16 | 52.9 | 39.8 | 36.7 |
+| 32 | 94.3 | 39.1 | 37.5 |
+
+`grouped_mm` is flat at about 39 ms (bound by framework overhead, not memory traffic); `batched_mm` is faster up to batch 8, then grows with the number of weight copies. Registering an `auto` implementation (`batched_mm` when tokens × top_k ≤ 8, otherwise `grouped_mm`; prefill naturally takes `grouped_mm`) stays within about 2 ms of the best at every batch size. Between-run noise is about ±2 ms, so 4 and 8 are indistinguishable as thresholds.
+
+```python
+import contextlib
+import transformers.integrations.moe as moe
+from transformers.generation.utils import GenerationMixin
+
+def auto_experts_forward(self, hidden_states, top_k_index, top_k_weights):
+    f = moe.batched_mm_experts_forward if top_k_index.numel() <= 8 else moe.grouped_mm_experts_forward
+    return f(self, hidden_states, top_k_index, top_k_weights)
+
+moe.ExpertsInterface.register("auto", auto_experts_forward)
+GenerationMixin._optimize_model_for_decode = contextlib.contextmanager(lambda self: (yield))
+model.set_experts_implementation("auto")
 ```
 
 The takeaway: with large experts (9216 × 2560) and batch > 1, transformers' "switch to `batched_mm` during decode" heuristic makes things slower.

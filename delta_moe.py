@@ -163,16 +163,27 @@ class DeltaMoE(nn.Module):
             self.down + self.d_down[e],
         )
 
-    def forward_param(self, x: Tokens) -> Tokens:
+    def mlp_split(self, x: Tokens, e: int) -> Tokens:
+        """MLP(x; W_b + Delta_e) without forming the sum: every projection is W_b x + Delta_e x."""
+        g = F.linear(x, self.gate) + F.linear(x, self.d_gate[e])
+        u = F.linear(x, self.up) + F.linear(x, self.d_up[e])
+        h = F.silu(g) * u
+        return F.linear(h, self.down) + F.linear(h, self.d_down[e])
+
+    def forward_param(self, x: Tokens, min_rows: int = 0) -> Tokens:
+        """min_rows > 0: an expert with fewer routed rows skips materialising W_b + Delta_e and uses mlp_split
+        (reads W_b and Delta_e once, writes no weights: cheaper while memory-bound, twice the FLOPs).
+        """
         idx, r = self.route(x)
         out = torch.zeros_like(x)
         for e in idx.unique().tolist():
-            rows, slots = (idx == e).nonzero(
-                as_tuple=True
-            )  # under top-k two zero experts can share a row; index_add sums them
-            out = out.index_add(
-                0, rows, r[rows, slots, None] * mlp(x[rows], *self.weights(e))
-            )
+            # under top-k two zero experts can share a row; index_add sums them
+            rows, slots = (idx == e).nonzero(as_tuple=True)
+            if 0 <= e and len(rows) < min_rows:
+                y = self.mlp_split(x[rows], e)
+            else:
+                y = mlp(x[rows], *self.weights(e))
+            out = out.index_add(0, rows, r[rows, slots, None] * y)
         return out
 
     def forward_matrix(self, x: Tokens) -> Tokens:
@@ -300,6 +311,8 @@ def check() -> None:
         )  # token by token
         for f in (
             m.forward_param,
+            lambda x: m.forward_param(x, min_rows=10**9),
+            lambda x: m.forward_param(x, min_rows=100),
             m.forward_matrix,
             lambda x: m.forward_dense(x, experts),
             m.forward_matrix_grouped,
@@ -336,6 +349,7 @@ def bench(
     forms: dict[str, Callable[[Tokens], Tokens]] = {
         "dense MoE": lambda x: m.forward_dense(x, experts),
         "param": m.forward_param,
+        "param hybrid": lambda x: m.forward_param(x, min_rows=256),
         "matrix": m.forward_matrix,
         "dense grouped": lambda x: m.forward_dense_grouped(x, experts),
         "matrix grouped": m.forward_matrix_grouped,
