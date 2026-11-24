@@ -21,6 +21,14 @@ Note two things that would not be equivalent:
 
 With $k=1$, $r=1$ and both forms reduce to one MLP. Under top-k the zero expert can be one of the k picks: its share $r_i$ goes to the base MLP.
 
+Build one from a plain MoE with `DeltaMoE.from_experts(base, experts, router, top_k)`:
+
+- `base`: the base expert's `(gate (I, H), up (I, H), down (H, I))`, i.e. expert 0 of the original MoE.
+- `experts`: the other n experts' full weights $W_e$ (not deltas), each in the same `(gate, up, down)` form; $\Delta_e = W_e - W_b$ is computed inside.
+- `router`: the original router weight `(n+1, H)`, with row 0 routing to the base.
+
+transformers' fused layout maps over as `gate, up = gate_up_proj[e].chunk(2)` and `down = down_proj[e]`. In bf16, $W_b + (W_e - W_b)$ is not always exactly $W_e$ (about 0.6% of elements in our model).
+
 **No custom kernels.** Everything is `F.linear` (cuBLAS) plus `index_add`.
 
 ```bash
