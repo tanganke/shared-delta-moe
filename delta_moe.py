@@ -64,9 +64,11 @@ class DeltaMoE(nn.Module):
     d_up: nn.Parameter  # N I H
     d_down: nn.Parameter  # N H I
 
-    def __init__(self, hidden: int, inter: int, n_delta: int, top_k: int = 1, num_zero_experts: int = 1, **factory: Any) -> None:
-        """Uninitialised (torch.empty); fill with from_experts or load_state_dict. factory: dtype / device."""
+    def __init__(self, hidden: int, inter: int, n_delta: int, top_k: int = 1, num_zero_experts: int = 1,
+                 device: torch.device | str | None = None, dtype: torch.dtype | None = None) -> None:
+        """Uninitialised (torch.empty); fill with from_experts or load_state_dict."""
         super().__init__()
+        factory: dict[str, Any] = {"device": device, "dtype": dtype}
         assert num_zero_experts >= 0 and 1 <= top_k <= n_delta + num_zero_experts
 
         def p(*shape: int) -> nn.Parameter:
