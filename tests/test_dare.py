@@ -9,7 +9,7 @@ from test_delta_moe import CASES, make, reference
 
 from shared_delta_moe import DareDeltaMoE
 from shared_delta_moe.constants import HAS_TRITON
-from shared_delta_moe.models.dare import keep_mask, philox
+from shared_delta_moe.models.dare import keep_mask, mask_bits, philox
 
 GPU = torch.cuda.is_available() and HAS_TRITON
 SETTINGS = [
@@ -39,26 +39,45 @@ def test_mask():
         ), "same mask on CPU and GPU"
 
 
-def test_triton_randint_is_the_same_philox():
+def test_mask_bits_is_keep_mask():
+    """The bitmap the fused kernel reads unpacks to keep_mask, ragged word counts included (C / B not a multiple of
+    32, and over 32 blocks per row)."""
+    for seed, stream, rows, cols, block in ((0, 0, 7, 40, 1), (12345, 7, 5, 64 * 40, 64), (2**40 + 3, 14, 3, 9216, 64),
+                                            (9, 2, 4, 96, 32)):  # fmt: skip
+        bits = mask_bits(seed, stream, rows, cols, 0.3, block)
+        j = torch.arange(cols // block)
+        unpacked = ((bits.long()[:, j // 32] >> (j % 32)) & 1).bool().repeat_interleave(block, 1)
+        assert torch.equal(unpacked, keep_mask(seed, stream, rows, cols, 0.3, block)), (seed, block)
+
+
+def test_bitmaps_after_load_state_dict():
+    """The mask bitmaps are built at construction and after load_state_dict (also for a model made on meta), so the
+    first forward of a loaded model can be captured in a CUDA graph (it builds nothing)."""
+    m, _, x = make(1, 2, 64, 96, torch.bfloat16, "cuda") if GPU else make(1, 2)
+    d = DareDeltaMoE.from_delta_moe(m, 0.3, 4, seed=5)
+    I, H = m.gate.shape
+    for device in ("meta", x.device):
+        d2 = DareDeltaMoE(H, I, m.n_delta, 0.3, 4, 5, m.top_k, m.num_zero_experts, device, x.dtype)
+        d2 = d2.to_empty(device=x.device)
+        for name in ("gate", "up", "down"):  # packed buffers start empty (see _init_deltas)
+            setattr(d2, f"v_{name}", torch.empty_like(getattr(d, f"v_{name}")))
+            setattr(d2, f"p_{name}", torch.empty_like(getattr(d, f"p_{name}")))
+        d2.load_state_dict(d.state_dict())
+        for name in ("gate", "up", "down"):
+            assert torch.equal(getattr(d2, f"m_{name}"), getattr(d, f"m_{name}")), (device, name)
     if not GPU:
-        print("skipped: no CUDA/Triton")
         return
-    import triton
-    import triton.language as tl
-
-    @triton.jit
-    def k(out, seed, stream, n, BLOCK: tl.constexpr):
-        i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-        u = tl.randint(seed, (stream.to(tl.int64) << 32) + i.to(tl.int64))
-        tl.store(out + i, u.to(tl.int64), mask=i < n)
-
-    for seed, stream in ((0, 0), (12345, 7), (2**40 + 3, 14)):
-        got = torch.empty(5000, dtype=torch.int64, device="cuda")
-        k[(5,)](got, seed, stream, 5000, BLOCK=1024)
-        u = torch.arange(5000)
-        z = torch.zeros_like(u)
-        want = philox(u, z + stream, z, z, seed & 0xFFFFFFFF, seed >> 32)
-        assert torch.equal(got.cpu(), want), (seed, stream)
+    with torch.no_grad():
+        want = d._forward_param_triton(x[:37])
+        xs = x[:37].clone()
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            y = d2._forward_param_triton(xs)
+        assert torch.equal(d2.m_gate, d.m_gate)
+        g.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(y, want)
 
 
 def test_dare_forwards_match_plain_moe():

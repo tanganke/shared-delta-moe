@@ -13,8 +13,8 @@ The GEMM kernels are persistent: each program walks tiles (group, row tile, colu
 order, so programs running at the same time share weight and activation tiles in L2. The tile list is derived on
 the device from gstart, which is what lets a whole forward run under a CUDA graph.
 
-Deltas come in two storage modes (MODE): 0 dense (G, N, K); 1 seeded DARE (models/dare.py), the Philox mask
-regenerated per tile and the kept values gathered from the packed storage. On Hopper (sm90+) with dense deltas the
+Deltas come in two storage modes (MODE): 0 dense (G, N, K); 1 seeded DARE (models/dare.py), the keep bits
+of each tile read from a 1-bit-per-block mask bitmap and the kept values gathered from the packed storage. On Hopper (sm90+) with dense deltas the
 weight tiles are loaded with TMA (tensor descriptors), so that address arithmetic and masking leave the main loop.
 Row offsets (row index times row stride) are int64: h (pairs x inter) passes 2^31 elements in training.
 """
@@ -128,16 +128,34 @@ def _dense_delta(d_ptr, g, cols, kk, dmask, sdg, sdn, sdk):
 
 
 @triton.jit
-def _dare_delta(v_ptr, run, k0, kk, dmask, stream, unit0, seed, thresh, B: tl.constexpr, BN: tl.constexpr,
-                BK: tl.constexpr):  # fmt: skip
-    """Seeded-DARE delta tile: one Philox per DARE block, kept values gathered from v at each row's running
-    position (run, advanced by the tile's kept count). Needs BK % B == 0 or B % BK == 0."""
-    if B >= BK:
-        u = tl.randint(seed, stream + unit0 + k0 // B).to(tl.int64)  # (BN, 1)
-        m = tl.broadcast_to(u < thresh, (BN, BK))
+def _mask_words(m_ptr, mrow, dcols, MW, MWP: tl.constexpr):
+    """A row's whole mask bitmap, (BN, MWP) words, when it is short (MWP: words padded to a power of 2; 0 = read per
+    tile instead): loaded once per tile so the K loop has no load the delta gather has to wait for."""
+    W1: tl.constexpr = MWP if MWP > 0 else 1
+    ar = tl.arange(0, W1)[None, :]
+    return tl.load(m_ptr + mrow + ar, mask=dcols[:, None] & (ar < MW) & (MWP > 0), other=0)
+
+
+@triton.jit
+def _dare_delta(v_ptr, run, k0, kk, dmask, m_ptr, mrow, words, KB, B: tl.constexpr, BN: tl.constexpr,
+                BK: tl.constexpr, MWP: tl.constexpr):  # fmt: skip
+    """Seeded-DARE delta tile: the keep bit of each DARE block from the mask bitmap (block j of a row in bit j % 32
+    of word j // 32; KB blocks per row): from words (_mask_words) when MWP > 0, else read at m_ptr + mrow. Kept values
+    gathered from v at each row's running position (run, advanced by the tile's kept count). Needs BK % B == 0 or
+    B % BK == 0."""
+    J: tl.constexpr = BK // B if B < BK else 1
+    j = (k0 // B + tl.arange(0, J))[None, :]  # (1, J) blocks of this tile
+    if MWP > 0:  # pick word j // 32 from the registers
+        sel = (j // 32)[:, :, None] == tl.arange(0, MWP)[None, None, :]
+        w = tl.sum(tl.where(sel, words[:, None, :], 0), axis=2)  # (BN, J)
     else:
-        ub = tl.randint(seed, stream + unit0 + (k0 // B + tl.arange(0, BK // B))[None, :])
-        m = tl.reshape(tl.broadcast_to((ub.to(tl.int64) < thresh)[:, :, None], (BN, BK // B, B)), (BN, BK))
+        rm = tl.max(dmask.to(tl.int32), axis=1)[:, None] > 0  # rows with a delta
+        w = tl.load(m_ptr + mrow + j // 32, mask=rm & (j < KB), other=0)  # (BN, J), mostly one word
+    bit = ((w >> (j % 32)) & 1) != 0
+    if B >= BK:
+        m = tl.broadcast_to(bit, (BN, BK))
+    else:
+        m = tl.reshape(tl.broadcast_to(bit[:, :, None], (BN, J, B)), (BN, BK))
     m = m & dmask
     mi = m.to(tl.int32)
     dw = tl.load(v_ptr + run[:, None] + (tl.cumsum(mi, axis=1) - mi), mask=m, other=0.0)
@@ -212,11 +230,12 @@ _KEY = ["N", "K", "P_BUCKET", "TOPK", "MODE", "B", "S", "TMA"]
 @triton.autotune(configs=GATE_UP_CONFIGS, key=_KEY, prune_configs_by={"early_config_prune": _pruner(4)})
 @triton.jit
 def _gate_up_kernel(
-    x_ptr, perm_ptr, gstart_ptr, wg_ptr, wu_ptr, dg_ptr, du_ptr, pg_ptr, pu_ptr, h_ptr,
+    x_ptr, perm_ptr, gstart_ptr, wg_ptr, wu_ptr, dg_ptr, du_ptr, pg_ptr, pu_ptr, mg_ptr, mu_ptr, h_ptr,
     wg_desc, wu_desc, dg_desc, du_desc,
-    N, K, G, P_BUCKET, seed, thresh,
+    N, K, G, P_BUCKET, MW,
     sxm, sxk, swn, swk, sun, suk, sdg, sdn, sdk, seg, sen, sek, shm, shn,
     TOPK: tl.constexpr, MODE: tl.constexpr, B: tl.constexpr, S: tl.constexpr, GP: tl.constexpr, TMA: tl.constexpr,
+    MWP: tl.constexpr,
     BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, OCC: tl.constexpr, GROUP_M: tl.constexpr,
 ):  # fmt: skip
     """sw* / su*: strides of W_g / W_u; sd* / se*: of D_g / D_u (dense mode)."""
@@ -236,7 +255,9 @@ def _gate_up_kernel(
         if MODE == 1:
             rg = tl.load(pg_ptr + g * N + cols, mask=dcols, other=0)
             ru = tl.load(pu_ptr + g * N + cols, mask=dcols, other=0)
-        unit0 = cols.to(tl.int64)[:, None] * (K // B)
+        mrow = (g * N + cols).to(tl.int64)[:, None] * MW  # mask words of each row (DARE)
+        wg_bits = _mask_words(mg_ptr, mrow, dcols, MW, MWP)
+        wu_bits = _mask_words(mu_ptr, mrow, dcols, MW, MWP)
         acc_g = tl.zeros((BN, BM), tl.float32)  # y^T: the summed weight is operand A
         acc_u = tl.zeros((BN, BM), tl.float32)
         for k0 in range(0, K, BK):
@@ -258,8 +279,8 @@ def _gate_up_kernel(
                 dg = _dense_delta(dg_ptr, g, cols, kk, dmask, sdg, sdn, sdk)
                 du = _dense_delta(du_ptr, g, cols, kk, dmask, seg, sen, sek)
             else:
-                dg, rg = _dare_delta(dg_ptr, rg, k0, kk, dmask, (g * 3).to(tl.int64) << 32, unit0, seed, thresh, B, BN, BK)
-                du, ru = _dare_delta(du_ptr, ru, k0, kk, dmask, (g * 3 + 1).to(tl.int64) << 32, unit0, seed, thresh, B, BN, BK)
+                dg, rg = _dare_delta(dg_ptr, rg, k0, kk, dmask, mg_ptr, mrow, wg_bits, K // B, B, BN, BK, MWP)
+                du, ru = _dare_delta(du_ptr, ru, k0, kk, dmask, mu_ptr, mrow, wu_bits, K // B, B, BN, BK, MWP)
             at = tl.trans(a)
             acc_g = tl.dot(wg + dg, at, acc_g)
             acc_u = tl.dot(wu + du, at, acc_u)
@@ -277,11 +298,12 @@ def _gate_up_kernel(
                  reset_to_zero=["o_ptr"])  # fmt: skip
 @triton.jit
 def _down_kernel(
-    h_ptr, perm_ptr, gstart_ptr, rw_ptr, w_ptr, d_ptr, p_ptr, o_ptr,
+    h_ptr, perm_ptr, gstart_ptr, rw_ptr, w_ptr, d_ptr, p_ptr, m_ptr, o_ptr,
     h_desc, w_desc, d_desc,
-    N, K, G, P_BUCKET, seed, thresh,
+    N, K, G, P_BUCKET, MW,
     shm, shk, swn, swk, sdg, sdn, sdk, som, son,
     TOPK: tl.constexpr, MODE: tl.constexpr, B: tl.constexpr, S: tl.constexpr, GP: tl.constexpr, TMA: tl.constexpr,
+    MWP: tl.constexpr,
     BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, OCC: tl.constexpr, GROUP_M: tl.constexpr,
 ):  # fmt: skip
     lo, hi, mt, mend, MT = _groups(gstart_ptr, G, BM, GP)
@@ -298,7 +320,8 @@ def _down_kernel(
         run = tl.zeros((BN,), tl.int64)
         if MODE == 1:
             run = tl.load(p_ptr + g * N + cols, mask=dcols, other=0)
-        unit0 = cols.to(tl.int64)[:, None] * (K // B)
+        mrow = (g * N + cols).to(tl.int64)[:, None] * MW
+        bits = _mask_words(m_ptr, mrow, dcols, MW, MWP)
         acc = tl.zeros((BN, BM), tl.float32)
         for k0 in range(s * kper, tl.minimum(K, s * kper + kper), BK):
             kk = k0 + ks
@@ -315,7 +338,7 @@ def _down_kernel(
             elif MODE == 0:
                 dw = _dense_delta(d_ptr, g, cols, kk, dmask, sdg, sdn, sdk)
             else:
-                dw, run = _dare_delta(d_ptr, run, k0, kk, dmask, (g * 3 + 2).to(tl.int64) << 32, unit0, seed, thresh, B, BN, BK)
+                dw, run = _dare_delta(d_ptr, run, k0, kk, dmask, m_ptr, mrow, bits, K // B, B, BN, BK, MWP)
             acc = tl.dot(w + dw, tl.trans(a), acc)
         pair = tl.load(perm_ptr + rows, mask=rmask, other=0)
         rw = tl.load(rw_ptr + pair, mask=rmask, other=0.0)
@@ -334,14 +357,23 @@ def _down_kernel(
 
 class Delta(NamedTuple):
     """One projection's deltas as the kernels take them. mode 0: dense (G, N, K) in d; mode 1: seeded DARE, d the
-    packed kept values, p (G, N) each row's start in d."""
+    packed kept values, p (G, N) each row's start in d, m (G, N, words) int32 the keep bit of each DARE block
+    (models/dare.py mask_bits)."""
 
     mode: int
     d: Tensor
     p: Tensor | None = None
-    seed: int = 0
-    thresh: int = 0
+    m: Tensor | None = None
     block: int = 1
+
+    def ptrs(self) -> tuple[Tensor, Tensor, int]:
+        """(p, m, mask words per row); dense mode: placeholders the kernel never reads."""
+        return (self.d, self.d, 0) if self.mode == 0 else (self.p, self.m, self.m.shape[-1])  # type: ignore[return-value]
+
+    def mwp(self) -> int:
+        """Mask words per row padded to a power of 2 when at most 8 (kept in registers), else 0 (read per tile)."""
+        mw = self.ptrs()[2]
+        return triton.next_power_of_2(mw) if 0 < mw <= 8 else 0
 
     def strides(self) -> tuple[int, int, int]:
         return tuple(self.d.stride()) if self.mode == 0 else (0, 0, 0)  # type: ignore[return-value]
@@ -429,10 +461,10 @@ def gate_up(x: Tensor, r: Routing, wg: Tensor, wu: Tensor, dg: Delta, du: Delta,
     descs = (_desc(wg), _desc(wu), *((_desc(dg.d), _desc(du.d)) if dg.mode == 0 else (None, None))) if tma else (None,) * 4
     with torch.cuda.device(x.device):
         _launch(_gate_up_kernel, grid, config,
-            x, r.perm, r.gstart, wg, wu, dg.d, du.d, dg.p if dg.p is not None else dg.d,
-            du.p if du.p is not None else du.d, h, *descs, N, K, G, _bucket(P), dg.seed, dg.thresh,
+            x, r.perm, r.gstart, wg, wu, dg.d, du.d, dg.ptrs()[0], du.ptrs()[0], dg.ptrs()[1], du.ptrs()[1], h, *descs,
+            N, K, G, _bucket(P), dg.ptrs()[2],
             *x.stride(), *wg.stride(), *wu.stride(), *dg.strides(), *du.strides(), *h.stride(),
-            TOPK=r.top_k, MODE=dg.mode, B=dg.block, S=1, GP=triton.next_power_of_2(G + 2), TMA=tma,
+            TOPK=r.top_k, MODE=dg.mode, B=dg.block, S=1, GP=triton.next_power_of_2(G + 2), TMA=tma, MWP=dg.mwp(),
         )  # fmt: skip
     return h
 
@@ -449,10 +481,10 @@ def down(h: Tensor, r: Routing, w: Tensor, d: Delta, config: triton.Config | Non
     descs = (_desc(h), _desc(w), _desc(d.d) if d.mode == 0 else None) if tma else (None,) * 3
     with torch.cuda.device(h.device):
         _launch(_down_kernel, grid, config,
-            h, r.perm, r.gstart, r.weight, w, d.d, d.p if d.p is not None else d.d, o, *descs,
-            N, K, G, _bucket(P), d.seed, d.thresh,
+            h, r.perm, r.gstart, r.weight, w, d.d, *d.ptrs()[:2], o, *descs,
+            N, K, G, _bucket(P), d.ptrs()[2],
             *h.stride(), *w.stride(), *d.strides(), *o.stride(),
-            TOPK=r.top_k, MODE=d.mode, B=d.block, S=S, GP=triton.next_power_of_2(G + 2), TMA=tma,
+            TOPK=r.top_k, MODE=d.mode, B=d.block, S=S, GP=triton.next_power_of_2(G + 2), TMA=tma, MWP=d.mwp(),
         )  # fmt: skip
     if S > 1:
         return o.to(h.dtype)
@@ -483,9 +515,9 @@ def fused_moe_dense(x: Tensor, idx: Tensor, rw: Tensor, wg: Tensor, wu: Tensor, 
 
 @torch.library.custom_op("shared_delta_moe::fused_moe_dare", mutates_args=())
 def fused_moe_dare(x: Tensor, idx: Tensor, rw: Tensor, wg: Tensor, wu: Tensor, wd: Tensor, vg: Tensor, vu: Tensor,
-                   vd: Tensor, pg: Tensor, pu: Tensor, pd: Tensor, n_delta: int, seed: int, thresh: int,
+                   vd: Tensor, pg: Tensor, pu: Tensor, pd: Tensor, mg: Tensor, mu: Tensor, md: Tensor, n_delta: int,
                    block: int) -> Tensor:  # fmt: skip
-    deltas = tuple(Delta(1, v, p, seed, thresh, block) for v, p in ((vg, pg), (vu, pu), (vd, pd)))
+    deltas = tuple(Delta(1, v, p, m, block) for v, p, m in ((vg, pg, mg), (vu, pu, mu), (vd, pd, md)))
     return fused_moe(x, idx, rw, n_delta, (wg, wu, wd), deltas)  # type: ignore[arg-type]
 
 
@@ -508,5 +540,5 @@ def fused_moe_any(x: Tensor, idx: Tensor, rw: Tensor, n_delta: int, base: tuple[
     if deltas[0].mode == 0:
         return fused_moe_dense(x, idx, rw, *base, *(d.d for d in deltas), n_delta)
     d0 = deltas[0]
-    return fused_moe_dare(x, idx, rw, *base, *(d.d for d in deltas), *(d.p for d in deltas), n_delta,  # type: ignore[misc]
-                          d0.seed, d0.thresh, d0.block)  # fmt: skip
+    return fused_moe_dare(x, idx, rw, *base, *(d.d for d in deltas), *(d.p for d in deltas),  # type: ignore[misc]
+                          *(d.m for d in deltas), n_delta, d0.block)  # fmt: skip

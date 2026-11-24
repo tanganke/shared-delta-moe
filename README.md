@@ -7,7 +7,7 @@ src/shared_delta_moe/models/delta_moe.py  DeltaMoE: from_experts, routing, the f
 src/shared_delta_moe/ops.py               stateless helpers: mlp, grouping routed rows, one grouped GEMM
 src/shared_delta_moe/triton_kernels/      fused.py: the fused parameter-aggregation forward (sort, gate_up + SiLU,
                                           down + routing weight; dense or seeded-DARE deltas; Hopper TMA)
-src/shared_delta_moe/models/dare.py       seeded DARE: Philox mask, pack/unpack, DareDeltaMoE
+src/shared_delta_moe/models/dare.py       seeded DARE: Philox mask, its bitmap, pack/unpack, DareDeltaMoE
 src/shared_delta_moe/models/qwen3_5/qwen3_5_delta_moe/
                                           transformers' Qwen3.5 MoE with DeltaMoE blocks (forward_param): modeling.py
                                           (patches the decoder layer for configs with delta_moe_zero_experts), convert.py
@@ -16,7 +16,7 @@ src/shared_delta_moe/constants.py         HAS_TRITON and the thresholds that pic
 src/shared_delta_moe/type_hints.py        shape-annotated tensor aliases (T tokens, H hidden, ...)
 src/shared_delta_moe/testing.py           random_experts for tests and benchmarks
 tests/test_delta_moe.py                   every forward == plain MoE, token by token (Triton part needs CUDA)
-tests/test_dare.py                        Philox known-answer, CPU == CUDA == Triton masks, DARE forwards
+tests/test_dare.py                        Philox known-answer, CPU == CUDA masks, bitmap == mask, DARE forwards
 tests/test_qwen3_5_delta_moe.py           tiny Qwen3.5 MoE: converted == stock MoE at top-1, top-2, soft routing
 tests/test_fused.py                       the fused kernels: sort, every autotune config, split-K, int64 offsets,
                                           CUDA graph, torch.compile
@@ -89,23 +89,33 @@ have no output. `num_experts_per_tok` is the top-k at load time (= `num_experts`
 `DareDeltaMoE.from_delta_moe(m, keep=0.2, block=64, seed=0)` keeps a random `keep` of each $\Delta_e$ (whole
 $1 \times$ `block` blocks along the input dimension; `block=1` is element-wise DARE), rescaled by $1/\text{keep}$, and
 stores only the kept values plus one int64 row start per weight row. The mask is not stored: it is Philox4x32-10 of
-(unit, 3e + projection) under the seed, pure 32-bit integer arithmetic, so torch on CPU or CUDA and Triton's
-`tl.randint` give the same bits (`tests/test_dare.py` checks a Random123 known-answer vector and all three against
-each other). The fused kernel regenerates the mask tile by tile, gathers the kept values and adds them to $W_b$ in
-registers. Storage per delta: `keep` of dense, e.g. 20%.
+(unit, 3e + projection) under the seed, pure 32-bit integer arithmetic, so it can be regenerated anywhere
+(`tests/test_dare.py` checks a Random123 known-answer vector and CPU == CUDA). The fused kernel reads it as a bitmap,
+1 bit per block (`mask_bits`), built once from the seed and kept as a non-persistent buffer (`m_gate` / `m_up` /
+`m_down`, rebuilt after loading): 0.7 MB per layer at block 64, 44 MB element-wise, against 142 MB of kept values at
+keep 0.2. A row's bitmap of up to 8 words (blocks of 64: 2 to 5 words) is loaded once per tile into registers, so
+the K loop only does bit arithmetic before gathering the kept values; longer rows read their word per tile. Storage
+per delta: `keep` of dense, e.g. 20%, plus the bitmap.
 
-RTX 6000 Ada, hidden 2560, inter 9216, 5 deltas + zero expert, top-1, bf16, ms per layer:
+The bitmap replaced Philox in the kernel (one Philox per block per tile). ms per layer, top-1, 5 deltas + zero
+expert, hidden 2560, inter 9216:
 
-| tokens | plain grouped | param Triton (dense $\Delta$) | DARE 0.2, block 64 | DARE 0.2, element-wise |
-|---:|---:|---:|---:|---:|
-| 1 | 0.743 | **0.562** | 0.605 | 1.896 |
-| 8 | 1.056 | 0.936 | **0.754** | 3.297 |
-| 32 | 1.394 | 1.083 | **0.953** | 4.068 |
-| 512 | 1.623 | 1.246 | **1.164** | 4.024 |
-| 4096 | **5.660** | 5.802 | 6.592 | 20.897 |
+| tokens | dense $\Delta$ | block 64, Philox | **block 64, bitmap** | element-wise, Philox | **element-wise, bitmap** |
+|---:|---:|---:|---:|---:|---:|
+| RTX 6000 Ada, 8 | 0.69 | 0.50 | **0.44** | 4.79 | **0.61** |
+| RTX 6000 Ada, 32 | 1.02 | 0.64 | **0.54** | 7.08 | **0.92** |
+| RTX 6000 Ada, 512 | 1.15 | 1.35 | **1.28** | 6.05 | **1.67** |
+| RTX 6000 Ada, 2048 | 2.96 | 4.03 | **3.55** | 18.9 | **5.0** |
+| H200, 8 | 0.231 | 0.739 | **0.488** | | 0.693 |
+| H200, 32 | 0.267 | 0.852 | **0.676** | | 0.932 |
+| H200, 512 | 0.384 | 1.153 | **0.982** | | 1.379 |
+| H200, 8192 | 3.43 | 8.85 | **7.64** | | 10.59 |
 
-Element-wise DARE needs one Philox per element and every expert group recomputes its whole mask each call, so it is
-compute-bound and slow; with blocks Philox runs once per block. Accuracy of block DARE on the real model:
+Element-wise DARE was compute-bound under Philox (one per element, every expert group recomputing its mask each
+call); with the bitmap it is within 1.5x of blocks. Reading the bitmap per tile instead of from registers made block 64
+on the Ada slower than Philox at decode (8 tokens 0.78 ms): the mask load and the gather that depends on it could not
+be pipelined. On the H200 DARE stays about 2x slower than dense deltas: the gather of kept values, not the mask, is
+what is left. Accuracy of block DARE on the real model:
 ntu-projects `moe-indomain-acc` log [35] (blocks 4 to 256 at 20% match element-wise DARE).
 
 ## Fused Triton kernel
@@ -125,26 +135,26 @@ H200, top-1 / top-2, ms per layer (hidden 2560, inter 9216, 5 deltas + zero expe
 
 | tokens | plain grouped | param (materialised) | **param Triton** | Triton, graph | DARE 0.2 block 64 |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 0.359 / 0.396 | 0.303 / 0.526 | 0.177 / 0.190 | **0.095 / 0.137** | 0.328 / 0.437 |
-| 8 | 0.546 / 0.552 | 1.058 / 1.083 | 0.231 / 0.244 | **0.215 / 0.223** | 0.739 / 0.747 |
-| 32 | 0.566 / 0.603 | 1.287 / 1.325 | 0.273 / 0.298 | **0.258 / 0.278** | 0.852 / 0.914 |
-| 512 | 0.566 / 0.674 | 1.339 / 1.444 | 0.378 / 0.641 | **0.358 / 0.609** | 1.153 / 1.776 |
-| 2048 | 0.972 / **1.332** | 1.641 / 2.220 | 0.970 / 1.822 | **0.929** / 1.749 | 2.645 / 4.859 |
-| 8192 | **2.450 / 4.289** | 3.301 / 5.247 | 3.306 / 6.780 | 3.168 / 6.263 | 8.854 / 17.061 |
+| 1 | 0.359 / 0.396 | 0.303 / 0.526 | 0.177 / 0.190 | **0.095 / 0.137** | 0.256 / 0.341 |
+| 8 | 0.546 / 0.552 | 1.058 / 1.083 | 0.231 / 0.244 | **0.215 / 0.223** | 0.488 / 0.688 |
+| 32 | 0.566 / 0.603 | 1.287 / 1.325 | 0.273 / 0.298 | **0.258 / 0.278** | 0.676 / 0.695 |
+| 512 | 0.566 / 0.674 | 1.339 / 1.444 | 0.378 / 0.641 | **0.358 / 0.609** | 0.982 / 1.541 |
+| 2048 | 0.972 / **1.332** | 1.641 / 2.220 | 0.970 / 1.822 | **0.929** / 1.749 | 2.298 / 4.220 |
+| 8192 | **2.450 / 4.289** | 3.301 / 5.247 | 3.306 / 6.780 | 3.168 / 6.263 | 7.643 / 14.708 |
 
 RTX 6000 Ada, top-1 / top-2:
 
 | tokens | plain grouped | param (materialised) | **param Triton** | Triton, graph | DARE 0.2 block 64 |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 0.736 / 0.822 | 0.916 / 1.057 | 0.434 / 0.469 | **0.355 / 0.357** | 0.390 / 0.438 |
-| 8 | 1.067 / 1.245 | 3.009 / 3.838 | 0.844 / 1.014 | 0.822 / 0.990 | **0.513 / 0.574** |
-| 32 | 1.432 / 1.425 | 4.058 / 4.085 | 1.014 / 1.020 | 0.992 / 1.004 | **0.630 / 0.656** |
-| 512 | 1.629 / 1.795 | 4.257 / 4.363 | 1.152 / 1.613 | **1.136** / 1.699 | 1.380 / 2.358 |
-| 2048 | **2.786** / 5.504 | 5.572 / 8.045 | 2.866 / 5.817 | 3.107 / 5.636 | 3.918 / 7.699 |
-| 8192 | 12.522 / 24.998 | 14.386 / 24.907 | 11.345 / 24.637 | **10.526 / 23.902** | 14.969 / 30.730 |
+| 1 | 0.736 / 0.822 | 0.916 / 1.057 | 0.434 / 0.469 | **0.355 / 0.357** | 0.412 / 0.329 |
+| 8 | 1.067 / 1.245 | 3.009 / 3.838 | 0.844 / 1.014 | 0.822 / 0.990 | **0.446 / 0.556** |
+| 32 | 1.432 / 1.425 | 4.058 / 4.085 | 1.014 / 1.020 | 0.992 / 1.004 | **0.545 / 0.543** |
+| 512 | 1.629 / 1.795 | 4.257 / 4.363 | 1.152 / 1.613 | **1.136** / 1.699 | 1.270 / 2.170 |
+| 2048 | **2.786** / 5.504 | 5.572 / 8.045 | 2.866 / 5.817 | 3.107 / 5.636 | 3.545 / 7.043 |
+| 8192 | 12.522 / 24.998 | 14.386 / 24.907 | 11.345 / 24.637 | **10.526 / 23.902** | 13.167 / 27.388 |
 
 - Against the previous single-projection kernel (5522b23, the per-GPU tables below), H200 top-1: 1 token 0.336 → 0.177 ms eager, 0.095 in a graph; 32 tokens 0.359 → 0.273, 0.258 in a graph. Ada 1 token: 0.538 → 0.434. The graph numbers show how much of decode is launch overhead.
-- DARE regenerates its mask with Philox, which is integer arithmetic. The H200 has no more integer throughput than the Ada, so DARE gains less there than dense deltas do. It is faster than dense deltas on the Ada at 8–32 tokens, because it reads 20% of the delta bytes, but not on the H200.
+- DARE (bitmap, see [Seeded DARE deltas](#seeded-dare-deltas)) is faster than dense deltas on the Ada up to 32 tokens, because it reads 20% of the delta bytes; on the H200 the gather of kept values keeps it about 2x slower than dense.
 
 ### Training
 

@@ -1,13 +1,17 @@
 """Seeded DARE deltas: each Delta_e keeps a random fraction `keep` of its entries (or of its 1 x block blocks along
 the input dimension), rescaled by 1/keep; only the kept values are stored. The mask is not stored: it is a function of
-(seed, expert, projection, position) through Philox4x32-10, pure 32-bit integer arithmetic, so the packer (any
-device, torch) and the fused kernel (Triton tl.randint) regenerate the same bits on any hardware.
+(seed, expert, projection, position) through Philox4x32-10, pure 32-bit integer arithmetic, so it regenerates
+bit for bit on any device.
 
 Mask spec, for projection j (0 gate, 1 up, 2 down) of delta e, an (R, C) matrix, block size B dividing C:
   unit u = row * (C / B) + col // B,  counter = (u, 3e + j, 0, 0),  key = (seed mod 2^32, seed >> 32)
   kept  <=>  word 0 of Philox4x32-10(counter, key) < round(keep * 2^32)
 Kept values are stored row-major, expert by expert, as Delta / keep in the model dtype; p_<proj> (N, R) holds where
-each row starts.
+each row starts. The fused kernel reads the mask as a bitmap (mask_bits: 1 bit per block, built once per model and
+kept as a non-persistent buffer) rather than running Philox per tile: rows x C / B bits per delta matrix, e.g. 0.7 MB
+per Qwen3.5-4B MoE layer at block 64. It is built in __init__ and again after load_state_dict (which also covers a
+model made on the meta device), never inside a forward: there it could land in a CUDA-graph capture or a compiled
+trace. seed, keep and block are fixed at construction.
 """
 
 from typing import Any
@@ -61,6 +65,17 @@ def keep_mask(
     return kept.view(rows, -1).repeat_interleave(block, 1)
 
 
+def mask_bits(seed: int, stream: int, rows: int, cols: int, keep: float, block: int, device: Any = "cpu") -> Tensor:
+    """keep_mask as a bitmap: (rows, ceil(cols / block / 32)) int32, block j of a row in bit j % 32 of word j // 32."""
+    u = torch.arange(rows * (cols // block), device=device)
+    z = torch.zeros_like(u)
+    kept = (philox(u, z + stream, z, z, seed & M32, seed >> 32) < threshold(keep)).view(rows, -1)
+    words = -(-kept.shape[1] // 32)
+    kept = torch.nn.functional.pad(kept, (0, words * 32 - kept.shape[1])).view(rows, words, 32).long()
+    w = (kept << torch.arange(32, device=device)).sum(-1)
+    return torch.where(w >= 2**31, w - 2**32, w).to(torch.int32)
+
+
 def pack(
     d: Tensor, seed: int, j: int, keep: float, block: int
 ) -> tuple[Tensor, Tensor]:
@@ -108,6 +123,8 @@ class DareDeltaMoE(DeltaMoE):
     ) -> None:
         super().__init__(hidden, inter, n_delta, top_k, num_zero_experts, device, dtype)
         self.keep, self.block, self.seed = keep, block, seed
+        self._mask_bits()
+        self.register_load_state_dict_post_hook(lambda mod, _: mod._mask_bits())
 
     def _init_deltas(
         self, n: int, inter: int, hidden: int, factory: dict[str, Any]
@@ -123,6 +140,8 @@ class DareDeltaMoE(DeltaMoE):
             self.register_buffer(
                 f"p_{name}", torch.empty(0, dtype=torch.int64, device=factory["device"])
             )
+            # derived from (seed, keep, block, shape) alone: built by _mask_bits, never saved
+            self.register_buffer(f"m_{name}", torch.empty(0, dtype=torch.int32, device=factory["device"]), persistent=False)
 
     @classmethod
     @torch.no_grad()
@@ -177,10 +196,23 @@ class DareDeltaMoE(DeltaMoE):
         # the kernel's K tile and the block must divide one another; tiles are powers of 2
         return self.block & (self.block - 1) == 0 and super()._use_triton(x)
 
+    @torch.no_grad()
+    def _mask_bits(self) -> None:
+        """(Re)build m_<proj> (G, R, words) with mask_bits on the buffers' device (skipped on meta: built after
+        load_state_dict)."""
+        for j, n in enumerate(PROJ):
+            dev = getattr(self, f"v_{n}").device
+            if dev.type == "meta":
+                continue
+            G, R, C = self.shapes[n]
+            bits = [mask_bits(self.seed, 3 * e + j, R, C, self.keep, self.block, dev) for e in range(G)]
+            setattr(self, f"m_{n}", torch.stack(bits) if bits else torch.zeros(0, R, 1, dtype=torch.int32, device=dev))
+
     def _kernel_deltas(self) -> "tuple[Delta, Delta, Delta]":
         from ..triton_kernels import Delta
 
-        t = threshold(self.keep)
+        if any(getattr(self, f"m_{n}").ndim != 3 for n in PROJ):  # e.g. made on meta, then to_empty, no load
+            raise RuntimeError("DareDeltaMoE mask bitmaps not built: call load_state_dict or _mask_bits() first")
         return tuple(  # type: ignore[return-value]
-            Delta(1, getattr(self, f"v_{n}"), getattr(self, f"p_{n}"), self.seed, t, self.block) for n in PROJ
+            Delta(1, getattr(self, f"v_{n}"), getattr(self, f"p_{n}"), getattr(self, f"m_{n}"), self.block) for n in PROJ
         )
