@@ -138,12 +138,17 @@ class DeltaMoE(nn.Module):
             dst.copy_(torch.stack([w[i] for w in experts]) - b)
         return m
 
-    def route(self, x: Tokens) -> tuple[Experts, RouteWeights]:
-        # float32 softmax and renormalisation, as transformers' MoE routers do (bf16 can flip near-ties)
+    def topk(self, x: Tokens) -> tuple[Tensor, Tensor]:
+        """Router index (>= n_delta: a zero expert) and float32 renormalised weight per slot, both (T, k): float32
+        softmax and renormalisation as transformers' MoE routers do (bf16 can flip near-ties). Every forward routes
+        through this one call, so they all pick the same experts, ties included."""
         r, i = self.router(x).softmax(-1, dtype=torch.float).topk(self.top_k, dim=-1)
-        return torch.where(i < self.n_delta, i, -1), (r / r.sum(-1, keepdim=True)).to(
-            x.dtype
-        )
+        return i, r / r.sum(-1, keepdim=True)
+
+    def route(self, x: Tokens) -> tuple[Experts, RouteWeights]:
+        """topk with every zero expert as -1 and the weights in the model dtype (the PyTorch forwards)."""
+        i, r = self.topk(x)
+        return torch.where(i < self.n_delta, i, -1), r.to(x.dtype)
 
     def weights(self, e: int) -> MLPWeights:
         if e < 0:
@@ -245,40 +250,19 @@ class DeltaMoE(nn.Module):
         return (o.view(-1, self.top_k, x.shape[-1]) * r[..., None]).sum(1)
 
     def _forward_param_triton(self, x: Tokens) -> Tokens:
-        """Parameter aggregation with W_b + Delta_e fused into the GEMM (triton_kernels/delta_gmm.py), all (token, slot)
-        pairs in one launch per projection. CUDA, bf16/fp16."""
-        idx, r = self.route(x)
-        n, k = self.n_delta, self.top_k
-        e = idx.flatten()
-        e = torch.where(e < 0, n, e)  # every zero expert -> group n (W_b alone)
-        order = e.argsort()
-        counts = torch.zeros(n + 1, dtype=torch.int32, device=x.device)
-        counts.scatter_add_(
-            0, e, torch.ones_like(e, dtype=torch.int32)
-        )  # no host sync, unlike bincount
-        ends = counts.cumsum(0, dtype=torch.int32)
-        starts = ends - counts
-        # largest group bounds the grid; for few pairs use the pair count instead of syncing to read it
-        max_rows = e.numel() if e.numel() <= 1024 else int(counts.max())
-        xs = x[order // k]
-        groups = (starts, ends, max_rows)
-        g = self._fused_gmm(xs, 0, *groups)
-        u = self._fused_gmm(xs, 1, *groups)
-        o = self._fused_gmm(F.silu(g) * u, 2, *groups)
-        out = torch.empty_like(o)
-        out[order] = o
-        return (out.view(-1, k, x.shape[-1]) * r[..., None]).sum(1)
+        """Parameter aggregation with W_b + Delta_e fused into the GEMMs (triton_kernels/fused.py): the routing
+        (topk) sorted in one kernel, gate/up with SiLU * up in one, down with the routing weights in one; no host
+        sync, so it can be captured in a CUDA graph. CUDA, bf16/fp16."""
+        from ..triton_kernels import fused_moe
 
-    def _fused_gmm(
-        self, x: Tensor, j: int, starts: Tensor, ends: Tensor, max_rows: int
-    ) -> Tensor:
-        """Projection j (0 gate, 1 up, 2 down) of rows grouped by expert, W_b + Delta_g fused in the GEMM."""
-        from ..triton_kernels import delta_gmm
+        idx, r = self.topk(x)
+        return fused_moe(x, idx, r, self.n_delta, (self.gate, self.up, self.down), self._kernel_deltas())
 
-        wb = (self.gate, self.up, self.down)[j]
-        return delta_gmm(
-            x, wb, (self.d_gate, self.d_up, self.d_down)[j], starts, ends, max_rows
-        )
+    def _kernel_deltas(self) -> "tuple[Delta, Delta, Delta]":
+        """The deltas in the form the fused kernels take; dare.DareDeltaMoE overrides it with its packed storage."""
+        from ..triton_kernels import Delta
+
+        return Delta(0, self.d_gate), Delta(0, self.d_up), Delta(0, self.d_down)
 
     def _grouped(self, x: Tokens) -> bool:
         """Use grouped GEMM? Needs F.grouped_mm with this dtype on this device, and more than one (token, slot) pair
@@ -295,26 +279,40 @@ class DeltaMoE(nn.Module):
             and x.shape[0] * self.top_k >= GROUPED_MIN_PAIRS
         )
 
+    def _needs_grad(self, x: Tokens) -> bool:
+        return torch.is_grad_enabled() and (x.requires_grad or any(p.requires_grad for p in self.parameters()))
+
     def _use_triton(self, x: Tokens) -> bool:
-        """Fused Triton parameter aggregation? Triton, CUDA, a TRITON_DTYPES dtype, no gradient needed (the kernels are
-        forward-only), and a (token, slot) pair count within TRITON_MIN_PAIRS .. TRITON_MAX_PAIRS_{HOPPER,OLDER}.
-        """
+        """Fused Triton kernels? Triton, CUDA and a TRITON_DTYPES dtype; without gradients also a (token, slot) pair
+        count within TRITON_MIN_PAIRS .. TRITON_MAX_PAIRS_{HOPPER,OLDER} (with gradients always: the autograd
+        path saves no materialised weights)."""
         if not (HAS_TRITON and x.is_cuda and x.dtype in TRITON_DTYPES):
             return False
-        # the kernels have no backward: while training, the PyTorch path (autograd, DDP/FSDP) instead
-        if torch.is_grad_enabled() and (
-            x.requires_grad or any(p.requires_grad for p in self.parameters())
-        ):
-            return False
+        if self._needs_grad(x):  # weight gradients use F.grouped_mm
+            return hasattr(F, "grouped_mm") or not any(
+                p.requires_grad for n, p in self.named_parameters() if n != "router.weight"
+            )
         hopper = torch.cuda.get_device_capability(x.device) >= (9, 0)
         limit = TRITON_MAX_PAIRS_HOPPER if hopper else TRITON_MAX_PAIRS_OLDER
         return TRITON_MIN_PAIRS <= x.shape[0] * self.top_k <= limit
 
+    def _forward_param_autograd(self, x: Tokens) -> Tokens:
+        """Differentiable fused parameter aggregation (triton_kernels/train.py): the routing runs in torch autograd
+        (the router gets its gradient through the routing weights), the MoE in one autograd.Function that saves only
+        its inputs and recomputes the rest in backward. Gradients to x, the routing weights and any weight that
+        requires grad; top-k up to every expert. DARE deltas are used unpacked (dense)."""
+        from ..triton_kernels.train import fused_moe_autograd
+
+        idx, r = self.topk(x)
+        return fused_moe_autograd(x, idx, r, (self.gate, self.up, self.down),
+                                  (self.d_gate, self.d_up, self.d_down), self.n_delta)  # fmt: skip
+
     def forward_param(self, x: Tokens) -> Tokens:
-        """Parameter aggregation: the fused Triton kernel when _use_triton, else materialised W_b + Delta_e (experts
-        with fewer than PARAM_MIN_ROWS routed rows skip the materialisation)."""
+        """Parameter aggregation: the fused Triton kernels when _use_triton (differentiable when a gradient is
+        needed), else materialised W_b + Delta_e (experts with fewer than PARAM_MIN_ROWS routed rows skip the
+        materialisation)."""
         if self._use_triton(x):
-            return self._forward_param_triton(x)
+            return self._forward_param_autograd(x) if self._needs_grad(x) else self._forward_param_triton(x)
         return self._forward_param(x, min_rows=PARAM_MIN_ROWS)
 
     def forward_matrix(self, x: Tokens) -> Tokens:

@@ -1,6 +1,5 @@
 """Fused Triton kernels for parameter aggregation (import needs triton)."""
 
-from .dare_gmm import dare_gmm
-from .delta_gmm import delta_gmm
+from .fused import Delta, fused_moe_any as fused_moe
 
-__all__ = ["dare_gmm", "delta_gmm"]
+__all__ = ["Delta", "fused_moe"]

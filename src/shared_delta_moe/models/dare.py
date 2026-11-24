@@ -91,7 +91,7 @@ def unpack(
 class DareDeltaMoE(DeltaMoE):
     """DeltaMoE whose deltas are seeded DARE (see the module docstring). d_gate / d_up / d_down unpack to dense
     tensors on access, so every inherited forward works (as a slow reference); the fused Triton path reads the packed
-    values directly (triton_kernels/dare_gmm.py). Build with from_delta_moe."""
+    values directly (triton_kernels/fused.py). Build with from_delta_moe."""
 
     def __init__(
         self,
@@ -173,23 +173,10 @@ class DareDeltaMoE(DeltaMoE):
     def d_down(self) -> Tensor:  # type: ignore[override]
         return self._delta(2)
 
-    def _fused_gmm(
-        self, x: Tensor, j: int, starts: Tensor, ends: Tensor, max_rows: int
-    ) -> Tensor:
-        from ..triton_kernels import dare_gmm
+    def _kernel_deltas(self) -> "tuple[Delta, Delta, Delta]":
+        from ..triton_kernels import Delta
 
-        name = PROJ[j]
-        v, p = getattr(self, f"v_{name}"), getattr(self, f"p_{name}")
-        return dare_gmm(
-            x,
-            getattr(self, name),
-            v,
-            p,
-            self.seed,
-            j,
-            self.keep,
-            self.block,
-            starts,
-            ends,
-            max_rows,
+        t = threshold(self.keep)
+        return tuple(  # type: ignore[return-value]
+            Delta(1, getattr(self, f"v_{n}"), getattr(self, f"p_{n}"), self.seed, t, self.block) for n in PROJ
         )

@@ -110,14 +110,12 @@ def test_triton_matches_materialised_param():
                 assert rel < 2e-2, (name, z, k, hidden, t, rel)
 
 
-def test_training_skips_forward_only_kernel():
+def test_training_uses_autograd_path():
     if not torch.cuda.is_available():
         print("skipped: no CUDA")
         return
     m, _, x = make(1, 2, 256, 384, torch.bfloat16, "cuda")
-    m.forward_param(
-        x[:37]
-    ).float().sum().backward()  # grad enabled: the autograd path, not the Triton kernel
+    m.forward_param(x[:37]).float().sum().backward()  # grad enabled: the differentiable fused path
     assert m.d_gate.grad is not None and m.d_gate.grad.abs().sum() > 0
     with torch.no_grad():
         assert m._use_triton(x[:37]) == HAS_TRITON

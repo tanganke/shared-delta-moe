@@ -50,6 +50,7 @@ def main() -> None:
         "param triton": m._forward_param_triton,
         "matrix loop": m._forward_matrix,
         "matrix grouped": m._forward_matrix_grouped,
+        "param triton graph": m._forward_param_triton,  # replayed from a CUDA graph (needs no host sync)
     } | {k: d._forward_param_triton for k, d in dare.items()}
     if a.only:
         forms = {k: f for k, f in forms.items() if k in a.only.split(",")}
@@ -60,9 +61,14 @@ def main() -> None:
     for t in map(int, a.tokens.split(",")):
         x = torch.randn(t, a.hidden, dtype=torch.bfloat16, device="cuda")
         row = []
-        for f in forms.values():
+        for name, f in forms.items():
             for _ in range(3):  # also runs Triton's autotuning
                 f(x)
+            if name.endswith(" graph"):
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g):
+                    f(x)
+                f = lambda _: g.replay()  # noqa: E731
             torch.cuda.synchronize()
             s = time.perf_counter()
             for _ in range(20):
