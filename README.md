@@ -9,11 +9,16 @@ src/shared_delta_moe/triton_kernels/      fused Triton kernels: delta_gmm.py (gr
                                           formed in registers), dare_gmm.py (the same with seeded-DARE deltas),
                                           configs.py (shared autotune configs)
 src/shared_delta_moe/models/dare.py       seeded DARE: Philox mask, pack/unpack, DareDeltaMoE
+src/shared_delta_moe/models/qwen3_5/qwen3_5_delta_moe/
+                                          transformers' Qwen3.5 MoE with DeltaMoE blocks (forward_param): modeling.py
+                                          (patches the decoder layer for configs with delta_moe_zero_experts), convert.py
+                                          (plain MoE checkpoint -> delta layout)
 src/shared_delta_moe/constants.py         HAS_TRITON and the thresholds that pick an implementation
 src/shared_delta_moe/type_hints.py        shape-annotated tensor aliases (T tokens, H hidden, ...)
 src/shared_delta_moe/testing.py           random_experts for tests and benchmarks
 tests/test_delta_moe.py                   every forward == plain MoE, token by token (Triton part needs CUDA)
 tests/test_dare.py                        Philox known-answer, CPU == CUDA == Triton masks, DARE forwards
+tests/test_qwen3_5_delta_moe.py           tiny Qwen3.5 MoE: converted == stock MoE at top-1, top-2, soft routing
 benchmarks/bench.py                       per-layer time of each implementation (CUDA)
 ```
 
@@ -63,6 +68,20 @@ Build one from a plain MoE with `DeltaMoE.from_experts(base, experts, router, to
 transformers' fused layout maps over as `gate, up = gate_up_proj[e].chunk(2)` and `down = down_proj[e]`. In bf16, $W_b + (W_e - W_b)$ is not always exactly $W_e$ (about 0.6% of elements in our model).
 
 Apart from the Triton kernel, everything is `F.linear` (cuBLAS), `F.grouped_mm` (PyTorch's own grouped GEMM: CUDA sm80+ or CPU, bf16/fp16/fp32) and `index_add`. bf16/fp16 are the targets; fp32 is supported (and used for the CPU tests), fp64 is not.
+
+## Qwen3.5 in transformers
+
+```bash
+python -m shared_delta_moe.models.qwen3_5.qwen3_5_delta_moe.convert PLAIN_MOE OUT [--base INDEX] [--top-k K]
+```
+
+```python
+import shared_delta_moe.models.qwen3_5.qwen3_5_delta_moe  # patches Qwen3_5MoeDecoderLayer
+model = AutoModelForImageTextToText.from_pretrained(OUT, num_experts_per_tok=2)  # or AutoModelForCausalLM
+```
+
+The plain MoE's expert BASE becomes $W_b$ and the zero expert; the others become $\Delta_e$. Its shared expert must
+have no output. `num_experts_per_tok` is the top-k at load time (= `num_experts` for soft routing over all experts).
 
 ## Seeded DARE deltas
 

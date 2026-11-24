@@ -8,9 +8,15 @@ dependencies = ["torch"]
 
 [project.optional-dependencies]
 triton = ["triton"]
+transformers = ["transformers>=5.13"]
 
 [dependency-groups]
-dev = ["pytest", "mypy", "black"]
+dev = [
+    "pytest",
+    "mypy",
+    "black",
+    "transformers==5.16.1",
+]
 
 [build-system]
 requires = ["hatchling"]
