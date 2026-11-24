@@ -29,7 +29,7 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-from torch import nn
+from torch import Tensor, nn
 
 from .constants import (
     GROUPED_DTYPES,
@@ -81,7 +81,11 @@ class DeltaMoE(nn.Module):
         def p(*shape: int) -> nn.Parameter:
             return nn.Parameter(torch.empty(*shape, **factory))
 
-        self.top_k, self.num_zero_experts = top_k, num_zero_experts
+        self.top_k, self.num_zero_experts, self.n_delta = (
+            top_k,
+            num_zero_experts,
+            n_delta,
+        )
         self.router = nn.Linear(
             hidden, n_delta + num_zero_experts, bias=False, **factory
         )
@@ -90,10 +94,16 @@ class DeltaMoE(nn.Module):
             p(inter, hidden),
             p(hidden, inter),
         )
+        self._init_deltas(n_delta, inter, hidden, factory)
+
+    def _init_deltas(
+        self, n: int, inter: int, hidden: int, factory: dict[str, Any]
+    ) -> None:
+        """Delta storage; a subclass with another format (dare.DareDeltaMoE) overrides this and d_gate/d_up/d_down."""
         self.d_gate, self.d_up, self.d_down = (
-            p(n_delta, inter, hidden),
-            p(n_delta, inter, hidden),
-            p(n_delta, hidden, inter),
+            nn.Parameter(torch.empty(n, inter, hidden, **factory)),
+            nn.Parameter(torch.empty(n, inter, hidden, **factory)),
+            nn.Parameter(torch.empty(n, hidden, inter, **factory)),
         )
 
     @classmethod
@@ -130,7 +140,7 @@ class DeltaMoE(nn.Module):
 
     def route(self, x: Tokens) -> tuple[Experts, RouteWeights]:
         r, i = self.router(x).softmax(-1).topk(self.top_k, dim=-1)
-        return torch.where(i < self.d_gate.shape[0], i, -1), r / r.sum(-1, keepdim=True)
+        return torch.where(i < self.n_delta, i, -1), r / r.sum(-1, keepdim=True)
 
     def weights(self, e: int) -> MLPWeights:
         if e < 0:
@@ -210,9 +220,7 @@ class DeltaMoE(nn.Module):
         """forward_matrix with the deltas of all (token, slot) pairs done as one grouped GEMM per projection."""
         idx, r = self.route(x)
         tok = torch.arange(idx.numel(), device=x.device) // self.top_k  # pair -> token
-        rows, offs = sort_rows(
-            idx.flatten(), self.d_gate.shape[0]
-        )  # pairs with a delta
+        rows, offs = sort_rows(idx.flatten(), self.n_delta)  # pairs with a delta
         xs = x[tok[rows]]
         g = F.linear(x, self.gate)[tok].index_add(0, rows, gmm(xs, self.d_gate, offs))
         u = F.linear(x, self.up)[tok].index_add(0, rows, gmm(xs, self.d_up, offs))
@@ -236,10 +244,8 @@ class DeltaMoE(nn.Module):
     def _forward_param_triton(self, x: Tokens) -> Tokens:
         """Parameter aggregation with W_b + Delta_e fused into the GEMM (triton_kernels.delta_gmm), all (token, slot)
         pairs in one launch per projection. CUDA, bf16/fp16."""
-        from .triton_kernels import delta_gmm
-
         idx, r = self.route(x)
-        n, k = self.d_gate.shape[0], self.top_k
+        n, k = self.n_delta, self.top_k
         e = idx.flatten()
         e = torch.where(e < 0, n, e)  # every zero expert -> group n (W_b alone)
         order = e.argsort()
@@ -253,12 +259,23 @@ class DeltaMoE(nn.Module):
         max_rows = e.numel() if e.numel() <= 1024 else int(counts.max())
         xs = x[order // k]
         groups = (starts, ends, max_rows)
-        g = delta_gmm(xs, self.gate, self.d_gate, *groups)
-        u = delta_gmm(xs, self.up, self.d_up, *groups)
-        o = delta_gmm(F.silu(g) * u, self.down, self.d_down, *groups)
+        g = self._fused_gmm(xs, 0, *groups)
+        u = self._fused_gmm(xs, 1, *groups)
+        o = self._fused_gmm(F.silu(g) * u, 2, *groups)
         out = torch.empty_like(o)
         out[order] = o
         return (out.view(-1, k, x.shape[-1]) * r[..., None]).sum(1)
+
+    def _fused_gmm(
+        self, x: Tensor, j: int, starts: Tensor, ends: Tensor, max_rows: int
+    ) -> Tensor:
+        """Projection j (0 gate, 1 up, 2 down) of rows grouped by expert, W_b + Delta_g fused in the GEMM."""
+        from .triton_kernels import delta_gmm
+
+        wb = (self.gate, self.up, self.down)[j]
+        return delta_gmm(
+            x, wb, (self.d_gate, self.d_up, self.d_down)[j], starts, ends, max_rows
+        )
 
     def _grouped(self, x: Tokens) -> bool:
         """Use grouped GEMM? Needs F.grouped_mm with this dtype on this device, and more than one (token, slot) pair

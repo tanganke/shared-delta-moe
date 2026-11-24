@@ -1,6 +1,6 @@
 """Per-layer time of each implementation on CUDA, bf16, eager.
 
-python benchmarks/bench.py [--top-k K] [--tokens 1,32,512,8192]
+python benchmarks/bench.py [--top-k K] [--tokens 1,32,512,8192] [--dare 0.2:1,0.2:64] [--only NAME,...]
 """
 
 import argparse
@@ -9,7 +9,7 @@ from collections.abc import Callable
 
 import torch
 
-from shared_delta_moe import DeltaMoE, random_experts
+from shared_delta_moe import DareDeltaMoE, DeltaMoE, random_experts
 
 
 @torch.no_grad()
@@ -21,6 +21,11 @@ def main() -> None:
     ap.add_argument("--inter", type=int, default=9216)
     ap.add_argument("--deltas", type=int, default=5)
     ap.add_argument(
+        "--dare",
+        default="0.2:1,0.2:64",
+        help="seeded-DARE settings keep:block, comma-separated",
+    )
+    ap.add_argument(
         "--only", default="", help="comma-separated implementation names to run"
     )
     a = ap.parse_args()
@@ -30,6 +35,13 @@ def main() -> None:
     m = DeltaMoE.from_experts(full[0], full[1:], router, a.top_k)
     del full
     experts = m.dense_experts()
+    dare = {
+        f"dare {s}": DareDeltaMoE.from_delta_moe(
+            m, float(s.split(":")[0]), int(s.split(":")[1])
+        )
+        for s in a.dare.split(",")
+        if s
+    }
     forms: dict[str, Callable] = {
         "dense loop": lambda x: m._forward_dense(x, experts),
         "dense grouped": lambda x: m._forward_dense_grouped(x, experts),
@@ -38,7 +50,7 @@ def main() -> None:
         "param triton": m._forward_param_triton,
         "matrix loop": m._forward_matrix,
         "matrix grouped": m._forward_matrix_grouped,
-    }
+    } | {k: d._forward_param_triton for k, d in dare.items()}
     if a.only:
         forms = {k: f for k, f in forms.items() if k in a.only.split(",")}
     print(

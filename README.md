@@ -5,11 +5,14 @@ A small Python library: a top-k SwiGLU MoE written as **a shared base expert plu
 ```
 src/shared_delta_moe/delta_moe.py       DeltaMoE: from_experts, routing, the forward implementations
 src/shared_delta_moe/ops.py             stateless helpers: mlp, grouping routed rows, one grouped GEMM
-src/shared_delta_moe/triton_kernels.py  delta_gmm: grouped GEMM over (W_b + Delta_g), the sum formed in registers
+src/shared_delta_moe/triton_kernels.py  delta_gmm: grouped GEMM over (W_b + Delta_g), the sum formed in registers;
+                                        dare_gmm: the same with seeded-DARE deltas
+src/shared_delta_moe/dare.py            seeded DARE: Philox mask, pack/unpack, DareDeltaMoE
 src/shared_delta_moe/constants.py       HAS_TRITON and the thresholds that pick an implementation
 src/shared_delta_moe/type_hints.py      shape-annotated tensor aliases (T tokens, H hidden, ...)
 src/shared_delta_moe/testing.py         random_experts for tests and benchmarks
 tests/test_delta_moe.py                 every forward == plain MoE, token by token (Triton part needs CUDA)
+tests/test_dare.py                      Philox known-answer, CPU == CUDA == Triton masks, DARE forwards
 benchmarks/bench.py                     per-layer time of each implementation (CUDA)
 ```
 
@@ -59,6 +62,30 @@ Build one from a plain MoE with `DeltaMoE.from_experts(base, experts, router, to
 transformers' fused layout maps over as `gate, up = gate_up_proj[e].chunk(2)` and `down = down_proj[e]`. In bf16, $W_b + (W_e - W_b)$ is not always exactly $W_e$ (about 0.6% of elements in our model).
 
 Apart from the Triton kernel, everything is `F.linear` (cuBLAS), `F.grouped_mm` (PyTorch's own grouped GEMM: CUDA sm80+ or CPU, bf16/fp16/fp32) and `index_add`. bf16/fp16 are the targets; fp32 is supported (and used for the CPU tests), fp64 is not.
+
+## Seeded DARE deltas
+
+`DareDeltaMoE.from_delta_moe(m, keep=0.2, block=64, seed=0)` keeps a random `keep` of each $\Delta_e$ (whole
+$1 \times$ `block` blocks along the input dimension; `block=1` is element-wise DARE), rescaled by $1/\text{keep}$, and
+stores only the kept values plus one int64 row start per weight row. The mask is not stored: it is Philox4x32-10 of
+(unit, 3e + projection) under the seed, pure 32-bit integer arithmetic, so torch on CPU or CUDA and Triton's
+`tl.randint` give the same bits (`tests/test_dare.py` checks a Random123 known-answer vector and all three against
+each other). The fused kernel regenerates the mask tile by tile, gathers the kept values and adds them to $W_b$ in
+registers. Storage per delta: `keep` of dense, e.g. 20%.
+
+RTX 6000 Ada, hidden 2560, inter 9216, 5 deltas + zero expert, top-1, bf16, ms per layer:
+
+| tokens | plain grouped | param Triton (dense $\Delta$) | DARE 0.2, block 64 | DARE 0.2, element-wise |
+|---:|---:|---:|---:|---:|
+| 1 | 0.743 | **0.562** | 0.605 | 1.896 |
+| 8 | 1.056 | 0.936 | **0.754** | 3.297 |
+| 32 | 1.394 | 1.083 | **0.953** | 4.068 |
+| 512 | 1.623 | 1.246 | **1.164** | 4.024 |
+| 4096 | **5.660** | 5.802 | 6.592 | 20.897 |
+
+Element-wise DARE needs one Philox per element and every expert group recomputes its whole mask each call, so it is
+compute-bound and slow; with blocks Philox runs once per block. Accuracy of block DARE on the real model:
+ntu-projects `moe-indomain-acc` log [35] (blocks 4 to 256 at 20% match element-wise DARE).
 
 ## Speed (single MoE layer, bf16, eager, ms)
 
