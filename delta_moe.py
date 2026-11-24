@@ -1,9 +1,9 @@
 """Top-k SwiGLU MoE written as a shared base expert plus per-expert deltas, with two exact forward forms.
 
-Routed expert e has weights W_e = W_b + Delta_e for each of gate, up and down. Router rows 0 .. Z-1 are zero
-experts (num_zero_experts = Z, default 1): no parameters, each stands for the base MLP itself; rows Z .. Z+n-1 are the
-deltas. Routing is softmax, top-k, renormalised over the k picks (weights r). Both forms below equal the plain MoE
-sum_i r_i MLP(x; W_{e_i})  with experts [W_b] * Z + [W_b + Delta_1, ..., W_b + Delta_n]; they differ only in where
+Routed expert e has weights W_e = W_b + Delta_e for each of gate, up and down. Router rows 0 .. n-1 are the
+deltas; rows n .. n+Z-1 are zero experts (num_zero_experts = Z, default 1): no parameters, each stands for the base
+MLP itself. Routing is softmax, top-k, renormalised over the k picks (weights r). Both forms below equal the plain MoE
+sum_i r_i MLP(x; W_{e_i})  with experts [W_b + Delta_1, ..., W_b + Delta_n] + [W_b] * Z; they differ only in where
 the addition happens:
 
   forward_param   parameter aggregation: per expert, materialise W_b + Delta_e once and run one MLP on the
@@ -40,7 +40,9 @@ InWeight: TypeAlias = Annotated[Tensor, "I H"]
 OutWeight: TypeAlias = Annotated[Tensor, "H I"]
 MLPWeights: TypeAlias = tuple[InWeight, InWeight, OutWeight]
 Group: TypeAlias = tuple[int, Rows, Coef]
-RouterWeight: TypeAlias = Annotated[Tensor, "Z+N H, rows 0..Z-1 = zero experts (base)"]
+RouterWeight: TypeAlias = Annotated[
+    Tensor, "N+Z H, rows N..N+Z-1 = zero experts (base)"
+]
 DenseExperts: TypeAlias = list[Annotated[Tensor, "N+1 out in, index 0 = base"]]
 
 
@@ -85,7 +87,7 @@ class DeltaMoE(nn.Module):
 
         self.top_k, self.num_zero_experts = top_k, num_zero_experts
         self.router = nn.Linear(
-            hidden, num_zero_experts + n_delta, bias=False, **factory
+            hidden, n_delta + num_zero_experts, bias=False, **factory
         )
         self.gate, self.up, self.down = (
             p(inter, hidden),
@@ -109,10 +111,11 @@ class DeltaMoE(nn.Module):
         num_zero_experts: int = 1,
     ) -> "DeltaMoE":
         """From a plain MoE: base = the base expert's (gate, up, down), experts = the other experts' full weights W_e,
-        router = the MoE's router weight, rows 0..Z-1 routing to the base (Z = num_zero_experts; 0: the base is only
-        shared, never an expert on its own). Stores W_b and Delta_e = W_e - W_b in the inputs' dtype."""
+        router = the MoE's router weight, rows n..n+Z-1 routing to the base (Z = num_zero_experts; 0: the base is only
+        shared, never an expert on its own). Stores W_b and Delta_e = W_e - W_b in the inputs' dtype.
+        """
         gate, up, down = base
-        assert router.shape[0] == num_zero_experts + len(experts)
+        assert router.shape[0] == len(experts) + num_zero_experts
         m = cls(
             gate.shape[1],
             gate.shape[0],
@@ -131,7 +134,7 @@ class DeltaMoE(nn.Module):
 
     def route(self, x: Tokens) -> tuple[Experts, RouteWeights]:
         r, i = self.router(x).softmax(-1).topk(self.top_k, dim=-1)
-        return (i - self.num_zero_experts).clamp(min=-1), r / r.sum(-1, keepdim=True)
+        return torch.where(i < self.d_gate.shape[0], i, -1), r / r.sum(-1, keepdim=True)
 
     def weights(self, e: int) -> MLPWeights:
         if e < 0:
@@ -216,7 +219,7 @@ def check() -> None:
         m = DeltaMoE.from_experts(
             full[0],
             full[1:],
-            torch.randn(z + 3, 16, dtype=torch.float64),
+            torch.randn(3 + z, 16, dtype=torch.float64),
             top_k=k,
             num_zero_experts=z,
         )
@@ -230,9 +233,9 @@ def check() -> None:
             or k == 1
             or (idx == -1).any(-1).logical_and((idx >= 0).any(-1)).any()
         ), "zero expert mixed with a delta"
-        assert z < 2 or k == 1 or (idx == -1).all(-1).any(), (
-            "two zero experts on one token"
-        )
+        assert (
+            z < 2 or k == 1 or (idx == -1).all(-1).any()
+        ), "two zero experts on one token"
         experts = m.dense_experts()
         assert all(
             torch.allclose(w[e], f[j])
@@ -261,9 +264,9 @@ def check() -> None:
         n = sum(
             p.numel() for name, p in m.named_parameters() if name != "router.weight"
         )
-        assert n == 4 * 3 * 16 * 24, (
-            "base + 3 deltas = 4 MLPs, zero experts add nothing"
-        )
+        assert (
+            n == 4 * 3 * 16 * 24
+        ), "base + 3 deltas = 4 MLPs, zero experts add nothing"
     print("check ok (0/1/2 zero experts x top-1/top-2)")
 
 
@@ -309,7 +312,9 @@ if __name__ == "__main__":
     check()
     if torch.cuda.is_available() and "--no-bench" not in sys.argv:
         bench(
-            top_k=int(sys.argv[sys.argv.index("--top-k") + 1])
-            if "--top-k" in sys.argv
-            else 1
+            top_k=(
+                int(sys.argv[sys.argv.index("--top-k") + 1])
+                if "--top-k" in sys.argv
+                else 1
+            )
         )
