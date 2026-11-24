@@ -65,7 +65,7 @@ top-2:
 - **Grouped GEMM** replaces the per-expert Python loop with one kernel per projection. From 32 to 512 tokens it is 1.3–2.3× faster than the loop, and top-2 gains the most, because the loop runs every expert of every slot separately. At 1 token, the extra sort and count make it slightly slower.
 - **Per-matrix output aggregation, grouped**: 1.3× the transformers MoE at 32 tokens (top-1 0.61 vs 0.47, top-2 0.63 vs 0.50), and about 1.9× at 8192 tokens (computing both $W_b$ and $\Delta_e$ roughly doubles the compute).
 - **Parameter aggregation** writes out a full weight matrix per expert, so it is the slowest at mid-range token counts. It does not fit grouped GEMM well: you would first have to write out $W_b+\Delta_e$ for every expert, which costs even more memory traffic.
-- The remaining gap between plain grouped and transformers (0.58 vs 0.47) is mainly the `nonzero` and `bincount` here, which synchronise the CPU and GPU; transformers uses `histc` and a fixed number of groups, which needs no sync.
+- The remaining gap between plain grouped and transformers (0.58 vs 0.47) probably comes from the `nonzero` and `bincount` here, which synchronise the CPU and GPU (transformers uses `histc` and a fixed number of groups, which needs no sync). Not profiled.
 
 The benefits of these forms are elsewhere. The delta $\Delta_e$ is a standalone tensor that can be compressed, sparsified or trained on its own; the zero expert has no parameters; and in per-matrix output aggregation the routing weight can stay in the computation graph.
 
