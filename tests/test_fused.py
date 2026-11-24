@@ -87,6 +87,37 @@ def test_every_config_matches_materialised():
             assert rel(got, want) < 2e-2, (type(m).__name__, t)
 
 
+def test_rounds_like_the_model():
+    """Real size (hidden 2560, inter 9216), deltas small next to W_b as in a fine-tuned MoE, 200 tokens: the fused
+    forward matches _forward_param, which rounds g, u, SiLU(g), h and y to bf16 like the original model, to 1e-3 (norm
+    relative). Computing the epilogue in fp32 instead was closer to exact but 4.5e-3 away from it per layer, which
+    lowered argmax agreement of a 32-layer Qwen3.5 with the original from 98.8% to 98.4%."""
+    if not GPU:
+        print("skipped: no CUDA/Triton")
+        return
+    from shared_delta_moe import DeltaMoE
+
+    red = torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False  # cuBLAS split-K sums in bf16 else
+    try:
+        g = torch.Generator().manual_seed(0)
+        H, I, n = 2560, 9216, 5
+        base = [torch.randn(I, H, generator=g) * 0.02, torch.randn(I, H, generator=g) * 0.02,
+                torch.randn(H, I, generator=g) * 0.02]  # fmt: skip
+        experts = [[b + torch.randn(b.shape, generator=g) * 0.004 for b in base] for _ in range(n)]
+        to = dict(device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(200, H, generator=g).to(**to)
+        for k in (1, 2):
+            m = DeltaMoE.from_experts([b.to(**to) for b in base], [[w.to(**to) for w in e] for e in experts],
+                                      (torch.randn(n + 1, H, generator=g) * H**-0.5).to(**to), k)  # fmt: skip
+            with torch.no_grad():
+                a, b = m._forward_param_triton(x).float(), m._forward_param(x).float()
+            err = ((a - b).norm() / b.norm()).item()
+            assert err < 1e-3, (k, err)
+    finally:
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = red
+
+
 def test_empty_and_all_zero_expert():
     if not GPU:
         print("skipped: no CUDA/Triton")

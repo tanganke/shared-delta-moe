@@ -263,7 +263,12 @@ def _gate_up_kernel(
             at = tl.trans(a)
             acc_g = tl.dot(wg + dg, at, acc_g)
             acc_u = tl.dot(wu + du, at, acc_u)
-        h = acc_g * tl.sigmoid(acc_g) * acc_u
+        # rounded where the PyTorch MLP rounds (g, u, SiLU(g), h: each a bf16/fp16 tensor there), so the result
+        # matches the model's own numerics; fp32 throughout is closer to exact but drifts from what the model
+        # was trained with (32-layer Qwen3.5: argmax agreement with the original 98.4% vs 98.8%)
+        dt = h_ptr.dtype.element_ty
+        g = acc_g.to(dt).to(tl.float32)
+        h = (g * tl.sigmoid(g)).to(dt).to(tl.float32) * acc_u.to(dt).to(tl.float32)
         tl.store(h_ptr + rows.to(tl.int64)[None, :] * shm + cols[:, None] * shn, h.to(h_ptr.dtype.element_ty),
                  mask=cmask[:, None] & rmask[None, :])  # fmt: skip
 
@@ -313,11 +318,14 @@ def _down_kernel(
                 dw, run = _dare_delta(d_ptr, run, k0, kk, dmask, (g * 3 + 2).to(tl.int64) << 32, unit0, seed, thresh, B, BN, BK)
             acc = tl.dot(w + dw, tl.trans(a), acc)
         pair = tl.load(perm_ptr + rows, mask=rmask, other=0)
-        y = acc * tl.load(rw_ptr + pair, mask=rmask, other=0.0)[None, :]
+        rw = tl.load(rw_ptr + pair, mask=rmask, other=0.0)
         omask = cmask[:, None] & rmask[None, :]
-        if S == 1:  # each pair's own slot
+        if S == 1:  # each pair's own slot; y and the routing weight rounded as in the PyTorch forward
+            dt = o_ptr.dtype.element_ty
+            y = acc.to(dt).to(tl.float32) * rw.to(dt).to(tl.float32)[None, :]
             tl.store(o_ptr + pair.to(tl.int64)[None, :] * som + cols[:, None] * son, y.to(o_ptr.dtype.element_ty), mask=omask)
         else:  # partial sums of all splits and slots into the token's float32 row
+            y = acc * rw[None, :]
             tl.atomic_add(o_ptr + (pair // TOPK).to(tl.int64)[None, :] * som + cols[:, None] * son, y, mask=omask, sem="relaxed")
 
 
