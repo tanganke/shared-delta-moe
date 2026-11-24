@@ -21,7 +21,7 @@ Adding r Delta_e x into one shared activation instead (merging weights per token
 because SwiGLU is nonlinear; each slot keeps its own activation here. With k = 1, r = 1 and both reduce to one MLP.
 
 Plain PyTorch (F.linear, F.grouped_mm, index_add), plus an optional Triton kernel for parameter aggregation that
-adds W_b + Delta_e tile by tile in registers instead of writing the sum out (triton_kernels.py).
+adds W_b + Delta_e tile by tile in registers instead of writing the sum out (triton_kernels/).
 """
 
 from collections.abc import Sequence
@@ -31,7 +31,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from .constants import (
+from ..constants import (
     GROUPED_DTYPES,
     GROUPED_MIN_PAIRS,
     HAS_TRITON,
@@ -41,8 +41,8 @@ from .constants import (
     TRITON_MAX_PAIRS_OLDER,
     TRITON_MIN_PAIRS,
 )
-from .ops import gmm, groups, mlp, sort_rows
-from .type_hints import (
+from ..ops import gmm, groups, mlp, sort_rows
+from ..type_hints import (
     DenseExperts,
     Experts,
     Group,
@@ -242,7 +242,7 @@ class DeltaMoE(nn.Module):
         return (o.view(-1, self.top_k, x.shape[-1]) * r[..., None]).sum(1)
 
     def _forward_param_triton(self, x: Tokens) -> Tokens:
-        """Parameter aggregation with W_b + Delta_e fused into the GEMM (triton_kernels.delta_gmm), all (token, slot)
+        """Parameter aggregation with W_b + Delta_e fused into the GEMM (triton_kernels/delta_gmm.py), all (token, slot)
         pairs in one launch per projection. CUDA, bf16/fp16."""
         idx, r = self.route(x)
         n, k = self.n_delta, self.top_k
@@ -270,7 +270,7 @@ class DeltaMoE(nn.Module):
         self, x: Tensor, j: int, starts: Tensor, ends: Tensor, max_rows: int
     ) -> Tensor:
         """Projection j (0 gate, 1 up, 2 down) of rows grouped by expert, W_b + Delta_g fused in the GEMM."""
-        from .triton_kernels import delta_gmm
+        from ..triton_kernels import delta_gmm
 
         wb = (self.gate, self.up, self.down)[j]
         return delta_gmm(

@@ -9,7 +9,7 @@ from test_delta_moe import CASES, make, reference
 
 from shared_delta_moe import DareDeltaMoE
 from shared_delta_moe.constants import HAS_TRITON
-from shared_delta_moe.dare import keep_mask, philox
+from shared_delta_moe.models.dare import keep_mask, philox
 
 GPU = torch.cuda.is_available() and HAS_TRITON
 SETTINGS = [

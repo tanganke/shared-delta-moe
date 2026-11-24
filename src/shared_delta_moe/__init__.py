@@ -1,5 +1,5 @@
-from .dare import DareDeltaMoE
-from .delta_moe import DeltaMoE
+from .models.dare import DareDeltaMoE
+from .models.delta_moe import DeltaMoE
 from .ops import mlp
 from .testing import random_experts
 

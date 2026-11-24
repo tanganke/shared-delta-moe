@@ -3,17 +3,18 @@
 A small Python library: a top-k SwiGLU MoE written as **a shared base expert plus per-expert deltas**, with several forward implementations that are exactly equivalent to the original MoE, including a Triton kernel that fuses $W_b+\Delta_e$ into the GEMM.
 
 ```
-src/shared_delta_moe/delta_moe.py       DeltaMoE: from_experts, routing, the forward implementations
-src/shared_delta_moe/ops.py             stateless helpers: mlp, grouping routed rows, one grouped GEMM
-src/shared_delta_moe/triton_kernels.py  delta_gmm: grouped GEMM over (W_b + Delta_g), the sum formed in registers;
-                                        dare_gmm: the same with seeded-DARE deltas
-src/shared_delta_moe/dare.py            seeded DARE: Philox mask, pack/unpack, DareDeltaMoE
-src/shared_delta_moe/constants.py       HAS_TRITON and the thresholds that pick an implementation
-src/shared_delta_moe/type_hints.py      shape-annotated tensor aliases (T tokens, H hidden, ...)
-src/shared_delta_moe/testing.py         random_experts for tests and benchmarks
-tests/test_delta_moe.py                 every forward == plain MoE, token by token (Triton part needs CUDA)
-tests/test_dare.py                      Philox known-answer, CPU == CUDA == Triton masks, DARE forwards
-benchmarks/bench.py                     per-layer time of each implementation (CUDA)
+src/shared_delta_moe/models/delta_moe.py  DeltaMoE: from_experts, routing, the forward implementations
+src/shared_delta_moe/ops.py               stateless helpers: mlp, grouping routed rows, one grouped GEMM
+src/shared_delta_moe/triton_kernels/      fused Triton kernels: delta_gmm.py (grouped GEMM over W_b + Delta_g, the sum
+                                          formed in registers), dare_gmm.py (the same with seeded-DARE deltas),
+                                          configs.py (shared autotune configs)
+src/shared_delta_moe/models/dare.py       seeded DARE: Philox mask, pack/unpack, DareDeltaMoE
+src/shared_delta_moe/constants.py         HAS_TRITON and the thresholds that pick an implementation
+src/shared_delta_moe/type_hints.py        shape-annotated tensor aliases (T tokens, H hidden, ...)
+src/shared_delta_moe/testing.py           random_experts for tests and benchmarks
+tests/test_delta_moe.py                   every forward == plain MoE, token by token (Triton part needs CUDA)
+tests/test_dare.py                        Philox known-answer, CPU == CUDA == Triton masks, DARE forwards
+benchmarks/bench.py                       per-layer time of each implementation (CUDA)
 ```
 
 ```bash
