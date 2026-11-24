@@ -91,6 +91,28 @@ def test_forwards_match_plain_moe():
                 assert err < 1e-5, (z, k, name, t, err)
 
 
+def test_gradients_match_plain_moe():
+    """Training through forward_param (the materialised path): dL/dx and dL/d router match the plain MoE, for top-k
+    up to every expert, zero experts included (their weight is in the renormalised top-k)."""
+    for z, k in CASES + [(1, 4), (2, 5)]:  # k = n + Z: soft routing over every expert
+        m, _, x = make(z, k)
+        w = torch.randn(200, 16)
+        grads = {}
+        for name, f in (
+            ("reference", lambda x: reference(m, x)),
+            ("forward_param", m.forward_param),
+            ("param split", lambda x: m._forward_param(x, min_rows=10**9)),
+        ):
+            xg = x.clone().requires_grad_(True)
+            m.zero_grad()
+            (f(xg) * w).sum().backward()
+            grads[name] = (xg.grad, m.router.weight.grad.clone())
+        for name, (gx, gr) in grads.items():
+            ref_x, ref_r = grads["reference"]
+            assert (gr.abs().max() > 1e-3) == (k > 1), (z, k, name)  # top-1 renormalises to 1: no router gradient (rounding only)
+            assert torch.allclose(gx, ref_x, atol=1e-5) and torch.allclose(gr, ref_r, atol=1e-4), (z, k, name)
+
+
 def test_triton_matches_materialised_param():
     if not torch.cuda.is_available():
         print("skipped: no CUDA")
