@@ -85,8 +85,10 @@ def dare_gmm(
         triton.cdiv(max_rows, meta["BM"]),
         triton.cdiv(N, meta["BN"]),
     )
-    _dare_gmm_kernel[grid](
-        x, wb, v, p, y, starts, ends, N, K, G, bucket, seed, proj, threshold(keep),
-        *x.stride(), *wb.stride(), *y.stride(), B=block,
-    )  # fmt: skip
+    # Triton launches on the current CUDA device, not on the tensors' one
+    with torch.cuda.device(x.device):
+        _dare_gmm_kernel[grid](
+            x, wb, v, p, y, starts, ends, N, K, G, bucket, seed, proj, threshold(keep),
+            *x.stride(), *wb.stride(), *y.stride(), B=block,
+        )  # fmt: skip
     return y

@@ -103,6 +103,21 @@ def test_dare_triton_matches_materialised():
             assert rel < 2e-2, (z, k, keep, block, hidden, t, rel)
 
 
+def test_triton_on_another_gpu():
+    """Tensors on cuda:1 while cuda:0 is current (a model placed with device_map)."""
+    if not GPU or torch.cuda.device_count() < 2:
+        print("skipped: needs 2 GPUs")
+        return
+    m, _, x = make(1, 1, 256, 384, torch.bfloat16, "cuda:1")
+    d = DareDeltaMoE.from_delta_moe(m, 0.5, 64, seed=1)
+    for mod in (m, d):
+        want = mod._forward_param(x[:37])
+        rel = (
+            (mod._forward_param_triton(x[:37]) - want).abs().max() / want.abs().max()
+        ).item()
+        assert rel < 2e-2, (type(mod).__name__, rel)
+
+
 if __name__ == "__main__":
     for name, f in list(globals().items()):
         if name.startswith("test_"):

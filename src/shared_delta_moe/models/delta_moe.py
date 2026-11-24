@@ -296,9 +296,15 @@ class DeltaMoE(nn.Module):
         )
 
     def _use_triton(self, x: Tokens) -> bool:
-        """Fused Triton parameter aggregation? Triton, CUDA, a TRITON_DTYPES dtype, and a (token, slot) pair count
-        within TRITON_MIN_PAIRS .. TRITON_MAX_PAIRS_{HOPPER,OLDER} (see constants)."""
+        """Fused Triton parameter aggregation? Triton, CUDA, a TRITON_DTYPES dtype, no gradient needed (the kernels are
+        forward-only), and a (token, slot) pair count within TRITON_MIN_PAIRS .. TRITON_MAX_PAIRS_{HOPPER,OLDER}.
+        """
         if not (HAS_TRITON and x.is_cuda and x.dtype in TRITON_DTYPES):
+            return False
+        # the kernels have no backward: while training, the PyTorch path (autograd, DDP/FSDP) instead
+        if torch.is_grad_enabled() and (
+            x.requires_grad or any(p.requires_grad for p in self.parameters())
+        ):
             return False
         hopper = torch.cuda.get_device_capability(x.device) >= (9, 0)
         limit = TRITON_MAX_PAIRS_HOPPER if hopper else TRITON_MAX_PAIRS_OLDER
