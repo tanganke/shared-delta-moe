@@ -2,7 +2,7 @@
 
 A minimal implementation (one file, torch only) of a top-k SwiGLU MoE written as **a shared base expert plus per-expert deltas**, showing two forward forms that are exactly equivalent to the original MoE.
 
-Each routed expert's weights are $W_e = W_b + \Delta_e$, applied to gate, up and down separately. Router index 0 is the **zero expert**: it has no parameters and stands for the base MLP itself. So base + n deltas has exactly as many parameters as the original MoE's n+1 experts.
+Each routed expert's weights are $W_e = W_b + \Delta_e$, applied to gate, up and down separately. The router's first `num_zero_experts` rows (Z, default 1) are **zero experts**: they have no parameters and each stands for the base MLP itself; the remaining n rows are the deltas. Whatever Z is, base + n deltas has exactly as many parameters as the original MoE's n+1 distinct experts. With Z = 0 the base is only a shared component, never chosen on its own; with Z > 1 the original MoE is equivalent to one with Z copies of the base expert (which gives the router more room to send tokens to the base).
 
 Routing is softmax, top-k (`top_k`, default 1), renormalised over the k picks to weights $r_i$. The target is the original MoE:
 
@@ -23,16 +23,17 @@ With $k=1$, $r=1$ and both forms reduce to one MLP. Under top-k the zero expert 
 
 Build one from a plain MoE with `DeltaMoE.from_experts(base, experts, router, top_k)`:
 
-- `base`: the base expert's `(gate (I, H), up (I, H), down (H, I))`, i.e. expert 0 of the original MoE.
+- `base`: the base expert's `(gate (I, H), up (I, H), down (H, I))`.
 - `experts`: the other n experts' full weights $W_e$ (not deltas), each in the same `(gate, up, down)` form; $\Delta_e = W_e - W_b$ is computed inside.
-- `router`: the original router weight `(n+1, H)`, with row 0 routing to the base.
+- `router`: the original router weight `(Z+n, H)`, with rows 0..Z-1 routing to the base.
+- `num_zero_experts`: Z, default 1.
 
 transformers' fused layout maps over as `gate, up = gate_up_proj[e].chunk(2)` and `down = down_proj[e]`. In bf16, $W_b + (W_e - W_b)$ is not always exactly $W_e$ (about 0.6% of elements in our model).
 
 **No custom kernels.** Everything is `F.linear` (cuBLAS) plus `index_add`.
 
 ```bash
-python delta_moe.py                  # float64 self-check (top-1 and top-2, both forms == plain MoE, token by token), then a top-1 benchmark if CUDA is available
+python delta_moe.py                  # float64 self-check (Z = 0/1/2 x top-1/top-2, both forms == plain MoE, token by token), then a top-1 benchmark if CUDA is available
 python delta_moe.py --top-k 2        # top-2 benchmark
 python delta_moe.py --no-bench
 ```
