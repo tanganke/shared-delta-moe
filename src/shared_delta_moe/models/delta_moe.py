@@ -139,8 +139,11 @@ class DeltaMoE(nn.Module):
         return m
 
     def route(self, x: Tokens) -> tuple[Experts, RouteWeights]:
-        r, i = self.router(x).softmax(-1).topk(self.top_k, dim=-1)
-        return torch.where(i < self.n_delta, i, -1), r / r.sum(-1, keepdim=True)
+        # float32 softmax and renormalisation, as transformers' MoE routers do (bf16 can flip near-ties)
+        r, i = self.router(x).softmax(-1, dtype=torch.float).topk(self.top_k, dim=-1)
+        return torch.where(i < self.n_delta, i, -1), (r / r.sum(-1, keepdim=True)).to(
+            x.dtype
+        )
 
     def weights(self, e: int) -> MLPWeights:
         if e < 0:
