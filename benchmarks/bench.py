@@ -20,7 +20,9 @@ def main() -> None:
     ap.add_argument("--hidden", type=int, default=2560)
     ap.add_argument("--inter", type=int, default=9216)
     ap.add_argument("--deltas", type=int, default=5)
-    ap.add_argument("--only", default="", help="comma-separated implementation names to run")
+    ap.add_argument(
+        "--only", default="", help="comma-separated implementation names to run"
+    )
     a = ap.parse_args()
     torch.manual_seed(0)
     full = random_experts(a.hidden, a.inter, a.deltas + 1, torch.bfloat16, "cuda")
