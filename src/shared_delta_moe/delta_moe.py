@@ -12,26 +12,26 @@ the addition happens:
                   slot has its own activation h_i, down is W_b h_i + Delta_e h_i; slots summed with weights r
   forward_dense   the plain MoE baseline, from stored full experts
 
-Each public forward picks an implementation (_forward_*) by hardware and input: grouped GEMM (F.grouped_mm) when it
-is available for the dtype and device and there is more than one (token, slot) pair, else a loop over experts.
+Each public forward picks an implementation (_forward_*) by hardware and input. forward_param: the fused Triton
+kernel on CUDA bf16/fp16 for 2..4096 (token, slot) pairs, else materialised weights. forward_matrix / forward_dense:
+grouped GEMM (F.grouped_mm) when available for the dtype and device and there is more than one pair, else a loop.
 
 Adding r Delta_e x into one shared activation instead (merging weights per token) is not the same function when k > 1,
 because SwiGLU is nonlinear; each slot keeps its own activation here. With k = 1, r = 1 and both reduce to one MLP.
 
-Plain PyTorch only (F.linear, F.grouped_mm, index_add); no custom kernels.
-
-    python delta_moe.py [--top-k K] [--no-bench]   # self-check (float32), then a benchmark if CUDA
+Plain PyTorch (F.linear, F.grouped_mm, index_add), plus an optional Triton kernel for parameter aggregation that
+adds W_b + Delta_e tile by tile in registers instead of writing the sum out (triton_kernels.py).
 """
 
-import itertools
-import sys
-import time
-from collections.abc import Callable, Sequence
+import importlib.util
+from collections.abc import Sequence
 from typing import Annotated, Any, TypeAlias
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+
+HAS_TRITON = importlib.util.find_spec("triton") is not None
 
 # Shapes as annotations (T tokens, H hidden, I intermediate, N deltas, K top-k, R rows of one group).
 Tokens: TypeAlias = Annotated[Tensor, "T H"]
@@ -261,6 +261,33 @@ class DeltaMoE(nn.Module):
         o[rows] = gmm(h, experts[2], offs)
         return (o.view(-1, self.top_k, x.shape[-1]) * r[..., None]).sum(1)
 
+    def _forward_param_triton(self, x: Tokens) -> Tokens:
+        """Parameter aggregation with W_b + Delta_e fused into the GEMM (triton_kernels.delta_gmm), all (token, slot)
+        pairs in one launch per projection. CUDA, bf16/fp16."""
+        from .triton_kernels import delta_gmm
+
+        idx, r = self.route(x)
+        n, k = self.d_gate.shape[0], self.top_k
+        e = idx.flatten()
+        e = torch.where(e < 0, n, e)  # every zero expert -> group n (W_b alone)
+        order = e.argsort()
+        counts = torch.zeros(n + 1, dtype=torch.int32, device=x.device)
+        counts.scatter_add_(
+            0, e, torch.ones_like(e, dtype=torch.int32)
+        )  # no host sync, unlike bincount
+        ends = counts.cumsum(0, dtype=torch.int32)
+        starts = ends - counts
+        # largest group bounds the grid; for few pairs use the pair count instead of syncing to read it
+        max_rows = e.numel() if e.numel() <= 1024 else int(counts.max())
+        xs = x[order // k]
+        groups = (starts, ends, max_rows)
+        g = delta_gmm(xs, self.gate, self.d_gate, *groups)
+        u = delta_gmm(xs, self.up, self.d_up, *groups)
+        o = delta_gmm(F.silu(g) * u, self.down, self.d_down, *groups)
+        out = torch.empty_like(o)
+        out[order] = o
+        return (out.view(-1, k, x.shape[-1]) * r[..., None]).sum(1)
+
     def _grouped(self, x: Tokens) -> bool:
         """Use grouped GEMM? Needs F.grouped_mm with this dtype on this device, and more than one (token, slot) pair
         (with one pair the sort and count cost more than the loop saves)."""
@@ -278,8 +305,19 @@ class DeltaMoE(nn.Module):
             return False
         return x.device.type in ("cuda", "cpu") and x.shape[0] * self.top_k > 1
 
+    def _use_triton(self, x: Tokens) -> bool:
+        """Fused Triton parameter aggregation? CUDA, bf16/fp16, and 2..4096 (token, slot) pairs: one pair is cheaper
+        through the loop, and past ~4096 the materialised weights + cuBLAS win (compute-bound).
+        """
+        # ponytail: thresholds measured on one H200 (hidden 2560, inter 9216, 6 experts); retune for other shapes/GPUs
+        ok = HAS_TRITON and x.is_cuda and x.dtype in (torch.bfloat16, torch.float16)
+        return ok and 2 <= x.shape[0] * self.top_k <= 4096
+
     def forward_param(self, x: Tokens) -> Tokens:
-        """Parameter aggregation; experts with < 256 routed rows skip materialising W_b + Delta_e."""
+        """Parameter aggregation: the fused Triton kernel when _use_triton, else materialised W_b + Delta_e (experts
+        with < 256 routed rows skip the materialisation)."""
+        if self._use_triton(x):
+            return self._forward_param_triton(x)
         return self._forward_param(x, min_rows=256)
 
     def forward_matrix(self, x: Tokens) -> Tokens:
@@ -300,131 +338,8 @@ class DeltaMoE(nn.Module):
 def random_experts(
     hidden: int, inter: int, n: int, dtype: torch.dtype, device: str
 ) -> list[MLPWeights]:
-    """n random (gate, up, down), scaled 1/sqrt(fan_in) so activations stay O(1) (for the check and benchmark)."""
+    """n random (gate, up, down), scaled 1/sqrt(fan_in) so activations stay O(1) (for tests and benchmarks)."""
     r = lambda *shape: (
         torch.randn(*shape, dtype=dtype, device=device) * shape[-1] ** -0.5
     )
     return [(r(inter, hidden), r(inter, hidden), r(hidden, inter)) for _ in range(n)]
-
-
-def check() -> None:
-    for z, k in itertools.product((0, 1, 2), (1, 2)):
-        torch.manual_seed(0)
-        full = random_experts(
-            16, 24, 4, torch.float32, "cpu"
-        )  # random weights only so that the experts differ
-        m = DeltaMoE.from_experts(
-            full[0],
-            full[1:],
-            torch.randn(3 + z, 16, dtype=torch.float32),
-            top_k=k,
-            num_zero_experts=z,
-        )
-        x = torch.randn(200, 16, dtype=torch.float32)
-        idx, r = m.route(x)
-        assert idx[idx >= 0].unique().tolist() == [0, 1, 2] and (idx == -1).any() == (
-            z > 0
-        ), "hit every delta, and the zero experts iff any"
-        assert (
-            z == 0
-            or k == 1
-            or (idx == -1).any(-1).logical_and((idx >= 0).any(-1)).any()
-        ), "zero expert mixed with a delta"
-        assert (
-            z < 2 or k == 1 or (idx == -1).all(-1).any()
-        ), "two zero experts on one token"
-        experts = m.dense_experts()
-        assert all(
-            torch.allclose(w[e], f[j])
-            for e, f in enumerate(full)
-            for j, w in enumerate(experts)
-        )
-        ref = torch.stack(
-            [
-                sum(
-                    ri * mlp(xi, *(w[ei + 1] for w in experts))
-                    for ei, ri in zip(es.tolist(), rs)
-                )
-                for xi, es, rs in zip(x, idx, r)
-            ]
-        )  # token by token
-        for f in (
-            m._forward_param,
-            lambda x: m._forward_param(x, min_rows=10**9),
-            lambda x: m._forward_param(x, min_rows=100),
-            m._forward_matrix,
-            lambda x: m._forward_dense(x, experts),
-            m._forward_matrix_grouped,
-            lambda x: m._forward_dense_grouped(x, experts),
-            m.forward_param,
-            m.forward_matrix,
-            lambda x: m.forward_dense(x, experts),
-        ):
-            assert torch.allclose(f(x[:1]), ref[:1], atol=1e-5), (z, k, "1 token")
-            assert torch.allclose(f(x), ref, atol=1e-5), (
-                z,
-                k,
-                (f(x) - ref).abs().max(),
-            )
-        n = sum(
-            p.numel() for name, p in m.named_parameters() if name != "router.weight"
-        )
-        assert (
-            n == 4 * 3 * 16 * 24
-        ), "base + 3 deltas = 4 MLPs, zero experts add nothing"
-    print("check ok (0/1/2 zero experts x top-1/top-2)")
-
-
-@torch.no_grad()
-def bench(
-    hidden: int = 2560, inter: int = 9216, n_delta: int = 5, top_k: int = 1
-) -> None:
-    torch.manual_seed(0)
-    full = random_experts(hidden, inter, n_delta + 1, torch.bfloat16, "cuda")
-    m = DeltaMoE.from_experts(
-        full[0],
-        full[1:],
-        torch.randn(n_delta + 1, hidden, dtype=torch.bfloat16, device="cuda"),
-        top_k,
-    )
-    del full
-    experts = m.dense_experts()
-    forms: dict[str, Callable[[Tokens], Tokens]] = {
-        "dense loop": lambda x: m._forward_dense(x, experts),
-        "dense grouped": lambda x: m._forward_dense_grouped(x, experts),
-        "dense": lambda x: m.forward_dense(x, experts),
-        "param pure": m._forward_param,
-        "param": m.forward_param,
-        "matrix loop": m._forward_matrix,
-        "matrix grouped": m._forward_matrix_grouped,
-        "matrix": m.forward_matrix,
-    }
-    print(
-        f"{torch.cuda.get_device_name()}, hidden {hidden}, inter {inter}, {n_delta} deltas + zero expert, top-{top_k}, bf16, eager"
-    )
-    print(f"{'tokens':>8} " + " ".join(f"{k:>14}" for k in forms) + "   (ms per layer)")
-    for t in (1, 32, 512, 8192):
-        x = torch.randn(t, hidden, dtype=torch.bfloat16, device="cuda")
-        row: list[float] = []
-        for f in forms.values():
-            for _ in range(3):
-                f(x)
-            torch.cuda.synchronize()
-            s = time.perf_counter()
-            for _ in range(20):
-                f(x)
-            torch.cuda.synchronize()
-            row.append((time.perf_counter() - s) / 20 * 1e3)
-        print(f"{t:>8} " + " ".join(f"{v:>14.3f}" for v in row))
-
-
-if __name__ == "__main__":
-    check()
-    if torch.cuda.is_available() and "--no-bench" not in sys.argv:
-        bench(
-            top_k=(
-                int(sys.argv[sys.argv.index("--top-k") + 1])
-                if "--top-k" in sys.argv
-                else 1
-            )
-        )

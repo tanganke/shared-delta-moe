@@ -1,6 +1,25 @@
 # shared-delta-moe
 
-A minimal implementation (one file, torch only) of a top-k SwiGLU MoE written as **a shared base expert plus per-expert deltas**, showing two forward forms that are exactly equivalent to the original MoE.
+A small Python library: a top-k SwiGLU MoE written as **a shared base expert plus per-expert deltas**, with several forward implementations that are exactly equivalent to the original MoE, including a Triton kernel that fuses $W_b+\Delta_e$ into the GEMM.
+
+```
+src/shared_delta_moe/delta_moe.py       DeltaMoE, from_experts, the forward implementations
+src/shared_delta_moe/triton_kernels.py  delta_gmm: grouped GEMM over (W_b + Delta_g), the sum formed in registers
+tests/test_delta_moe.py                 every forward == plain MoE, token by token (Triton part needs CUDA)
+benchmarks/bench.py                     per-layer time of each implementation (CUDA)
+```
+
+```bash
+uv sync                                  # or: pip install -e .   (Triton ships with torch on Linux + CUDA)
+uv run pytest                            # or: python tests/test_delta_moe.py
+uv run python benchmarks/bench.py --top-k 2 --tokens 1,32,512,8192
+```
+
+```python
+from shared_delta_moe import DeltaMoE
+m = DeltaMoE.from_experts(base, experts, router, top_k=1, num_zero_experts=1)
+y = m.forward_param(x)   # or forward_matrix(x); forward_dense(x, m.dense_experts()) is the plain-MoE baseline
+```
 
 Each routed expert's weights are $W_e = W_b + \Delta_e$, applied to gate, up and down separately. The router's first n rows are the deltas; its last `num_zero_experts` rows (Z, default 1) are **zero experts**: they have no parameters and each stands for the base MLP itself. Whatever Z is, base + n deltas has exactly as many parameters as the original MoE's n+1 distinct experts. With Z = 0 the base is only a shared component, never chosen on its own; with Z > 1 the original MoE is equivalent to one with Z copies of the base expert (which gives the router more room to send tokens to the base).
 
@@ -10,11 +29,14 @@ $$y = \sum_{i=1}^{k} r_i\,\mathrm{MLP}(x;\,W_b + \Delta_{e_i})$$
 
 | Public method | Computation | Implementations (private), picked automatically |
 |---|---|---|
-| `forward_param` | Parameter aggregation: per expert, materialise $W_b + \Delta_e$ once and run one MLP on the (token, slot) pairs routed to it; multiply by $r_i$ and `index_add` back. Experts with fewer than 256 routed rows skip materialisation and compute $W_b x + \Delta_e x$ per projection directly | `_forward_param(x, min_rows)` |
+| `forward_param` | Parameter aggregation: each (token, slot) pair is multiplied by $W_b + \Delta_e$ of its expert, weighted by $r_i$ | `_forward_param_triton`: one Triton launch per projection for all pairs, adding $W_b$ and $\Delta_e$ tiles in registers (no weights written, 1× FLOPs); `_forward_param(x, min_rows)`: materialise $W_b + \Delta_e$ per expert and run cuBLAS (experts with fewer than `min_rows` rows compute $W_b x + \Delta_e x$ instead) |
 | `forward_matrix` | Per-matrix output aggregation: gate/up compute $W_b x$ once for all tokens, plus $\Delta_e x$ per slot. Each slot keeps its own activation $h_i$; down computes $W_b h_i + \Delta_e h_i$; the slots are summed with weights $r_i$ | `_forward_matrix_grouped`: flattens all (token, slot) pairs, sorts them by expert, one `F.grouped_mm` per projection for the deltas; `_forward_matrix`: loop over experts |
 | `forward_dense(x, experts)` | Reference: plain MoE from stored full expert weights | `_forward_dense_grouped`: one `F.grouped_mm` per projection, like transformers' `grouped_mm` path; `_forward_dense`: loop over experts |
 
-Selection rule: use grouped GEMM when `F.grouped_mm` exists, the dtype is bf16/fp16/fp32, the device is CPU or a CUDA GPU with sm80+, and there is more than one (token, slot) pair (for a single pair, sorting and counting cost more than the loop saves). Otherwise use the loop. The threshold was measured on an H200 only.
+Selection rules (thresholds measured on one H200 at the shape below; retune for other GPUs or shapes):
+
+- `forward_param`: Triton on CUDA bf16/fp16 for 2–4096 (token, slot) pairs. A single pair is cheaper through the loop; beyond about 4096 the work is compute-bound, and cuBLAS on materialised weights wins.
+- `forward_matrix` / `forward_dense`: grouped GEMM when `F.grouped_mm` exists, the dtype is bf16/fp16/fp32, the device is CPU or a CUDA GPU with sm80+, and there is more than one pair; otherwise the loop.
 
 Note two things that would not be equivalent:
 
@@ -32,53 +54,55 @@ Build one from a plain MoE with `DeltaMoE.from_experts(base, experts, router, to
 
 transformers' fused layout maps over as `gate, up = gate_up_proj[e].chunk(2)` and `down = down_proj[e]`. In bf16, $W_b + (W_e - W_b)$ is not always exactly $W_e$ (about 0.6% of elements in our model).
 
-**No custom kernels.** Everything is `F.linear` (cuBLAS), `F.grouped_mm` (PyTorch's own grouped GEMM: CUDA sm80+ or CPU, bf16/fp16/fp32, no fp64) plus `index_add`.
-
-```bash
-python delta_moe.py                  # float32 self-check (Z = 0/1/2 x top-1/top-2, every form == plain MoE, token by token), then a top-1 benchmark if CUDA is available
-python delta_moe.py --top-k 2        # top-2 benchmark
-python delta_moe.py --no-bench
-```
+Apart from the Triton kernel, everything is `F.linear` (cuBLAS), `F.grouped_mm` (PyTorch's own grouped GEMM: CUDA sm80+ or CPU, bf16/fp16/fp32) and `index_add`. bf16/fp16 are the targets; fp32 is supported (and used for the CPU tests), fp64 is not.
 
 ## Speed (single MoE layer, H200, bf16, eager, ms)
 
-hidden 2560, inter 9216, 5 deltas + zero expert (the size of a Qwen3.5-4B MoE with 6 experts). "transformers" is the stock `Qwen3_5MoeSparseMoeBlock` (`grouped_mm`, 6 experts) at the same size.
-
-`transformers` is the stock `Qwen3_5MoeSparseMoeBlock` (`grouped_mm`); the other columns are the public methods (automatic selection), with the private implementations in brackets.
+hidden 2560, inter 9216, 5 deltas + zero expert (the size of a Qwen3.5-4B MoE with 6 experts). For comparison, transformers' stock `Qwen3_5MoeSparseMoeBlock` (`grouped_mm`) at the same size takes 0.36 / 0.47 / 0.49 / 2.72 ms at 1 / 32 / 512 / 8192 tokens (top-1).
 
 top-1:
 
-| tokens | transformers | `forward_dense` (loop / grouped) | `forward_param` (pure param agg) | `forward_matrix` (loop / grouped) |
-|---:|---:|---:|---:|---:|
-| 1 | 0.360 | 0.271 (0.273 / 0.363) | 0.240 (0.234) | 0.250 (0.231 / 0.326) |
-| 32 | 0.472 | 0.577 (0.817 / 0.578) | 1.056 (1.285) | 0.623 (0.932 / 0.618) |
-| 512 | 0.494 | 0.576 (0.962 / 0.578) | 1.207 (1.380) | 0.745 (1.007 / 0.744) |
-| 8192 | 2.719 | 2.462 (2.720 / 2.441) | 3.241 (3.317) | 5.171 (5.651 / 5.106) |
+| tokens | plain loop | plain grouped | param (materialised) | param hybrid | **param Triton** | matrix loop | matrix grouped |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 0.249 | 0.349 | 0.229 | 0.221 | 0.336 | 0.229 | 0.315 |
+| 8 | 0.572 | 0.481 | 0.935 | 0.748 | **0.354** | 0.609 | 0.568 |
+| 32 | 0.794 | 0.586 | 1.263 | 1.018 | **0.359** | 0.758 | 0.597 |
+| 512 | 0.850 | 0.562 | 1.321 | 1.115 | **0.557** | 0.963 | 0.733 |
+| 2048 | 1.149 | 0.958 | 1.649 | 1.655 | 1.322 | 1.864 | 1.636 |
+| 4096 | 1.677 | 1.319 | 2.205 | 2.178 | 1.934 | 3.122 | 2.730 |
+| 8192 | 2.730 | 2.409 | 3.251 | 3.237 | 3.655 | 5.670 | 5.139 |
 
 top-2:
 
-| tokens | transformers | `forward_dense` (loop / grouped) | `forward_param` (pure param agg) | `forward_matrix` (loop / grouped) |
-|---:|---:|---:|---:|---:|
-| 1 | 0.405 | 0.396 (0.377 / 0.392) | 0.405 (0.422) | 0.459 (0.456 / 0.437) |
-| 32 | 0.498 | 0.601 (0.848 / 0.600) | 1.083 (1.309) | 0.635 (1.488 / 0.632) |
-| 512 | 0.591 | 0.668 (0.949 / 0.664) | 1.281 (1.428) | 0.920 (1.835 / 0.920) |
-| 8192 | 4.732 | 4.506 (4.569 / 4.431) | 5.223 (5.219) | 8.664 (10.239 / 8.773) |
+| tokens | plain loop | plain grouped | param (materialised) | param hybrid | **param Triton** | matrix loop | matrix grouped |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 0.358 | 0.387 | 0.417 | 0.390 | **0.354** | 0.450 | 0.419 |
+| 8 | 0.789 | 0.578 | 1.254 | 1.004 | **0.361** | 1.266 | 0.633 |
+| 32 | 0.824 | 0.573 | 1.287 | 1.051 | **0.362** | 1.435 | 0.623 |
+| 512 | 0.919 | 0.659 | 1.416 | 1.267 | 0.712 | 1.818 | 0.923 |
+| 2048 | 1.654 | 1.319 | 2.180 | 2.144 | 1.783 | 3.438 | 2.444 |
+| 4096 | 2.615 | 2.439 | 3.152 | 3.120 | 3.621 | 5.712 | 4.574 |
+| 8192 | 4.717 | 4.601 | 5.456 | 5.258 | 7.172 | 10.293 | 8.668 |
 
-- **Grouped GEMM** replaces the per-expert Python loop with one kernel per projection. From 32 to 512 tokens it is 1.3–2.3× faster than the loop, and top-2 gains the most, because the loop runs every expert of every slot separately. At 1 token, the extra sort and count make it slightly slower.
-- **Per-matrix output aggregation, grouped**: 1.3× the transformers MoE at 32 tokens (top-1 0.61 vs 0.47, top-2 0.63 vs 0.50), and about 1.9× at 8192 tokens (computing both $W_b$ and $\Delta_e$ roughly doubles the compute).
-- **Parameter aggregation** writes out a full weight matrix per expert, so it is the slowest at mid-range token counts. The hybrid that `forward_param` uses (small groups skip materialisation) only shaves this down (top-1 32 tokens 1.35 → 1.17 ms, top-2 1.33 → 1.10): each small group still reads $W_b$ once, so it can't beat per-matrix output aggregation, which shares $W_b x$ across all tokens (0.86 / 0.64). It does not fit grouped GEMM well: you would first have to write out $W_b+\Delta_e$ for every expert, which costs even more memory traffic.
-- The remaining gap between plain grouped and transformers (0.58 vs 0.47) probably comes from the `nonzero` and `bincount` here, which synchronise the CPU and GPU (transformers uses `histc` and a fixed number of groups, which needs no sync). Not profiled.
+- **Triton fused parameter aggregation** is the fastest of everything here from 8 to 512 tokens, the plain MoE and transformers included (top-1, 32 tokens: 0.36 vs 0.59 / 0.47). Decode is memory-bound. The kernel reads $W_b$ and $\Delta_e$ once each, writes no weights, and does a single GEMM's FLOPs; all pairs go through one launch per projection, and nothing synchronises the host.
+- Three things mattered in the kernel:
+  - **Masked delta load instead of a branch.** The zero expert's delta load is masked off rather than skipped with an `if`, so Triton can pipeline the loop. At 32 tokens: 0.57 → 0.48 ms.
+  - **Summed weight as operand A.** The summed weight is the A operand, computing $y^T = (W_b+\Delta)\,x^T$; Hopper's wgmma can take A from registers. At 8192 tokens: 4.55 → 3.67 ms.
+  - **No host sync for counts.** Group counts come from `scatter_add`, not `bincount`, and with few pairs the grid is sized from the pair count, not the largest group, so nothing synchronises the host. At 32 tokens: 0.48 → 0.36 ms.
+- With many tokens the work is compute-bound, and this simple Triton GEMM loses to cuBLAS (8192 tokens: 3.66 vs 2.41 plain grouped). So `forward_param` switches to the materialised version past 4096 pairs; a better GEMM kernel would be needed to close that gap.
+- **Per-matrix output aggregation** needs no custom kernel. It is about 1.3× the plain MoE at small token counts and about 2× at large ones, since it computes both $W_b$ and $\Delta_e$.
+- **Grouped GEMM vs loop**: from 32 to 512 tokens, the grouped versions are 1.3–2.3× faster than the per-expert loops; at a single token the sort and count cost more than they save.
 
-The benefits of these forms are elsewhere. The delta $\Delta_e$ is a standalone tensor that can be compressed, sparsified or trained on its own; the zero expert has no parameters; and in per-matrix output aggregation the routing weight can stay in the computation graph.
+The delta form has uses beyond speed: $\Delta_e$ is a standalone tensor that can be compressed, sparsified or trained on its own; the zero expert has no parameters; and in per-matrix output aggregation the routing weight can stay in the computation graph.
 
 ## Why it looked "faster than the original MoE" in transformers
 
 Running the full model with transformers (Qwen3.5-4B MoE, 6 experts, H200), batch-32 decode measured 338 tok/s for the original MoE, while both forms here reached 711 / 860 tok/s. That is **not** because these forms are faster. It's because the original MoE was given a slow path by transformers:
 
-1. Qwen3.5 MoE experts default to `grouped_mm` (`torch._grouped_mm`, one cutlass grouped GEMM for all experts). A single layer takes 0.45 ms at 32 tokens, faster than the plain MoE in this repo.
+1. Qwen3.5 MoE experts default to `grouped_mm` (`torch._grouped_mm`, one cutlass grouped GEMM for all experts). A single layer takes 0.47 ms at 32 tokens.
 2. But `generate()` uses `_optimize_model_for_decode` to automatically **switch every `grouped_mm` to `batched_mm` during decode** (transformers 5.16, `generation/utils.py`).
 3. `batched_mm` gathers **one full copy of the expert weights per token** (`self.gate_up_proj[expert_ids]`), then runs `bmm`. At batch 1 that's about the same as reading the weights directly. At batch 32, every layer copies 32 expert-sized matrices (about 4.5 GB). The profile shows 90% of the time in `aten::index` (gather) and `aten::bmm`.
-4. The two forms here don't go through the experts module, so they're never switched.
+4. The forms here don't go through the experts module, so they're never switched.
 
 Disable the switch and the original MoE becomes the fastest:
 
@@ -86,8 +110,8 @@ Disable the switch and the original MoE becomes the fastest:
 |---|---:|---:|
 | Original MoE (with transformers' switch to `batched_mm`) | 338 | 94.7 |
 | Original MoE (stays on `grouped_mm`) | **867** | 36.9 |
-| Parameter aggregation | 711 | 45.0 |
-| Per-matrix output aggregation | 860 | 37.2 |
+| Parameter aggregation (materialised, pure PyTorch) | 711 | 45.0 |
+| Per-matrix output aggregation (loop, pure PyTorch) | 860 | 37.2 |
 
 How to disable it (batch 1 gets slightly slower, 31 → 28 tok/s):
 

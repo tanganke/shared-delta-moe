@@ -1,0 +1,116 @@
+"""Every forward equals the plain MoE, token by token. Runs under pytest, or directly: python tests/test_delta_moe.py
+(the Triton test needs CUDA and is skipped without it)."""
+
+import itertools
+
+import torch
+
+from shared_delta_moe import DeltaMoE, mlp, random_experts
+
+CASES = list(itertools.product((0, 1, 2), (1, 2)))  # (zero experts, top-k)
+
+
+def make(
+    z: int, k: int, hidden: int = 16, inter: int = 24, dtype=torch.float32, device="cpu"
+):
+    torch.manual_seed(0)
+    full = random_experts(
+        hidden, inter, 4, dtype, device
+    )  # random only so that the experts differ
+    router = torch.randn(3 + z, hidden, dtype=dtype, device=device)
+    m = DeltaMoE.from_experts(full[0], full[1:], router, top_k=k, num_zero_experts=z)
+    return m, full, torch.randn(200, hidden, dtype=dtype, device=device)
+
+
+def reference(m: DeltaMoE, x: torch.Tensor) -> torch.Tensor:
+    idx, r = m.route(x)
+    experts = m.dense_experts()
+    return torch.stack(
+        [
+            sum(
+                ri * mlp(xi, *(w[ei + 1] for w in experts))
+                for ei, ri in zip(es.tolist(), rs)
+            )
+            for xi, es, rs in zip(x, idx, r)
+        ]
+    )
+
+
+def test_routing_covers_cases():
+    for z, k in CASES:
+        m, _, x = make(z, k)
+        idx, _ = m.route(x)
+        assert idx[idx >= 0].unique().tolist() == [0, 1, 2], "every delta is hit"
+        assert (idx == -1).any() == (z > 0), "zero experts hit iff there are any"
+        if z and k > 1:
+            assert (
+                (idx == -1).any(-1) & (idx >= 0).any(-1)
+            ).any(), "a zero expert mixed with a delta"
+        if z > 1 and k > 1:
+            assert (idx == -1).all(-1).any(), "two zero experts on one token"
+
+
+def test_from_experts_and_parameter_count():
+    for z, k in CASES:
+        m, full, _ = make(z, k)
+        experts = m.dense_experts()
+        assert all(
+            torch.allclose(w[e], f[j])
+            for e, f in enumerate(full)
+            for j, w in enumerate(experts)
+        )
+        n = sum(
+            p.numel() for name, p in m.named_parameters() if name != "router.weight"
+        )
+        assert (
+            n == 4 * 3 * 16 * 24
+        ), "base + 3 deltas = 4 MLPs, zero experts add nothing"
+
+
+def test_forwards_match_plain_moe():
+    for z, k in CASES:
+        m, _, x = make(z, k)
+        experts = m.dense_experts()
+        ref = reference(m, x)
+        forms = {
+            "param": m._forward_param,
+            "param split": lambda x: m._forward_param(x, min_rows=10**9),
+            "param mixed": lambda x: m._forward_param(x, min_rows=100),
+            "matrix loop": m._forward_matrix,
+            "matrix grouped": m._forward_matrix_grouped,
+            "dense loop": lambda x: m._forward_dense(x, experts),
+            "dense grouped": lambda x: m._forward_dense_grouped(x, experts),
+            "forward_param": m.forward_param,
+            "forward_matrix": m.forward_matrix,
+            "forward_dense": lambda x: m.forward_dense(x, experts),
+        }
+        for name, f in forms.items():
+            for t in (1, 200):  # 1 token takes the loop branch of the public forwards
+                err = (f(x[:t]) - ref[:t]).abs().max().item()
+                assert err < 1e-5, (z, k, name, t, err)
+
+
+def test_triton_matches_materialised_param():
+    if not torch.cuda.is_available():
+        print("skipped: no CUDA")
+        return
+    for (z, k), (hidden, inter) in itertools.product(
+        CASES, ((256, 384), (200, 300))
+    ):  # 200/300: ragged tiles
+        m, _, x = make(z, k, hidden, inter, torch.bfloat16, "cuda")
+        for t in (1, 37, 200):
+            want = m._forward_param(x[:t])
+            for name, f in (
+                ("triton", m._forward_param_triton),
+                ("forward_param", m.forward_param),
+            ):
+                got = f(x[:t])
+                rel = ((got - want).abs().max() / want.abs().max()).item()
+                assert rel < 2e-2, (name, z, k, hidden, t, rel)
+
+
+if __name__ == "__main__":
+    for name, f in list(globals().items()):
+        if name.startswith("test_"):
+            f()
+            print("ok", name)

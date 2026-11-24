@@ -1,0 +1,20 @@
+[project]
+name = "shared-delta-moe"
+version = "0.1.0"
+description = "Top-k SwiGLU MoE as a shared base expert plus per-expert deltas: parameter vs per-matrix output aggregation"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["torch"]
+
+[project.optional-dependencies]
+triton = ["triton"]
+
+[dependency-groups]
+dev = ["pytest", "mypy", "black"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
