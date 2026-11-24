@@ -14,55 +14,79 @@ weight r would scale the Delta_k terms in forward_matrix).
 """
 import sys
 import time
+from collections.abc import Callable
+from typing import Annotated, Any, TypeAlias
 
 import torch
 import torch.nn.functional as F
-from torch import nn
+from torch import Tensor, nn
+
+# Shapes as annotations (T tokens, H hidden, I intermediate, N deltas, R rows of one group).
+Tokens: TypeAlias = Annotated[Tensor, "T H"]
+Hidden: TypeAlias = Annotated[Tensor, "T I"]
+Rows: TypeAlias = Annotated[Tensor, "R int64 token indices"]
+InWeight: TypeAlias = Annotated[Tensor, "I H"]
+OutWeight: TypeAlias = Annotated[Tensor, "H I"]
+MLPWeights: TypeAlias = tuple[InWeight, InWeight, OutWeight]
+Group: TypeAlias = tuple[int, Rows]
+DenseExperts: TypeAlias = list[Annotated[Tensor, "N+1 out in"]]
 
 
-def mlp(x, gate, up, down):
+def mlp(x: Tokens, gate: InWeight, up: InWeight, down: OutWeight) -> Tokens:
     return F.linear(F.silu(F.linear(x, gate)) * F.linear(x, up), down)
 
 
 class DeltaMoE(nn.Module):
-    def __init__(self, hidden, inter, n_delta, **factory):
+    gate: nn.Parameter  # I H
+    up: nn.Parameter  # I H
+    down: nn.Parameter  # H I
+    d_gate: nn.Parameter  # N I H
+    d_up: nn.Parameter  # N I H
+    d_down: nn.Parameter  # N H I
+
+    def __init__(self, hidden: int, inter: int, n_delta: int, **factory: Any) -> None:
+        """factory: dtype / device for every parameter."""
         super().__init__()
-        p = lambda *shape: nn.Parameter(torch.randn(*shape, **factory) * shape[-1] ** -0.5)
+
+        def p(*shape: int) -> nn.Parameter:
+            return nn.Parameter(torch.randn(*shape, **factory) * shape[-1] ** -0.5)
+
         self.router = nn.Linear(hidden, n_delta + 1, bias=False, **factory)
         self.gate, self.up, self.down = p(inter, hidden), p(inter, hidden), p(hidden, inter)
         self.d_gate, self.d_up, self.d_down = p(n_delta, inter, hidden), p(n_delta, inter, hidden), p(n_delta, hidden, inter)
 
-    def groups(self, x):
+    def groups(self, x: Tokens) -> list[Group]:
         """[(delta index or -1 for the zero expert, token rows)] for the experts this batch uses."""
         k = self.router(x).argmax(-1) - 1
         return [(e, (k == e).nonzero().squeeze(-1)) for e in k.unique().tolist()]
 
-    def forward_param(self, x):
+    def forward_param(self, x: Tokens) -> Tokens:
         out = torch.empty_like(x)
         for e, rows in self.groups(x):
-            w = (self.gate, self.up, self.down)
+            w: MLPWeights = (self.gate, self.up, self.down)
             if e >= 0:
                 w = (self.gate + self.d_gate[e], self.up + self.d_up[e], self.down + self.d_down[e])
             out[rows] = mlp(x[rows], *w)
         return out
 
-    def forward_matrix(self, x):
-        groups = [(e, rows) for e, rows in self.groups(x) if e >= 0]
-        g, u = F.linear(x, self.gate), F.linear(x, self.up)
+    def forward_matrix(self, x: Tokens) -> Tokens:
+        groups: list[Group] = [(e, rows) for e, rows in self.groups(x) if e >= 0]
+        g: Hidden = F.linear(x, self.gate)
+        u: Hidden = F.linear(x, self.up)
         for e, rows in groups:
             g = g.index_add(0, rows, F.linear(x[rows], self.d_gate[e]))
             u = u.index_add(0, rows, F.linear(x[rows], self.d_up[e]))
-        h = F.silu(g) * u
-        out = F.linear(h, self.down)
+        h: Hidden = F.silu(g) * u
+        out: Tokens = F.linear(h, self.down)
         for e, rows in groups:
             out = out.index_add(0, rows, F.linear(h[rows], self.d_down[e]))
         return out
 
-    def dense_experts(self):
-        """The equivalent plain MoE: stacked full expert weights, index 0 = base."""
+    def dense_experts(self) -> DenseExperts:
+        """The equivalent plain MoE: [gate (N+1, I, H), up (N+1, I, H), down (N+1, H, I)], index 0 = base."""
         return [torch.cat((b[None], b + d)) for b, d in ((self.gate, self.d_gate), (self.up, self.d_up), (self.down, self.d_down))]
 
-    def forward_dense(self, x, experts):
+    def forward_dense(self, x: Tokens, experts: DenseExperts) -> Tokens:
         """Plain top-1 MoE with stored full experts, grouped the same way (the baseline)."""
         out = torch.empty_like(x)
         for e, rows in self.groups(x):
@@ -70,7 +94,7 @@ class DeltaMoE(nn.Module):
         return out
 
 
-def check():
+def check() -> None:
     torch.manual_seed(0)
     m = DeltaMoE(16, 24, 3, dtype=torch.float64)
     x = torch.randn(200, 16, dtype=torch.float64)
@@ -86,16 +110,16 @@ def check():
 
 
 @torch.no_grad()
-def bench(hidden=2560, inter=9216, n_delta=5):
+def bench(hidden: int = 2560, inter: int = 9216, n_delta: int = 5) -> None:
     torch.manual_seed(0)
     m = DeltaMoE(hidden, inter, n_delta, dtype=torch.bfloat16, device="cuda")
     experts = m.dense_experts()
-    forms = {"dense MoE": lambda x: m.forward_dense(x, experts), "param": m.forward_param, "matrix": m.forward_matrix}
+    forms: dict[str, Callable[[Tokens], Tokens]] = {"dense MoE": lambda x: m.forward_dense(x, experts), "param": m.forward_param, "matrix": m.forward_matrix}
     print(f"{torch.cuda.get_device_name()}, hidden {hidden}, inter {inter}, {n_delta} deltas + zero expert, bf16, eager")
     print(f"{'tokens':>8} " + " ".join(f"{k:>14}" for k in forms) + "   (ms per layer)")
     for t in (1, 32, 512, 8192):
         x = torch.randn(t, hidden, dtype=torch.bfloat16, device="cuda")
-        row = []
+        row: list[float] = []
         for f in forms.values():
             for _ in range(3):
                 f(x)
