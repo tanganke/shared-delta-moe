@@ -20,6 +20,7 @@ def main() -> None:
     ap.add_argument("--hidden", type=int, default=2560)
     ap.add_argument("--inter", type=int, default=9216)
     ap.add_argument("--deltas", type=int, default=5)
+    ap.add_argument("--only", default="", help="comma-separated implementation names to run")
     a = ap.parse_args()
     torch.manual_seed(0)
     full = random_experts(a.hidden, a.inter, a.deltas + 1, torch.bfloat16, "cuda")
@@ -36,6 +37,8 @@ def main() -> None:
         "matrix loop": m._forward_matrix,
         "matrix grouped": m._forward_matrix_grouped,
     }
+    if a.only:
+        forms = {k: f for k, f in forms.items() if k in a.only.split(",")}
     print(
         f"{torch.cuda.get_device_name()}, hidden {a.hidden}, inter {a.inter}, {a.deltas} deltas + zero expert, top-{a.top_k}, bf16, eager"
     )
