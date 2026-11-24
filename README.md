@@ -3,8 +3,12 @@
 A small Python library: a top-k SwiGLU MoE written as **a shared base expert plus per-expert deltas**, with several forward implementations that are exactly equivalent to the original MoE, including a Triton kernel that fuses $W_b+\Delta_e$ into the GEMM.
 
 ```
-src/shared_delta_moe/delta_moe.py       DeltaMoE, from_experts, the forward implementations
+src/shared_delta_moe/delta_moe.py       DeltaMoE: from_experts, routing, the forward implementations
+src/shared_delta_moe/ops.py             stateless helpers: mlp, grouping routed rows, one grouped GEMM
 src/shared_delta_moe/triton_kernels.py  delta_gmm: grouped GEMM over (W_b + Delta_g), the sum formed in registers
+src/shared_delta_moe/constants.py       HAS_TRITON and the thresholds that pick an implementation
+src/shared_delta_moe/type_hints.py      shape-annotated tensor aliases (T tokens, H hidden, ...)
+src/shared_delta_moe/testing.py         random_experts for tests and benchmarks
 tests/test_delta_moe.py                 every forward == plain MoE, token by token (Triton part needs CUDA)
 benchmarks/bench.py                     per-layer time of each implementation (CUDA)
 ```
@@ -33,9 +37,9 @@ $$y = \sum_{i=1}^{k} r_i\,\mathrm{MLP}(x;\,W_b + \Delta_{e_i})$$
 | `forward_matrix` | Per-matrix output aggregation: gate/up compute $W_b x$ once for all tokens, plus $\Delta_e x$ per slot. Each slot keeps its own activation $h_i$; down computes $W_b h_i + \Delta_e h_i$; the slots are summed with weights $r_i$ | `_forward_matrix_grouped`: flattens all (token, slot) pairs, sorts them by expert, one `F.grouped_mm` per projection for the deltas; `_forward_matrix`: loop over experts |
 | `forward_dense(x, experts)` | Reference: plain MoE from stored full expert weights | `_forward_dense_grouped`: one `F.grouped_mm` per projection, like transformers' `grouped_mm` path; `_forward_dense`: loop over experts |
 
-Selection rules (thresholds measured on one H200 at the shape below; retune for other GPUs or shapes):
+Selection rules (thresholds measured on an H200 and an RTX 6000 Ada at the shape below; retune for other GPUs or shapes):
 
-- `forward_param`: Triton on CUDA bf16/fp16 for 2–4096 (token, slot) pairs. A single pair is cheaper through the loop; beyond about 4096 the work is compute-bound, and cuBLAS on materialised weights wins.
+- `forward_param`: Triton on CUDA bf16/fp16 from 2 (token, slot) pairs up to 4096 on Hopper (sm90+) or 8192 on Ada and older. A single pair is cheaper through the loop. Beyond the limit the work is compute-bound, and cuBLAS on materialised weights wins; on Hopper that happens earlier, because cuBLAS uses wgmma and this simple kernel does not match it.
 - `forward_matrix` / `forward_dense`: grouped GEMM when `F.grouped_mm` exists, the dtype is bf16/fp16/fp32, the device is CPU or a CUDA GPU with sm80+, and there is more than one pair; otherwise the loop.
 
 Note two things that would not be equivalent:
@@ -56,7 +60,9 @@ transformers' fused layout maps over as `gate, up = gate_up_proj[e].chunk(2)` an
 
 Apart from the Triton kernel, everything is `F.linear` (cuBLAS), `F.grouped_mm` (PyTorch's own grouped GEMM: CUDA sm80+ or CPU, bf16/fp16/fp32) and `index_add`. bf16/fp16 are the targets; fp32 is supported (and used for the CPU tests), fp64 is not.
 
-## Speed (single MoE layer, H200, bf16, eager, ms)
+## Speed (single MoE layer, bf16, eager, ms)
+
+### H200 (sm90, 4.8 TB/s)
 
 hidden 2560, inter 9216, 5 deltas + zero expert (the size of a Qwen3.5-4B MoE with 6 experts). For comparison, transformers' stock `Qwen3_5MoeSparseMoeBlock` (`grouped_mm`) at the same size takes 0.36 / 0.47 / 0.49 / 2.72 ms at 1 / 32 / 512 / 8192 tokens (top-1).
 
@@ -64,25 +70,25 @@ top-1:
 
 | tokens | plain loop | plain grouped | param (materialised) | param hybrid | **param Triton** | matrix loop | matrix grouped |
 |---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 0.249 | 0.349 | 0.229 | 0.221 | 0.336 | 0.229 | 0.315 |
-| 8 | 0.572 | 0.481 | 0.935 | 0.748 | **0.354** | 0.609 | 0.568 |
-| 32 | 0.794 | 0.586 | 1.263 | 1.018 | **0.359** | 0.758 | 0.597 |
-| 512 | 0.850 | 0.562 | 1.321 | 1.115 | **0.557** | 0.963 | 0.733 |
-| 2048 | 1.149 | 0.958 | 1.649 | 1.655 | 1.322 | 1.864 | 1.636 |
-| 4096 | 1.677 | 1.319 | 2.205 | 2.178 | 1.934 | 3.122 | 2.730 |
-| 8192 | 2.730 | 2.409 | 3.251 | 3.237 | 3.655 | 5.670 | 5.139 |
+| 1 | 0.251 | 0.351 | 0.235 | 0.227 | 0.336 | 0.232 | 0.323 |
+| 8 | 0.578 | 0.488 | 0.947 | 0.758 | **0.358** | 0.620 | 0.574 |
+| 32 | 0.818 | 0.592 | 1.282 | 1.050 | **0.359** | 0.779 | 0.606 |
+| 512 | 0.880 | 0.566 | 1.345 | 1.146 | **0.557** | 0.982 | 0.743 |
+| 2048 | 1.156 | 0.963 | 1.665 | 1.661 | 1.337 | 1.878 | 1.639 |
+| 4096 | 1.688 | 1.326 | 2.213 | 2.196 | 1.794 | 3.131 | 2.720 |
+| 8192 | 2.730 | 2.415 | 3.320 | 3.242 | 3.595 | 5.680 | 5.140 |
 
 top-2:
 
 | tokens | plain loop | plain grouped | param (materialised) | param hybrid | **param Triton** | matrix loop | matrix grouped |
 |---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 0.358 | 0.387 | 0.417 | 0.390 | **0.354** | 0.450 | 0.419 |
-| 8 | 0.789 | 0.578 | 1.254 | 1.004 | **0.361** | 1.266 | 0.633 |
-| 32 | 0.824 | 0.573 | 1.287 | 1.051 | **0.362** | 1.435 | 0.623 |
-| 512 | 0.919 | 0.659 | 1.416 | 1.267 | 0.712 | 1.818 | 0.923 |
-| 2048 | 1.654 | 1.319 | 2.180 | 2.144 | 1.783 | 3.438 | 2.444 |
-| 4096 | 2.615 | 2.439 | 3.152 | 3.120 | 3.621 | 5.712 | 4.574 |
-| 8192 | 4.717 | 4.601 | 5.456 | 5.258 | 7.172 | 10.293 | 8.668 |
+| 1 | 0.367 | 0.391 | 0.420 | 0.394 | **0.357** | 0.454 | 0.426 |
+| 8 | 0.809 | 0.585 | 1.278 | 1.032 | **0.361** | 1.293 | 0.643 |
+| 32 | 0.846 | 0.582 | 1.313 | 1.071 | **0.359** | 1.475 | 0.634 |
+| 512 | 0.926 | 0.664 | 1.436 | 1.283 | 0.716 | 1.852 | 0.924 |
+| 2048 | 1.650 | 1.311 | 2.177 | 2.160 | 1.773 | 3.475 | 2.443 |
+| 4096 | 2.631 | 2.406 | 3.169 | 3.127 | 3.568 | 5.737 | 4.509 |
+| 8192 | 4.628 | 4.392 | 5.261 | 5.252 | 7.067 | 10.236 | 8.546 |
 
 - **Triton fused parameter aggregation** is the fastest of everything here from 8 to 512 tokens, the plain MoE and transformers included (top-1, 32 tokens: 0.36 vs 0.59 / 0.47). Decode is memory-bound. The kernel reads $W_b$ and $\Delta_e$ once each, writes no weights, and does a single GEMM's FLOPs; all pairs go through one launch per projection, and nothing synchronises the host.
 - Three things mattered in the kernel:
@@ -92,6 +98,36 @@ top-2:
 - With many tokens the work is compute-bound, and this simple Triton GEMM loses to cuBLAS (8192 tokens: 3.66 vs 2.41 plain grouped). So `forward_param` switches to the materialised version past 4096 pairs; a better GEMM kernel would be needed to close that gap.
 - **Per-matrix output aggregation** needs no custom kernel. It is about 1.3× the plain MoE at small token counts and about 2× at large ones, since it computes both $W_b$ and $\Delta_e$.
 - **Grouped GEMM vs loop**: from 32 to 512 tokens, the grouped versions are 1.3–2.3× faster than the per-expert loops; at a single token the sort and count cost more than they save.
+
+### RTX 6000 Ada (sm89, 960 GB/s)
+
+top-1:
+
+| tokens | plain loop | plain grouped | param (materialised) | param hybrid | **param Triton** | matrix loop | matrix grouped |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 0.363 | 0.663 | 0.808 | 0.509 | 0.538 | 0.530 | 0.815 |
+| 8 | 1.650 | 1.357 | 3.935 | 2.402 | **1.065** | 1.600 | 1.379 |
+| 32 | 1.657 | 1.376 | 4.024 | 2.454 | **1.078** | 1.580 | 1.413 |
+| 512 | 1.859 | 1.591 | 4.225 | 2.823 | **1.244** | 2.368 | 2.095 |
+| 2048 | 3.324 | 3.532 | 5.867 | 5.641 | **3.168** | 6.500 | 5.869 |
+| 4096 | 6.162 | 6.219 | 8.153 | 8.009 | **5.935** | 12.223 | 11.810 |
+| 8192 | 12.373 | 11.415 | 13.407 | 13.302 | 11.713 | 24.865 | 23.370 |
+
+top-2:
+
+| tokens | plain loop | plain grouped | param (materialised) | param hybrid | **param Triton** | matrix loop | matrix grouped |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 0.642 | 0.825 | 1.538 | 0.953 | **0.599** | 1.050 | 0.955 |
+| 8 | 1.715 | 1.397 | 4.017 | 2.392 | **1.080** | 2.864 | 1.474 |
+| 32 | 1.694 | 1.413 | 4.047 | 2.496 | **1.107** | 3.047 | 1.456 |
+| 512 | 2.150 | 1.948 | 4.550 | 3.477 | **1.652** | 4.528 | 2.642 |
+| 2048 | 5.998 | 6.270 | 8.158 | 7.856 | 6.903 | 11.486 | 9.812 |
+| 4096 | 11.951 | 11.859 | 13.340 | 13.054 | **11.816** | 22.354 | 19.629 |
+| 8192 | 22.403 | 22.105 | 23.916 | 23.836 | 27.769 | 43.258 | 38.772 |
+
+- Lower bandwidth makes everything 2–4× slower than on the H200, but the ranking holds. From 8 to 512 tokens Triton is 1.2–1.3× faster than the plain MoE.
+- Hopper's wgmma advantage is absent here: with many tokens Triton is on par with cuBLAS (top-1 at 4096–8192 tokens), and it beats materialised weights up to about 8192 pairs, hence the higher limit for Ada and older.
+- Two Ada-friendly configs (BK 32, 4–5 stages) were added to the autotune list. They took top-1 at 4096 tokens from 6.72 to 5.94 ms. On Hopper, autotuning still picks its own.
 
 The delta form has uses beyond speed: $\Delta_e$ is a standalone tensor that can be compressed, sparsified or trained on its own; the zero expert has no parameters; and in per-matrix output aggregation the routing weight can stay in the computation graph.
 

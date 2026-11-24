@@ -12,9 +12,10 @@ the addition happens:
                   slot has its own activation h_i, down is W_b h_i + Delta_e h_i; slots summed with weights r
   forward_dense   the plain MoE baseline, from stored full experts
 
-Each public forward picks an implementation (_forward_*) by hardware and input. forward_param: the fused Triton
-kernel on CUDA bf16/fp16 for 2..4096 (token, slot) pairs, else materialised weights. forward_matrix / forward_dense:
-grouped GEMM (F.grouped_mm) when available for the dtype and device and there is more than one pair, else a loop.
+Each public forward picks an implementation (_forward_*) by hardware and input, with thresholds in constants.py:
+forward_param uses the fused Triton kernel on CUDA bf16/fp16 for a moderate number of (token, slot) pairs, else
+materialised weights; forward_matrix / forward_dense use grouped GEMM (F.grouped_mm) when available for the dtype and
+device and there is more than one pair, else a loop.
 
 Adding r Delta_e x into one shared activation instead (merging weights per token) is not the same function when k > 1,
 because SwiGLU is nonlinear; each slot keeps its own activation here. With k = 1, r = 1 and both reduce to one MLP.
@@ -23,62 +24,35 @@ Plain PyTorch (F.linear, F.grouped_mm, index_add), plus an optional Triton kerne
 adds W_b + Delta_e tile by tile in registers instead of writing the sum out (triton_kernels.py).
 """
 
-import importlib.util
 from collections.abc import Sequence
-from typing import Annotated, Any, TypeAlias
+from typing import Any
 
 import torch
 import torch.nn.functional as F
-from torch import Tensor, nn
+from torch import nn
 
-HAS_TRITON = importlib.util.find_spec("triton") is not None
-
-# Shapes as annotations (T tokens, H hidden, I intermediate, N deltas, K top-k, R rows of one group).
-Tokens: TypeAlias = Annotated[Tensor, "T H"]
-Hidden: TypeAlias = Annotated[Tensor, "T I"]
-Experts: TypeAlias = Annotated[Tensor, "T K int64, delta index, -1 = any zero expert"]
-RouteWeights: TypeAlias = Annotated[Tensor, "T K, rows sum to 1"]
-Rows: TypeAlias = Annotated[Tensor, "R int64 token indices"]
-Coef: TypeAlias = Annotated[Tensor, "R 1 router weight of those rows"]
-InWeight: TypeAlias = Annotated[Tensor, "I H"]
-OutWeight: TypeAlias = Annotated[Tensor, "H I"]
-MLPWeights: TypeAlias = tuple[InWeight, InWeight, OutWeight]
-Group: TypeAlias = tuple[int, Rows, Coef]
-RouterWeight: TypeAlias = Annotated[
-    Tensor, "N+Z H, rows N..N+Z-1 = zero experts (base)"
-]
-DenseExperts: TypeAlias = list[Annotated[Tensor, "N+1 out in, index 0 = base"]]
-
-
-def mlp(x: Tokens, gate: InWeight, up: InWeight, down: OutWeight) -> Tokens:
-    return F.linear(F.silu(F.linear(x, gate)) * F.linear(x, up), down)
-
-
-def groups(e: Annotated[Tensor, "T int64"], r: Annotated[Tensor, "T"]) -> list[Group]:
-    """One routing slot -> [(delta index or -1, token rows, their weights)] for the experts it uses."""
-    out: list[Group] = []
-    for k in e.unique().tolist():
-        rows = (e == k).nonzero().squeeze(-1)
-        out.append((k, rows, r[rows, None]))
-    return out
-
-
-def sort_rows(
-    e: Annotated[Tensor, "T int64"], n: int
-) -> tuple[Rows, Annotated[Tensor, "n int32 group ends"]]:
-    """Rows with e >= 0, sorted by e, and the cumulative group sizes that grouped_mm takes as offs."""
-    rows = (e >= 0).nonzero().squeeze(-1)
-    rows = rows[e[rows].argsort()]
-    return rows, torch.bincount(e[rows], minlength=n).cumsum(0).to(torch.int32)
-
-
-def gmm(
-    a: Annotated[Tensor, "R in"],
-    w: Annotated[Tensor, "G out in"],
-    offs: Annotated[Tensor, "G int32"],
-) -> Annotated[Tensor, "R out"]:
-    """One grouped GEMM: rows offs[g-1]:offs[g] of a times w[g]^T (CUDA sm80+, or CPU; bf16/fp16/fp32)."""
-    return F.grouped_mm(a, w.mT, offs=offs)
+from .constants import (
+    GROUPED_DTYPES,
+    GROUPED_MIN_PAIRS,
+    HAS_TRITON,
+    PARAM_MIN_ROWS,
+    TRITON_DTYPES,
+    TRITON_MAX_PAIRS_HOPPER,
+    TRITON_MAX_PAIRS_OLDER,
+    TRITON_MIN_PAIRS,
+)
+from .ops import gmm, groups, mlp, sort_rows
+from .type_hints import (
+    DenseExperts,
+    Experts,
+    Group,
+    Hidden,
+    MLPWeights,
+    PairHidden,
+    RouteWeights,
+    RouterWeight,
+    Tokens,
+)
 
 
 class DeltaMoE(nn.Module):
@@ -242,9 +216,7 @@ class DeltaMoE(nn.Module):
         xs = x[tok[rows]]
         g = F.linear(x, self.gate)[tok].index_add(0, rows, gmm(xs, self.d_gate, offs))
         u = F.linear(x, self.up)[tok].index_add(0, rows, gmm(xs, self.d_up, offs))
-        h: Annotated[Tensor, "T*K I"] = (
-            F.silu(g) * u
-        )  # each slot keeps its own activation
+        h: PairHidden = F.silu(g) * u  # each slot keeps its own activation
         o = F.linear(h, self.down).index_add(0, rows, gmm(h[rows], self.d_down, offs))
         return (o.view(-1, self.top_k, x.shape[-1]) * r[..., None]).sum(1)
 
@@ -291,34 +263,33 @@ class DeltaMoE(nn.Module):
     def _grouped(self, x: Tokens) -> bool:
         """Use grouped GEMM? Needs F.grouped_mm with this dtype on this device, and more than one (token, slot) pair
         (with one pair the sort and count cost more than the loop saves)."""
-        # ponytail: threshold measured on one H200 only; tune per GPU if it matters
-        if not hasattr(F, "grouped_mm") or x.dtype not in (
-            torch.bfloat16,
-            torch.float16,
-            torch.float32,
-        ):
+        if not hasattr(F, "grouped_mm") or x.dtype not in GROUPED_DTYPES:
             return False
         if x.device.type == "cuda" and torch.cuda.get_device_capability(x.device) < (
             8,
             0,
         ):
             return False
-        return x.device.type in ("cuda", "cpu") and x.shape[0] * self.top_k > 1
+        return (
+            x.device.type in ("cuda", "cpu")
+            and x.shape[0] * self.top_k >= GROUPED_MIN_PAIRS
+        )
 
     def _use_triton(self, x: Tokens) -> bool:
-        """Fused Triton parameter aggregation? CUDA, bf16/fp16, and 2..4096 (token, slot) pairs: one pair is cheaper
-        through the loop, and past ~4096 the materialised weights + cuBLAS win (compute-bound).
-        """
-        # ponytail: thresholds measured on one H200 (hidden 2560, inter 9216, 6 experts); retune for other shapes/GPUs
-        ok = HAS_TRITON and x.is_cuda and x.dtype in (torch.bfloat16, torch.float16)
-        return ok and 2 <= x.shape[0] * self.top_k <= 4096
+        """Fused Triton parameter aggregation? Triton, CUDA, a TRITON_DTYPES dtype, and a (token, slot) pair count
+        within TRITON_MIN_PAIRS .. TRITON_MAX_PAIRS_{HOPPER,OLDER} (see constants)."""
+        if not (HAS_TRITON and x.is_cuda and x.dtype in TRITON_DTYPES):
+            return False
+        hopper = torch.cuda.get_device_capability(x.device) >= (9, 0)
+        limit = TRITON_MAX_PAIRS_HOPPER if hopper else TRITON_MAX_PAIRS_OLDER
+        return TRITON_MIN_PAIRS <= x.shape[0] * self.top_k <= limit
 
     def forward_param(self, x: Tokens) -> Tokens:
         """Parameter aggregation: the fused Triton kernel when _use_triton, else materialised W_b + Delta_e (experts
-        with < 256 routed rows skip the materialisation)."""
+        with fewer than PARAM_MIN_ROWS routed rows skip the materialisation)."""
         if self._use_triton(x):
             return self._forward_param_triton(x)
-        return self._forward_param(x, min_rows=256)
+        return self._forward_param(x, min_rows=PARAM_MIN_ROWS)
 
     def forward_matrix(self, x: Tokens) -> Tokens:
         """Per-matrix output aggregation: grouped GEMM when available and worth it, else the per-expert loop."""
@@ -333,13 +304,3 @@ class DeltaMoE(nn.Module):
         if self._grouped(x):
             return self._forward_dense_grouped(x, experts)
         return self._forward_dense(x, experts)
-
-
-def random_experts(
-    hidden: int, inter: int, n: int, dtype: torch.dtype, device: str
-) -> list[MLPWeights]:
-    """n random (gate, up, down), scaled 1/sqrt(fan_in) so activations stay O(1) (for tests and benchmarks)."""
-    r = lambda *shape: (
-        torch.randn(*shape, dtype=dtype, device=device) * shape[-1] ** -0.5
-    )
-    return [(r(inter, hidden), r(inter, hidden), r(hidden, inter)) for _ in range(n)]
