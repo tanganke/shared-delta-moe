@@ -13,6 +13,8 @@ $$y = \sum_{i=1}^{k} r_i\,\mathrm{MLP}(x;\,W_b + \Delta_{e_i})$$
 | Parameter aggregation | Per expert, materialise $W_b + \Delta_e$ once and run one MLP on the (token, slot) pairs routed to it; multiply by $r_i$ and `index_add` back | `DeltaMoE.forward_param` |
 | Per-matrix output aggregation | gate/up compute $W_b x$ once for all tokens, plus $\Delta_e x$ per slot. Each slot keeps its own activation $h_i$; down computes $W_b h_i + \Delta_e h_i$; the slots are summed with weights $r_i$ | `DeltaMoE.forward_matrix` |
 | Reference: plain MoE | Stored full expert weights, grouped the same way | `DeltaMoE.forward_dense` |
+| Per-matrix output aggregation, grouped GEMM | Same as above, but flattens all (token, slot) pairs, sorts them by expert, and computes the deltas for each projection in one `F.grouped_mm` call (no Python loop) | `DeltaMoE.forward_matrix_grouped` |
+| Reference: plain MoE, grouped GEMM | One `F.grouped_mm` per projection, which is what transformers' default `grouped_mm` path does | `DeltaMoE.forward_dense_grouped` |
 
 Note two things that would not be equivalent:
 
@@ -30,29 +32,40 @@ Build one from a plain MoE with `DeltaMoE.from_experts(base, experts, router, to
 
 transformers' fused layout maps over as `gate, up = gate_up_proj[e].chunk(2)` and `down = down_proj[e]`. In bf16, $W_b + (W_e - W_b)$ is not always exactly $W_e$ (about 0.6% of elements in our model).
 
-**No custom kernels.** Everything is `F.linear` (cuBLAS) plus `index_add`.
+**No custom kernels.** Everything is `F.linear` (cuBLAS), `F.grouped_mm` (PyTorch's own grouped GEMM: CUDA sm80+ or CPU, bf16/fp16/fp32, no fp64) plus `index_add`.
 
 ```bash
-python delta_moe.py                  # float64 self-check (Z = 0/1/2 x top-1/top-2, both forms == plain MoE, token by token), then a top-1 benchmark if CUDA is available
+python delta_moe.py                  # float32 self-check (Z = 0/1/2 x top-1/top-2, every form == plain MoE, token by token), then a top-1 benchmark if CUDA is available
 python delta_moe.py --top-k 2        # top-2 benchmark
 python delta_moe.py --no-bench
 ```
 
 ## Speed (single MoE layer, H200, bf16, eager, ms)
 
-hidden 2560, inter 9216, 5 deltas + zero expert (the size of a Qwen3.5-4B MoE with 6 experts):
+hidden 2560, inter 9216, 5 deltas + zero expert (the size of a Qwen3.5-4B MoE with 6 experts). "transformers" is the stock `Qwen3_5MoeSparseMoeBlock` (`grouped_mm`, 6 experts) at the same size.
 
-| tokens | top-1 plain MoE | top-1 param agg | top-1 matrix agg | top-2 plain MoE | top-2 param agg | top-2 matrix agg |
+top-1:
+
+| tokens | plain loop | plain grouped | transformers | param agg | matrix loop | matrix grouped |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 0.242 | 0.304 | 0.296 | 0.352 | 0.418 | 0.440 |
-| 32 | 0.800 | 1.292 | 0.771 | 0.832 | 1.311 | 1.480 |
-| 512 | 0.853 | 1.349 | 0.974 | 0.926 | 1.428 | 1.834 |
-| 8192 | 2.708 | 3.197 | 5.633 | 4.600 | 5.218 | 10.258 |
+| 1 | 0.265 | 0.367 | 0.360 | 0.244 | 0.231 | 0.335 |
+| 32 | 0.828 | 0.578 | 0.472 | 1.310 | 0.782 | 0.611 |
+| 512 | 0.888 | 0.571 | 0.494 | 1.369 | 0.985 | 0.736 |
+| 8192 | 2.722 | 2.450 | 2.719 | 3.220 | 5.637 | 5.130 |
 
-Neither form beats a plain MoE implemented the same way:
+top-2:
 
-- **Parameter aggregation** writes out a full weight matrix per expert. With few tokens that extra memory traffic dominates (top-1, 32 tokens: 1.6×). Under top-k each expert still materialises its weights only once, so going from top-1 to top-2 adds little.
-- **Per-matrix output aggregation** has no weight sum, but does about twice the compute. Under top-1, with few tokens, it is on par with the plain MoE. Under top-k every slot has to run the full base down projection plus the deltas, so it is the slowest at top-2 (8192 tokens: 2.2×).
+| tokens | plain loop | plain grouped | transformers | param agg | matrix loop | matrix grouped |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 0.374 | 0.392 | 0.405 | 0.428 | 0.471 | 0.445 |
+| 32 | 0.843 | 0.597 | 0.498 | 1.335 | 1.482 | 0.632 |
+| 512 | 0.947 | 0.662 | 0.591 | 1.426 | 1.833 | 0.917 |
+| 8192 | 4.539 | 4.402 | 4.732 | 5.195 | 10.248 | 8.631 |
+
+- **Grouped GEMM** replaces the per-expert Python loop with one kernel per projection. From 32 to 512 tokens it is 1.3–2.3× faster than the loop, and top-2 gains the most, because the loop runs every expert of every slot separately. At 1 token, the extra sort and count make it slightly slower.
+- **Per-matrix output aggregation, grouped**: 1.3× the transformers MoE at 32 tokens (top-1 0.61 vs 0.47, top-2 0.63 vs 0.50), and about 1.9× at 8192 tokens (computing both $W_b$ and $\Delta_e$ roughly doubles the compute).
+- **Parameter aggregation** writes out a full weight matrix per expert, so it is the slowest at mid-range token counts. It does not fit grouped GEMM well: you would first have to write out $W_b+\Delta_e$ for every expert, which costs even more memory traffic.
+- The remaining gap between plain grouped and transformers (0.58 vs 0.47) is mainly the `nonzero` and `bincount` here, which synchronise the CPU and GPU; transformers uses `histc` and a fixed number of groups, which needs no sync.
 
 The benefits of these forms are elsewhere. The delta $\Delta_e$ is a standalone tensor that can be compressed, sparsified or trained on its own; the zero expert has no parameters; and in per-matrix output aggregation the routing weight can stay in the computation graph.
 

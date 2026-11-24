@@ -16,7 +16,7 @@ because SwiGLU is nonlinear; each slot keeps its own activation here. With k = 1
 
 Plain PyTorch only (F.linear, index_add); no custom kernels.
 
-    python delta_moe.py [--top-k K] [--no-bench]   # self-check (float64, k = 1 and 2), then a benchmark if CUDA
+    python delta_moe.py [--top-k K] [--no-bench]   # self-check (float32), then a benchmark if CUDA
 """
 
 import itertools
@@ -57,6 +57,24 @@ def groups(e: Annotated[Tensor, "T int64"], r: Annotated[Tensor, "T"]) -> list[G
         rows = (e == k).nonzero().squeeze(-1)
         out.append((k, rows, r[rows, None]))
     return out
+
+
+def sort_rows(
+    e: Annotated[Tensor, "T int64"], n: int
+) -> tuple[Rows, Annotated[Tensor, "n int32 group ends"]]:
+    """Rows with e >= 0, sorted by e, and the cumulative group sizes that grouped_mm takes as offs."""
+    rows = (e >= 0).nonzero().squeeze(-1)
+    rows = rows[e[rows].argsort()]
+    return rows, torch.bincount(e[rows], minlength=n).cumsum(0).to(torch.int32)
+
+
+def gmm(
+    a: Annotated[Tensor, "R in"],
+    w: Annotated[Tensor, "G out in"],
+    offs: Annotated[Tensor, "G int32"],
+) -> Annotated[Tensor, "R out"]:
+    """One grouped GEMM: rows offs[g-1]:offs[g] of a times w[g]^T (CUDA sm80+, or CPU; bf16/fp16/fp32)."""
+    return F.grouped_mm(a, w.mT, offs=offs)
 
 
 class DeltaMoE(nn.Module):
@@ -199,6 +217,35 @@ class DeltaMoE(nn.Module):
             )
         return out
 
+    def forward_matrix_grouped(self, x: Tokens) -> Tokens:
+        """forward_matrix with the deltas of all (token, slot) pairs done as one grouped GEMM per projection."""
+        idx, r = self.route(x)
+        tok = torch.arange(idx.numel(), device=x.device) // self.top_k  # pair -> token
+        rows, offs = sort_rows(
+            idx.flatten(), self.d_gate.shape[0]
+        )  # pairs with a delta
+        xs = x[tok[rows]]
+        g = F.linear(x, self.gate)[tok].index_add(0, rows, gmm(xs, self.d_gate, offs))
+        u = F.linear(x, self.up)[tok].index_add(0, rows, gmm(xs, self.d_up, offs))
+        h: Annotated[Tensor, "T*K I"] = (
+            F.silu(g) * u
+        )  # each slot keeps its own activation
+        o = F.linear(h, self.down).index_add(0, rows, gmm(h[rows], self.d_down, offs))
+        return (o.view(-1, self.top_k, x.shape[-1]) * r[..., None]).sum(1)
+
+    def forward_dense_grouped(self, x: Tokens, experts: DenseExperts) -> Tokens:
+        """Plain top-k MoE, all (token, slot) pairs as one grouped GEMM per projection (like transformers' grouped_mm)."""
+        idx, r = self.route(x)
+        tok = torch.arange(idx.numel(), device=x.device) // self.top_k
+        rows, offs = sort_rows(
+            idx.flatten() + 1, len(experts[0])
+        )  # every pair; zero experts -> 0 = base
+        xs = x[tok[rows]]
+        h = F.silu(gmm(xs, experts[0], offs)) * gmm(xs, experts[1], offs)
+        o = torch.empty(idx.numel(), x.shape[-1], dtype=x.dtype, device=x.device)
+        o[rows] = gmm(h, experts[2], offs)
+        return (o.view(-1, self.top_k, x.shape[-1]) * r[..., None]).sum(1)
+
 
 def random_experts(
     hidden: int, inter: int, n: int, dtype: torch.dtype, device: str
@@ -214,16 +261,16 @@ def check() -> None:
     for z, k in itertools.product((0, 1, 2), (1, 2)):
         torch.manual_seed(0)
         full = random_experts(
-            16, 24, 4, torch.float64, "cpu"
+            16, 24, 4, torch.float32, "cpu"
         )  # random weights only so that the experts differ
         m = DeltaMoE.from_experts(
             full[0],
             full[1:],
-            torch.randn(3 + z, 16, dtype=torch.float64),
+            torch.randn(3 + z, 16, dtype=torch.float32),
             top_k=k,
             num_zero_experts=z,
         )
-        x = torch.randn(200, 16, dtype=torch.float64)
+        x = torch.randn(200, 16, dtype=torch.float32)
         idx, r = m.route(x)
         assert idx[idx >= 0].unique().tolist() == [0, 1, 2] and (idx == -1).any() == (
             z > 0
@@ -255,8 +302,10 @@ def check() -> None:
             m.forward_param,
             m.forward_matrix,
             lambda x: m.forward_dense(x, experts),
+            m.forward_matrix_grouped,
+            lambda x: m.forward_dense_grouped(x, experts),
         ):
-            assert torch.allclose(f(x), ref, atol=1e-10), (
+            assert torch.allclose(f(x), ref, atol=1e-5), (
                 z,
                 k,
                 (f(x) - ref).abs().max(),
@@ -288,6 +337,8 @@ def bench(
         "dense MoE": lambda x: m.forward_dense(x, experts),
         "param": m.forward_param,
         "matrix": m.forward_matrix,
+        "dense grouped": lambda x: m.forward_dense_grouped(x, experts),
+        "matrix grouped": m.forward_matrix_grouped,
     }
     print(
         f"{torch.cuda.get_device_name()}, hidden {hidden}, inter {inter}, {n_delta} deltas + zero expert, top-{top_k}, bf16, eager"
