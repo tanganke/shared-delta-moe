@@ -59,12 +59,18 @@ def test_bitmaps_after_load_state_dict():
     for device in ("meta", x.device):
         d2 = DareDeltaMoE(H, I, m.n_delta, 0.3, 4, 5, m.top_k, m.num_zero_experts, device, x.dtype)
         d2 = d2.to_empty(device=x.device)
-        for name in ("gate", "up", "down"):  # packed buffers start empty (see _init_deltas)
-            setattr(d2, f"v_{name}", torch.empty_like(getattr(d, f"v_{name}")))
-            setattr(d2, f"p_{name}", torch.empty_like(getattr(d, f"p_{name}")))
-        d2.load_state_dict(d.state_dict())
+        d2.load_state_dict(d.state_dict())  # sizes the packed buffers
         for name in ("gate", "up", "down"):
             assert torch.equal(getattr(d2, f"m_{name}"), getattr(d, f"m_{name}")), (device, name)
+    for other in ((0.5, 4, 5), (0.3, 4, 6), (0.3, 8, 5)):  # keep, block, seed of another model: refused
+        d3 = DareDeltaMoE(H, I, m.n_delta, *other, m.top_k, m.num_zero_experts, x.device, x.dtype)
+        try:
+            d3.load_state_dict(d.state_dict())
+            raise AssertionError(other)
+        except RuntimeError as err:
+            assert "do not match" in str(err), err
+    d4 = DareDeltaMoE(H, I, m.n_delta, 0.3, 4, 5, m.top_k, m.num_zero_experts, x.device, x.dtype)
+    d4.load_state_dict({"router.weight": d.router.weight}, strict=False)  # packed deltas left for later: no check
     if not GPU:
         return
     with torch.no_grad():
@@ -78,6 +84,22 @@ def test_bitmaps_after_load_state_dict():
         g.replay()
         torch.cuda.synchronize()
         assert torch.equal(y, want)
+
+
+def test_no_deltas():
+    """n_delta = 0 (only zero experts): packs, saves, loads and runs as the base MLP."""
+    m, _, x = make(1, 1)
+    base = DeltaMoE(16, 24, 0, 2, 2)
+    with torch.no_grad():
+        base.router.weight.normal_()
+        for n in PROJ:
+            getattr(base, n).copy_(getattr(m, n))
+    d = DareDeltaMoE.from_delta_moe(base, 0.5, 4)
+    d2 = DareDeltaMoE(16, 24, 0, 0.5, 4, 0, 2, 2)
+    d2.load_state_dict(d.state_dict())
+    want = base._forward_param(x)
+    for mod in (d, d2):
+        assert torch.allclose(mod._forward_param(x), want) and torch.allclose(mod._forward_matrix(x), want)
 
 
 def test_dare_forwards_match_plain_moe():

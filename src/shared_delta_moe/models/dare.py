@@ -80,7 +80,7 @@ def pack(
     d: Tensor, seed: int, j: int, keep: float, block: int
 ) -> tuple[Tensor, Tensor]:
     """Deltas (N, R, C) of projection j -> kept values / keep (flat) and each row's start in them (N, R) int64."""
-    vals, counts = [], []
+    vals, counts = [d.new_empty(0)], [torch.zeros(0, dtype=torch.int64, device=d.device)]  # N = 0: empty
     for e in range(d.shape[0]):
         m = keep_mask(seed, 3 * e + j, d.shape[1], d.shape[2], keep, block, d.device)
         vals.append((d[e].float() / keep).to(d.dtype)[m])
@@ -110,13 +110,39 @@ class DareDeltaMoE(DeltaMoE):
     ) -> None:
         super().__init__(hidden, inter, n_delta, top_k, num_zero_experts, device, dtype)
         self.keep, self.block, self.seed = keep, block, seed
+        self._loaded: set[str] = set()  # projections the current load_state_dict fills (checked after it)
         self._mask_bits()
-        self.register_load_state_dict_post_hook(lambda mod, _: mod._mask_bits())
+        self.register_load_state_dict_pre_hook(DareDeltaMoE._resize_packed)
+        self.register_load_state_dict_post_hook(DareDeltaMoE._after_load)  # a method: the module pickles
+
+    def _after_load(self, _: Any = None) -> None:
+        """Rebuild the bitmaps and check the loaded packing against them: keep, block and seed are not in the state
+        dict, so a checkpoint made with others would otherwise load and scatter its values to the wrong places."""
+        self._mask_bits()
+        loaded, self._loaded = self._loaded, set()
+        for n in loaded:  # only what this load filled: strict=False may leave a block for later
+            m, v, p = getattr(self, f"m_{n}"), getattr(self, f"v_{n}"), getattr(self, f"p_{n}")
+            if m.device.type == "meta" or v.device.type == "meta":
+                continue
+            c = sum(((m >> b) & 1).sum(-1) for b in range(32)).flatten() * self.block  # kept per row
+            if v.numel() != int(c.sum()) or not torch.equal(p.flatten(), c.cumsum(0) - c):
+                raise RuntimeError(
+                    f"DareDeltaMoE: packed {n} deltas do not match keep={self.keep}, block={self.block}, "
+                    f"seed={self.seed} (made with other DARE settings?)"
+                )
+
+    def _resize_packed(self, state: dict[str, Tensor], prefix: str, *_: Any) -> None:
+        """v_<proj> holds as many values as the mask keeps: size the packed buffers to the incoming ones."""
+        for n in PROJ:
+            for k in (f"v_{n}", f"p_{n}"):
+                if (t := state.get(prefix + k)) is not None:
+                    setattr(self, k, getattr(self, k).new_empty(t.shape))
+                    self._loaded.add(n)
 
     def _init_deltas(
         self, n: int, inter: int, hidden: int, factory: dict[str, Any]
     ) -> None:
-        # ponytail: buffers start empty, so load_state_dict needs them resized first; fill with from_delta_moe
+        # packed buffers start empty: filled by from_delta_moe, or sized by load_state_dict (_resize_packed)
         self.shapes = {
             "gate": (n, inter, hidden),
             "up": (n, inter, hidden),
