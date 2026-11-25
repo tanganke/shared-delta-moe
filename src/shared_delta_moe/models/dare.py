@@ -7,9 +7,9 @@ Mask spec, for projection j (0 gate, 1 up, 2 down) of delta e, an (R, C) matrix,
   unit u = row * (C / B) + col // B,  counter = (u, 3e + j, 0, 0),  key = (seed mod 2^32, seed >> 32)
   kept  <=>  word 0 of Philox4x32-10(counter, key) < round(keep * 2^32)
 Kept values are stored row-major, expert by expert, as Delta / keep in the model dtype; p_<proj> (N, R) holds where
-each row starts. The fused kernel reads the mask as a bitmap (mask_bits: 1 bit per block, built once per model and
-kept as a non-persistent buffer) rather than running Philox per tile: rows x C / B bits per delta matrix, e.g. 0.7 MB
-per Qwen3.5-4B MoE layer at block 64. It is built in __init__ and again after load_state_dict (which also covers a
+each row starts. The fused kernel and the materialised (training) path read the mask as a bitmap (mask_bits: 1 bit per
+block, built once per model and kept as a non-persistent buffer) rather than running Philox each time: rows x C / B
+bits per delta matrix, e.g. 0.7 MB per Qwen3.5-4B MoE layer at block 64. It is built in __init__ and again after load_state_dict (which also covers a
 model made on the meta device), never inside a forward: there it could land in a CUDA-graph capture or a compiled
 trace. seed, keep and block are fixed at construction.
 """
@@ -89,24 +89,11 @@ def pack(
     return torch.cat(vals), (c.cumsum(0) - c).view(d.shape[:2])
 
 
-def unpack(
-    v: Tensor, seed: int, j: int, shape: tuple[int, int, int], keep: float, block: int
-) -> Tensor:
-    d = torch.zeros(shape, dtype=v.dtype, device=v.device)
-    i = 0
-    for e in range(shape[0]):
-        m = keep_mask(seed, 3 * e + j, shape[1], shape[2], keep, block, v.device)
-        k = int(m.sum())
-        d[e][m] = v[i : i + k]
-        i += k
-    assert i == v.numel()
-    return d
-
-
 class DareDeltaMoE(DeltaMoE):
-    """DeltaMoE whose deltas are seeded DARE (see the module docstring). d_gate / d_up / d_down unpack to dense
-    tensors on access, so every inherited forward works (as a slow reference); the fused Triton path reads the packed
-    values directly (triton_kernels/fused.py). Build with from_delta_moe."""
+    """DeltaMoE whose deltas are seeded DARE (see the module docstring). The materialised path (training) unpacks
+    only the routed expert e from the mask bitmap (delta(e)); d_gate / d_up / d_down unpack every expert on access, so
+    the other inherited forwards work too (as references); the fused Triton path reads the packed values directly
+    (triton_kernels/fused.py). Build with from_delta_moe."""
 
     def __init__(
         self,
@@ -169,16 +156,30 @@ class DareDeltaMoE(DeltaMoE):
             setattr(out, f"p_{name}", p)
         return out
 
+    def _bits(self, name: str) -> Tensor:
+        m = getattr(self, f"m_{name}")
+        if m.ndim != 3:  # e.g. made on meta, then to_empty, no load
+            raise RuntimeError("DareDeltaMoE mask bitmaps not built: call load_state_dict or _mask_bits() first")
+        return m
+
+    def _unpack(self, name: str, e: int) -> Tensor:
+        """Dense Delta_e of one projection from the bitmap (no Philox); differentiable in v_<name>."""
+        _, R, C = self.shapes[name]
+        w = self._bits(name)[e]  # (R, words)
+        bits = (w[..., None] >> torch.arange(32, dtype=torch.int32, device=w.device)) & 1
+        keep = bits.view(R, -1)[:, : C // self.block].bool().repeat_interleave(self.block, 1)
+        v = getattr(self, f"v_{name}")
+        return v.new_zeros(R, C).masked_scatter(keep, v[int(getattr(self, f"p_{name}")[e, 0]) :])
+
+    def delta(self, e: int) -> tuple[Tensor, Tensor, Tensor]:
+        return self._unpack("gate", e), self._unpack("up", e), self._unpack("down", e)
+
     def _delta(self, j: int) -> Tensor:
         name = PROJ[j]
-        return unpack(
-            getattr(self, f"v_{name}"),
-            self.seed,
-            j,
-            self.shapes[name],
-            self.keep,
-            self.block,
-        )
+        G, R, C = self.shapes[name]
+        if G == 0:
+            return getattr(self, f"v_{name}").new_zeros(G, R, C)
+        return torch.stack([self._unpack(name, e) for e in range(G)])
 
     @property
     def d_gate(self) -> Tensor:  # type: ignore[override]
@@ -211,8 +212,6 @@ class DareDeltaMoE(DeltaMoE):
     def _kernel_deltas(self) -> "tuple[Delta, Delta, Delta]":
         from ..triton_kernels import Delta
 
-        if any(getattr(self, f"m_{n}").ndim != 3 for n in PROJ):  # e.g. made on meta, then to_empty, no load
-            raise RuntimeError("DareDeltaMoE mask bitmaps not built: call load_state_dict or _mask_bits() first")
         return tuple(  # type: ignore[return-value]
-            Delta(1, getattr(self, f"v_{n}"), getattr(self, f"p_{n}"), getattr(self, f"m_{n}"), self.block) for n in PROJ
+            Delta(1, getattr(self, f"v_{n}"), getattr(self, f"p_{n}"), self._bits(n), self.block) for n in PROJ
         )

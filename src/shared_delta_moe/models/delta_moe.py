@@ -150,21 +150,23 @@ class DeltaMoE(nn.Module):
         i, r = self.topk(x)
         return torch.where(i < self.n_delta, i, -1), r.to(x.dtype)
 
+    def delta(self, e: int) -> MLPWeights:
+        """Delta_e for gate, up, down; dare.DareDeltaMoE unpacks only expert e here."""
+        return self.d_gate[e], self.d_up[e], self.d_down[e]
+
     def weights(self, e: int) -> MLPWeights:
         if e < 0:
             return self.gate, self.up, self.down
-        return (
-            self.gate + self.d_gate[e],
-            self.up + self.d_up[e],
-            self.down + self.d_down[e],
-        )
+        dg, du, dd = self.delta(e)
+        return self.gate + dg, self.up + du, self.down + dd
 
     def mlp_split(self, x: Tokens, e: int) -> Tokens:
         """MLP(x; W_b + Delta_e) without forming the sum: every projection is W_b x + Delta_e x."""
-        g = F.linear(x, self.gate) + F.linear(x, self.d_gate[e])
-        u = F.linear(x, self.up) + F.linear(x, self.d_up[e])
+        dg, du, dd = self.delta(e)
+        g = F.linear(x, self.gate) + F.linear(x, dg)
+        u = F.linear(x, self.up) + F.linear(x, du)
         h = F.silu(g) * u
-        return F.linear(h, self.down) + F.linear(h, self.d_down[e])
+        return F.linear(h, self.down) + F.linear(h, dd)
 
     def _forward_param(self, x: Tokens, min_rows: int = 0) -> Tokens:
         """min_rows > 0: an expert with fewer routed rows skips materialising W_b + Delta_e and uses mlp_split
@@ -189,14 +191,15 @@ class DeltaMoE(nn.Module):
         out = torch.zeros_like(x)
         for j in range(self.top_k):
             gs: list[Group] = [grp for grp in groups(idx[:, j], r[:, j]) if grp[0] >= 0]
+            ds = {e: self.delta(e) for e, _, _ in gs}
             g, u = gb, ub
             for e, rows, _ in gs:
-                g = g.index_add(0, rows, F.linear(x[rows], self.d_gate[e]))
-                u = u.index_add(0, rows, F.linear(x[rows], self.d_up[e]))
+                g = g.index_add(0, rows, F.linear(x[rows], ds[e][0]))
+                u = u.index_add(0, rows, F.linear(x[rows], ds[e][1]))
             h: Hidden = F.silu(g) * u
             o: Tokens = F.linear(h, self.down)
             for e, rows, _ in gs:
-                o = o.index_add(0, rows, F.linear(h[rows], self.d_down[e]))
+                o = o.index_add(0, rows, F.linear(h[rows], ds[e][2]))
             out = out + r[:, j, None] * o
         return out
 

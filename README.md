@@ -7,7 +7,7 @@ src/shared_delta_moe/models/delta_moe.py  DeltaMoE: from_experts, routing, the f
 src/shared_delta_moe/ops.py               stateless helpers: mlp, grouping routed rows, one grouped GEMM
 src/shared_delta_moe/triton_kernels/      fused.py: the fused parameter-aggregation forward (sort, gate_up + SiLU,
                                           down + routing weight; dense or seeded-DARE deltas; Hopper TMA)
-src/shared_delta_moe/models/dare.py       seeded DARE: Philox mask, its bitmap, pack/unpack, DareDeltaMoE
+src/shared_delta_moe/models/dare.py       seeded DARE: Philox mask, its bitmap, pack, DareDeltaMoE
 src/shared_delta_moe/models/qwen3_5/qwen3_5_delta_moe/
                                           transformers' Qwen3.5 MoE with DeltaMoE blocks (forward_param): modeling.py
                                           (patches the decoder layer for configs with delta_moe_zero_experts), convert.py
@@ -16,7 +16,7 @@ src/shared_delta_moe/constants.py         HAS_TRITON and the thresholds that pic
 src/shared_delta_moe/type_hints.py        shape-annotated tensor aliases (T tokens, H hidden, ...)
 src/shared_delta_moe/testing.py           random_experts for tests and benchmarks
 tests/test_delta_moe.py                   every forward == plain MoE, token by token (Triton part needs CUDA)
-tests/test_dare.py                        Philox known-answer, CPU == CUDA masks, bitmap == mask, DARE forwards
+tests/test_dare.py                        Philox known-answer, CPU == CUDA masks, bitmap == mask, DARE forwards and gradients
 tests/test_qwen3_5_delta_moe.py           tiny Qwen3.5 MoE: converted == stock MoE at top-1, top-2, soft routing
 tests/test_fused.py                       the fused kernels: sort, every autotune config, split-K, int64 offsets,
                                           CUDA graph, torch.compile
@@ -169,6 +169,17 @@ RTX 6000 Ada, top-1 / top-2:
 | Ada, 25000, top-6 | 704.94 (6.52) | 610.53 (9.96) | **478.93** (10.84) |
 
 With few experts (6), the materialisation costs one pass over the weights, and cuBLAS GEMMs on dense experts beat both the Triton GEMMs and `grouped_mm`. The fused backward only saves about 40% of activation memory.
+
+`DareDeltaMoE` trains through the same path: `delta(e)` unpacks only the routed expert from the bitmap (`masked_scatter` of the kept values, differentiable in them), so the kept values can be made `nn.Parameter`s and trained. Unpacking with Philox on every access of `d_gate` / `d_up` / `d_down` (all experts each time) made a step 7.6 s. Whole Qwen3.5-4B text model, full-parameter training, batch 2 x 2048, bf16 weights, fused AdamW (bf16 states), random router (every delta routed: the worst case), H200, peak GiB and s/step:
+
+| model | params / trainable | peak, checkpointing | peak, none | s/step, checkpointing |
+|---|---|---:|---:|---:|
+| dense Qwen3.5-4B | 4.21B / 4.21B | 35.9 | 65.5 | 0.4 |
+| DARE 0.2/64, kept values frozen, top-1 / top-2 | 6.48B / 4.21B | 40.1 / 40.1 | 92.9 / 103.7 | 0.9 / 1.0 |
+| DARE 0.2/64, kept values trained | 6.48B / 6.47B | 51.0 | 111.9 | 1.1 |
+| dense deltas (`DeltaMoE`) trained | 15.53B / 15.53B | 118.7 | out of memory | 0.8 |
+
+With gradient checkpointing, frozen DARE deltas cost only their own 4.2 GiB. Without it, every materialised $W_b+\Delta_e$ is held for the backward (142 MB per expert and layer).
 
 ## Speed (single MoE layer, bf16, eager, ms)
 

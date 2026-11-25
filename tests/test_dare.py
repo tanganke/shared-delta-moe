@@ -7,9 +7,9 @@ import itertools
 import torch
 from test_delta_moe import CASES, make, reference
 
-from shared_delta_moe import DareDeltaMoE
+from shared_delta_moe import DareDeltaMoE, DeltaMoE
 from shared_delta_moe.constants import HAS_TRITON
-from shared_delta_moe.models.dare import keep_mask, mask_bits, philox
+from shared_delta_moe.models.dare import PROJ, keep_mask, mask_bits, philox
 
 GPU = torch.cuda.is_available() and HAS_TRITON
 SETTINGS = [
@@ -102,6 +102,49 @@ def test_dare_forwards_match_plain_moe():
                 (f(x) - ref).abs().max() / ref.abs().max()
             ).item()  # deltas / keep make outputs larger
             assert err < 1e-5, (z, k, keep, block, name, err)
+
+
+def test_unpack_is_keep_mask():
+    """The bitmap unpack behind the materialised path equals Delta / keep under keep_mask: several words per row,
+    a ragged last word and bit 31 (negative int32 words) included."""
+    m, _, _ = make(1, 1, 80, 96)
+    for keep, block in ((0.9, 1), (0.5, 1), (0.3, 2), (0.5, 8)):
+        d = DareDeltaMoE.from_delta_moe(m, keep, block, seed=2**40 + 7)
+        for j, n in enumerate(PROJ):
+            dense = getattr(m, f"d_{n}")
+            for e in range(m.n_delta):
+                mask = keep_mask(2**40 + 7, 3 * e + j, *dense.shape[1:], keep, block)
+                want = torch.where(mask, (dense[e].float() / keep).to(dense.dtype), 0)
+                assert torch.equal(d.delta(e)[j], want), (keep, block, n, e)
+
+
+def test_dare_training_gradients():
+    """Training through the materialised path (deltas unpacked per expert from the bitmap): with the kept values made
+    trainable, their gradient is the dense DeltaMoE's delta gradient at the kept positions; x's gradient matches."""
+    for (z, k), (keep, block) in itertools.product(((1, 1), (2, 2)), SETTINGS):
+        m, _, x = make(z, k)
+        d = DareDeltaMoE.from_delta_moe(m, keep, block, seed=3)
+        for n in PROJ:
+            setattr(d, f"v_{n}", torch.nn.Parameter(d._buffers.pop(f"v_{n}")))
+        dense = DeltaMoE(16, 24, m.n_delta, k, z)
+        with torch.no_grad():
+            dense.router.weight.copy_(d.router.weight)
+            for n in PROJ:
+                getattr(dense, n).copy_(getattr(d, n))
+                getattr(dense, f"d_{n}").copy_(getattr(d, f"d_{n}"))
+        w = torch.randn(200, 16)
+        for name, f in (("param", lambda mod, x: mod._forward_param(x)), ("split", lambda mod, x: mod._forward_param(x, min_rows=10**9))):
+            gx = []
+            for mod in (d, dense):
+                xg = x.clone().requires_grad_(True)
+                mod.zero_grad()
+                (f(mod, xg) * w).sum().backward()
+                gx.append(xg.grad)
+            assert torch.allclose(gx[0], gx[1], atol=1e-5), (z, k, keep, block, name)
+            for j, n in enumerate(PROJ):
+                g, (G, R, C) = getattr(dense, f"d_{n}").grad, d.shapes[n]
+                want = torch.cat([g[e][keep_mask(3, 3 * e + j, R, C, keep, block)] for e in range(G)])
+                assert torch.allclose(getattr(d, f"v_{n}").grad, want, atol=1e-5), (z, k, keep, block, name, n)
 
 
 def test_dare_triton_matches_materialised():
