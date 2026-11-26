@@ -10,7 +10,7 @@ flowchart LR
     BIT -->|"unpack: delta(e) or in the fused kernel"| U
 ```
 
-See [dare.md](dare.md) and [bitdelta.md](bitdelta.md).
+See [dare.md](dare.md) and [bitdelta.md](bitdelta.md). [delta-compression.md](delta-compression.md) compares these with other compressions (low-bit quantisation, GPTQ, SparseGPT, Wanda, SVD, ...) on a real model: 2-bit group quantisation keeps the accuracy at 2.25 bits per entry.
 
 
 Size of one delta of a Qwen3.5-4B MoE layer (hidden 2560, inter 9216) takes:
@@ -27,4 +27,5 @@ Size of one delta of a Qwen3.5-4B MoE layer (hidden 2560, inter 9216) takes:
 
 dare
 bitdelta
+delta-compression
 ```
