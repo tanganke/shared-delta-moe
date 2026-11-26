@@ -13,20 +13,51 @@ from torch import Tensor
 
 
 def simple_average(base: Tensor, tuned: Sequence[Tensor]) -> Tensor:
+    """Mean of the fine-tuned tensors.
+
+    Args:
+        base: the base tensor; only its dtype is used.
+        tuned: the fine-tuned tensors, each shaped like base.
+
+    Returns:
+        mean_i tuned_i, shaped like base, in base's dtype (computed in float32).
+    """
     return torch.stack([t.float() for t in tuned]).mean(0).to(base.dtype)
 
 
 def task_arithmetic(base: Tensor, tuned: Sequence[Tensor], scaling_factor: float = 0.3) -> Tensor:
-    """base + scaling_factor * sum_i (tuned_i - base)."""
+    """Task arithmetic: base + scaling_factor * sum_i (tuned_i - base).
+
+    Args:
+        base: the base tensor.
+        tuned: the fine-tuned tensors, each shaped like base.
+        scaling_factor: scale of the summed task vectors.
+
+    Returns:
+        The merged tensor, shaped like base, in base's dtype (computed in float32).
+    """
     b = base.float()
     return (b + scaling_factor * sum(t.float() - b for t in tuned)).to(base.dtype)
 
 
 def ties_merging(base: Tensor, tuned: Sequence[Tensor], scaling_factor: float = 0.3, threshold: float = 20,
                  merge_func: str = "sum") -> Tensor:  # fmt: skip
-    """TIES: keep each task vector's top threshold entries by magnitude (as fusion_bench: a fraction if <= 1, else a
-    percentage), elect a sign per entry (sign of the sum of
-    the kept values), merge the values agreeing with it (merge_func "sum" or "mean"), base + scaling_factor * that."""
+    """TIES merging: trim, elect sign, merge agreeing values.
+
+    Keeps each task vector's (tuned_i - base) top threshold entries by magnitude (at least one), elects a sign per
+    entry (the sign of the sum of the kept values), merges the kept values agreeing with it, and returns
+    base + scaling_factor * that.
+
+    Args:
+        base: the base tensor (any shape, 0-dim included).
+        tuned: the fine-tuned tensors, each shaped like base.
+        scaling_factor: scale of the merged task vector.
+        threshold: share of entries kept per task vector, as fusion_bench: a fraction if <= 1, else a percentage.
+        merge_func: "sum" (sum of the agreeing values) or "mean" (their mean over the task vectors that agree).
+
+    Returns:
+        The merged tensor, shaped like base, in base's dtype (computed in float32).
+    """
     b = base.float()
     tv = torch.stack([t.float() - b for t in tuned]).reshape(len(tuned), -1)  # N, numel (0-dim tensors too)
     k = max(1, int(tv.shape[1] * (threshold if threshold <= 1 else threshold / 100)))

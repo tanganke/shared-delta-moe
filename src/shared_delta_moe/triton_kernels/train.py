@@ -195,8 +195,22 @@ class _FusedMoE(torch.autograd.Function):
 
 def fused_moe_autograd(x: Tensor, idx: Tensor, rw: Tensor, base: tuple[Tensor, Tensor, Tensor],
                        deltas: tuple[Tensor, Tensor, Tensor], n_delta: int) -> Tensor:  # fmt: skip
-    """Differentiable fused forward. idx (T, k): expert per slot (>= n_delta: a zero expert); rw (T, k): routing
-    weights (differentiable); dense deltas."""
+    """Differentiable fused forward of the parameter-aggregation MoE, with the Triton backward.
+
+    y = sum_i rw_i MLP(x; W + D_{idx_i}) over each token's k slots. Gradients flow to x, rw and every weight that
+    requires grad; idx gets none.
+
+    Args:
+        x: (T, H) tokens.
+        idx: (T, k) int expert per slot (>= n_delta: a zero expert).
+        rw: (T, k) routing weights (differentiable).
+        base: (W_g (I, H), W_u (I, H), W_d (H, I)), the base weights.
+        deltas: dense deltas (D_g (n_delta, I, H), D_u (n_delta, I, H), D_d (n_delta, H, I)).
+        n_delta: the number of delta experts.
+
+    Returns:
+        (T, H) output y; empty when T == 0.
+    """
     if x.shape[0] == 0:
         return torch.empty_like(x)
     return _FusedMoE.apply(x, idx, rw, *base, *deltas, n_delta, idx.shape[1])

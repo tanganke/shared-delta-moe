@@ -19,6 +19,13 @@ from ...delta_moe import DeltaMoE
 
 
 class Qwen3_5DeltaMoeBlock(DeltaMoE):
+    """A Qwen3.5 sparse MoE block as a DeltaMoE, run by forward_param.
+
+    Args:
+        config: The Qwen3.5 MoE text config: hidden_size, moe_intermediate_size, num_experts (N deltas + Z),
+            num_experts_per_tok (top-k) and delta_moe_zero_experts (Z).
+    """
+
     def __init__(self, config: Any) -> None:
         z = config.delta_moe_zero_experts
         n = config.num_experts - z
@@ -31,17 +38,39 @@ class Qwen3_5DeltaMoeBlock(DeltaMoE):
         )
 
     def forward(self, hidden_states: Tensor) -> Tensor:  # type: ignore[override]
+        """Run forward_param over the flattened tokens.
+
+        Args:
+            hidden_states: (..., H) hidden states, e.g. (batch, seq, H).
+
+        Returns:
+            MoE output, same shape as hidden_states.
+        """
         shape = hidden_states.shape
         return self.forward_param(hidden_states.reshape(-1, shape[-1])).view(shape)
 
 
 class Qwen3_5BitDeltaMoeBlock(BitDeltaMoE):
+    """A Qwen3.5 sparse MoE block as a BitDeltaMoE (1-bit deltas), with Qwen3_5DeltaMoeBlock's forward.
+
+    Built by to_bitdelta from a Qwen3_5DeltaMoeBlock; constructor args as BitDeltaMoE.
+    """
+
     forward = Qwen3_5DeltaMoeBlock.forward
 
 
 def to_bitdelta(model: Any, scale: "str | int" = "matrix") -> Any:
-    """Replace every Qwen3_5DeltaMoeBlock of a loaded model with its BitDelta form (BitDeltaMoE.from_delta_moe), in
-    place; the dense deltas are dropped."""
+    """Replace every Qwen3_5DeltaMoeBlock of a loaded model with its BitDelta form, in place.
+
+    Uses BitDeltaMoE.from_delta_moe; the dense deltas are dropped.
+
+    Args:
+        model: A loaded transformers Qwen3.5 MoE model with Qwen3_5DeltaMoeBlock blocks.
+        scale: Delta scales, passed to BitDeltaMoE.from_delta_moe: "matrix" (BitDelta), "row" or an int block size.
+
+    Returns:
+        The same model, modified.
+    """
     for name, mod in list(model.named_modules()):
         if type(mod) is Qwen3_5DeltaMoeBlock:
             parent, _, attr = name.rpartition(".")

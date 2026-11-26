@@ -7,7 +7,7 @@ Group i holds E_i delta experts (weights W_b + Delta_ij) and Z_i zero experts (n
   p_i = softmax over group i's E_i + Z_i experts; top-k1 renormalised within the group (zero experts compete too)
   y = [MLP(x; W_b)] + sum_i h_i sum_{j in top-k1, j a delta} p_ij MLP(x; W_b + Delta_ij)
 
-the bracketed term only with shared_base (the default); without it (upscaling a dense model from its fine-tunes) y is
+The bracketed term only with shared_base (the default); without it (upscaling a dense model from its fine-tunes) y is
 the routed ensemble alone. Either way y equals the plain two-level ensemble of full experts theta_ij = W_b + Delta_ij. One linear layer holds both
 routers: rows 0..G-1 are R_0, then group by group E_i delta rows and Z_i zero-expert rows.
 
@@ -27,6 +27,25 @@ from .delta_moe import DeltaMoE
 
 
 class HierDeltaMoE(DeltaMoE):
+    """Two-level (group, then expert) shared delta MoE, flattened into DeltaMoE routing slots.
+
+    Group i holds E_i delta experts and Z_i zero experts; the module stores the shared base W_b and the deltas
+    Delta_ij of all groups in order (n_delta = sum_i E_i). The router is one linear layer of G + sum_i (E_i + Z_i)
+    rows, laid out as in the module docstring. Construction leaves the weights uninitialised; fill them with
+    from_experts or load_state_dict.
+
+    Args:
+        hidden: H, the model width.
+        inter: I, the MLP intermediate width.
+        group_sizes: E_i, the number of delta experts in each group (G = len(group_sizes) > 0).
+        group_zeros: Z_i >= 0, the number of zero experts in each group (same length as group_sizes).
+        top_k: k1, experts picked per group, 1 <= k1 <= min_i (E_i + Z_i).
+        group_top_k: k0, groups picked per token, 1 <= k0 <= G; None = dense (soft) routing over all groups.
+        device: device of the parameters.
+        dtype: dtype of the parameters.
+        shared_base: add MLP(x; W_b) with weight 1 (one extra base slot per token).
+    """
+
     def __init__(
         self,
         hidden: int,
@@ -39,9 +58,6 @@ class HierDeltaMoE(DeltaMoE):
         dtype: torch.dtype | None = None,
         shared_base: bool = True,
     ) -> None:
-        """group_sizes[i] = E_i deltas, group_zeros[i] = Z_i zero experts; top_k = k1 per group; group_top_k = k0,
-        None = dense (soft) over all groups; shared_base: add MLP(x; W_b) with weight 1. Uninitialised; fill with
-        from_experts or load_state_dict."""
         G = len(group_sizes)
         assert G == len(group_zeros) and G > 0 and min(group_zeros) >= 0
         assert 1 <= top_k <= min(e + z for e, z in zip(group_sizes, group_zeros))
@@ -83,8 +99,23 @@ class HierDeltaMoE(DeltaMoE):
         group_top_k: int | None = None,
         shared_base: bool = True,
     ) -> "HierDeltaMoE":
-        """From the plain two-level ensemble: base = the shared expert, groups[i] = group i's full experts, router =
-        (G + sum_i (E_i + Z_i), H) laid out as in the module docstring. Stores W_b and Delta_ij = theta_ij - W_b."""
+        """Build from the plain two-level ensemble of full experts.
+
+        Stores W_b = base and Delta_ij = theta_ij - W_b; device and dtype follow base.
+
+        Args:
+            base: (gate (I, H), up (I, H), down (H, I)), the shared expert W_b.
+            groups: groups[i] = group i's full experts theta_ij, each as (gate, up, down) shaped like base;
+                E_i = len(groups[i]).
+            router: (G + sum_i (E_i + Z_i), H) router weight, laid out as in the module docstring.
+            group_zeros: Z_i, the number of zero experts in each group.
+            top_k: k1, experts picked per group.
+            group_top_k: k0, groups picked per token; None = dense routing over all groups.
+            shared_base: add MLP(x; W_b) with weight 1.
+
+        Returns:
+            The HierDeltaMoE holding W_b, the deltas and the router.
+        """
         gate, up, down = base
         m = cls(gate.shape[1], gate.shape[0], [len(g) for g in groups], group_zeros, top_k, group_top_k,
                 gate.device, gate.dtype, shared_base)  # fmt: skip
@@ -98,8 +129,18 @@ class HierDeltaMoE(DeltaMoE):
         return m
 
     def topk(self, x: Tokens) -> tuple[Tensor, Tensor]:
-        """(T, top_k) delta index (n_delta: base) and float32 weight per slot; with shared_base the last slot is the
-        shared base."""
+        """Route tokens to the flattened DeltaMoE slots.
+
+        Per token S * k1 slots (S = G if group_top_k is None, else k0) weighted h_i p_ij; a picked zero expert becomes
+        a base slot with weight 0. With shared_base the last slot is the shared base with weight 1.
+
+        Args:
+            x: (T, H) tokens.
+
+        Returns:
+            (idx, weight), both (T, top_k): idx is the int64 delta index per slot (n_delta: the base), weight the
+            float32 routing weight per slot.
+        """
         G = len(self.group_sizes)
         col, delta, pad = self._tables(x.device)
         logits = self.router(x).float()

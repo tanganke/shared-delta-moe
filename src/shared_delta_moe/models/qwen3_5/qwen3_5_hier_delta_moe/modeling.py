@@ -17,12 +17,28 @@ from ...hier import HierDeltaMoE
 
 
 class Qwen3_5HierDeltaMoeBlock(HierDeltaMoE):
+    """The decoder MLP replacement: a HierDeltaMoE built from a Qwen3.5 text config, run by forward_param.
+
+    Args:
+        config: a text config with hidden_size, intermediate_size and the hier_delta_moe dict (group_sizes,
+            group_zeros, top_k; optional group_top_k, default None = dense group routing, and shared_base, default
+            False).
+    """
+
     def __init__(self, config: Any) -> None:
         c = config.hier_delta_moe
         super().__init__(config.hidden_size, config.intermediate_size, c["group_sizes"], c["group_zeros"], c["top_k"],
                          c.get("group_top_k"), shared_base=c.get("shared_base", False))  # fmt: skip
 
     def forward(self, hidden_states: Tensor) -> Tensor:  # type: ignore[override]
+        """Apply the MoE to every token through forward_param.
+
+        Args:
+            hidden_states: (..., H) hidden states, any leading shape.
+
+        Returns:
+            Tensor of the same shape as hidden_states.
+        """
         shape = hidden_states.shape
         return self.forward_param(hidden_states.reshape(-1, shape[-1])).view(shape)
 

@@ -7,7 +7,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 project = "shared-delta-moe"
-extensions = ["myst_parser", "sphinx.ext.autodoc", "sphinx.ext.mathjax", "sphinx.ext.viewcode"]
+extensions = ["myst_parser", "sphinx.ext.autodoc", "sphinx.ext.napoleon", "sphinx.ext.mathjax", "sphinx.ext.viewcode"]
+napoleon_google_docstring = True
+napoleon_numpy_docstring = False
 myst_enable_extensions = ["dollarmath", "amsmath"]
 myst_heading_anchors = 3
 autodoc_member_order = "bysource"

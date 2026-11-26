@@ -36,8 +36,22 @@ def _mulhilo(a: int, b: Tensor) -> tuple[Tensor, Tensor]:
 def philox(
     c0: Tensor, c1: Tensor, c2: Tensor, c3: Tensor, k0: int, k1: int, rounds: int = 10
 ) -> Tensor:
-    """Word 0 of Philox4x32 (Salmon et al. 2011; the constants and round of Random123 and Triton), counters as int64
-    tensors in [0, 2^32)."""
+    """Word 0 of Philox4x32 (Salmon et al. 2011; the constants and round of Random123 and Triton).
+
+    Pure 32-bit integer arithmetic carried in int64, so the result is bit-identical on every device.
+
+    Args:
+        c0: Counter word 0, int64 tensor with values in [0, 2^32).
+        c1: Counter word 1, int64, same shape as c0.
+        c2: Counter word 2, int64, same shape as c0.
+        c3: Counter word 3, int64, same shape as c0.
+        k0: Key word 0, an int in [0, 2^32).
+        k1: Key word 1, an int in [0, 2^32).
+        rounds: Number of Philox rounds (10: Philox4x32-10).
+
+    Returns:
+        Word 0 of the output, int64 with values in [0, 2^32), the shape of c0.
+    """
     for _ in range(rounds):
         hb, lb = _mulhilo(0xCD9E8D57, c2)
         ha, la = _mulhilo(0xD2511F53, c0)
@@ -47,6 +61,14 @@ def philox(
 
 
 def threshold(keep: float) -> int:
+    """Philox threshold of a keep fraction.
+
+    Args:
+        keep: Fraction of units kept, in [0, 1].
+
+    Returns:
+        round(keep * 2^32): a unit is kept where Philox word 0 is below it.
+    """
     return round(keep * 2**32)
 
 
@@ -59,7 +81,20 @@ def keep_mask(
     block: int,
     device: Any = "cpu",
 ) -> Tensor:
-    """(rows, cols) bool mask of one delta matrix; stream = 3 * expert + projection."""
+    """Keep mask of one delta matrix (see the module docstring for the spec).
+
+    Args:
+        seed: DARE seed, in [0, 2^63).
+        stream: 3 * expert + projection (0 gate, 1 up, 2 down).
+        rows: R, rows of the delta matrix.
+        cols: C, columns of the delta matrix; a multiple of block.
+        keep: Fraction of blocks kept.
+        block: B, entries per 1 x B block along a row.
+        device: Device the mask is computed on.
+
+    Returns:
+        (rows, cols) bool, True where the entry is kept (constant over each block).
+    """
     assert cols % block == 0 and rows * (cols // block) <= 2**32 and 0 <= seed < 2**63
     u = torch.arange(rows * (cols // block), device=device)
     z = torch.zeros_like(u)
@@ -68,7 +103,20 @@ def keep_mask(
 
 
 def mask_bits(seed: int, stream: int, rows: int, cols: int, keep: float, block: int, device: Any = "cpu") -> Tensor:
-    """keep_mask as a bitmap: (rows, ceil(cols / block / 32)) int32, block j of a row in bit j % 32 of word j // 32."""
+    """keep_mask as a bitmap, 1 bit per block.
+
+    Args:
+        seed: DARE seed.
+        stream: 3 * expert + projection (0 gate, 1 up, 2 down).
+        rows: R, rows of the delta matrix.
+        cols: C, columns of the delta matrix; a multiple of block.
+        keep: Fraction of blocks kept.
+        block: B, entries per 1 x B block along a row.
+        device: Device the bitmap is computed on.
+
+    Returns:
+        (rows, ceil(cols / block / 32)) int32: block j of a row in bit j % 32 of word j // 32, set where kept.
+    """
     u = torch.arange(rows * (cols // block), device=device)
     z = torch.zeros_like(u)
     kept = (philox(u, z + stream, z, z, seed & M32, seed >> 32) < threshold(keep)).view(rows, -1)
@@ -81,7 +129,19 @@ def mask_bits(seed: int, stream: int, rows: int, cols: int, keep: float, block: 
 def pack(
     d: Tensor, seed: int, j: int, keep: float, block: int
 ) -> tuple[Tensor, Tensor]:
-    """Deltas (N, R, C) of projection j -> kept values / keep (flat) and each row's start in them (N, R) int64."""
+    """Pack the deltas of one projection into their kept values.
+
+    Args:
+        d: (N, R, C) deltas of projection j, one per delta expert.
+        seed: DARE seed.
+        j: Projection index (0 gate, 1 up, 2 down).
+        keep: Fraction of blocks kept.
+        block: B, entries per 1 x B block along a row.
+
+    Returns:
+        A pair (v, p): v the kept values / keep, flat, row-major expert by expert, in d's dtype; p (N, R) int64,
+        each row's start in v.
+    """
     vals, counts = [d.new_empty(0)], [torch.zeros(0, dtype=torch.int64, device=d.device)]  # N = 0: empty
     for e in range(d.shape[0]):
         m = keep_mask(seed, 3 * e + j, d.shape[1], d.shape[2], keep, block, d.device)
@@ -92,10 +152,25 @@ def pack(
 
 
 class DareDeltaMoE(DeltaMoE):
-    """DeltaMoE whose deltas are seeded DARE (see the module docstring). The materialised path (training) unpacks
-    only the routed expert e from the mask bitmap (delta(e)); d_gate / d_up / d_down unpack every expert on access, so
-    the other inherited forwards work too (as references); the fused Triton path reads the packed values directly
-    (triton_kernels/fused.py). Build with from_delta_moe."""
+    """DeltaMoE whose deltas are seeded DARE (see the module docstring).
+
+    The materialised path (training) unpacks only the routed expert e from the mask bitmap (delta(e)); d_gate / d_up /
+    d_down unpack every expert on access, so the other inherited forwards work too (as references); the fused Triton
+    path reads the packed values directly (triton_kernels/fused.py). Build with from_delta_moe; the constructor leaves
+    the packed buffers empty (load_state_dict sizes them to the checkpoint's).
+
+    Args:
+        hidden: H, model hidden size.
+        inter: I, expert intermediate size.
+        n_delta: N, number of delta experts.
+        keep: Fraction of each delta's blocks kept.
+        block: B, entries per 1 x B block along the input dimension; must divide each projection's columns.
+        seed: DARE seed, in [0, 2^63).
+        top_k: Experts per token.
+        num_zero_experts: Z, router rows that route to the base alone.
+        device: Device of the parameters and buffers.
+        dtype: Dtype of the parameters and packed values.
+    """
 
     def __init__(
         self,
@@ -163,8 +238,22 @@ class DareDeltaMoE(DeltaMoE):
     def from_delta_moe(
         cls, m: DeltaMoE, keep: float, block: int = 1, seed: int = 0
     ) -> "DareDeltaMoE":
-        """DARE form of a DeltaMoE (same base, router, top-k and zero experts): each delta keeps the fraction `keep`
-        of its 1 x `block` blocks chosen by `seed`, rescaled by 1 / keep. A HierDeltaMoE is refused."""
+        """DARE form of a DeltaMoE, with the same base, router, top-k and zero experts.
+
+        Each delta keeps the fraction `keep` of its 1 x `block` blocks chosen by `seed`, rescaled by 1 / keep.
+
+        Args:
+            m: The DeltaMoE to convert (not a HierDeltaMoE).
+            keep: Fraction of each delta's blocks kept.
+            block: B, entries per 1 x B block along the input dimension.
+            seed: DARE seed, in [0, 2^63).
+
+        Returns:
+            The DareDeltaMoE, on m's device and in m's dtype.
+
+        Raises:
+            TypeError: If m is a HierDeltaMoE (DareDeltaMoE has a flat router).
+        """
         from .hier import HierDeltaMoE
 
         if isinstance(m, HierDeltaMoE):
@@ -206,6 +295,17 @@ class DareDeltaMoE(DeltaMoE):
         return v.new_zeros(R, C).masked_scatter(keep, v[int(getattr(self, f"p_{name}")[e, 0]) :])
 
     def delta(self, e: int) -> tuple[Tensor, Tensor, Tensor]:
+        """Dense deltas of one expert, unpacked from the mask bitmap (no Philox); differentiable in v_<proj>.
+
+        Args:
+            e: Delta expert index, in [0, n_delta).
+
+        Returns:
+            (Delta_gate (I, H), Delta_up (I, H), Delta_down (H, I)) of expert e.
+
+        Raises:
+            RuntimeError: If the mask bitmaps are not built (e.g. made on meta, then to_empty, no load).
+        """
         return self._unpack("gate", e), self._unpack("up", e), self._unpack("down", e)
 
     def _delta(self, j: int) -> Tensor:
@@ -217,14 +317,17 @@ class DareDeltaMoE(DeltaMoE):
 
     @property
     def d_gate(self) -> Tensor:  # type: ignore[override]
+        """Dense gate deltas of every expert, unpacked on each access: (N, I, H)."""
         return self._delta(0)
 
     @property
     def d_up(self) -> Tensor:  # type: ignore[override]
+        """Dense up deltas of every expert, unpacked on each access: (N, I, H)."""
         return self._delta(1)
 
     @property
     def d_down(self) -> Tensor:  # type: ignore[override]
+        """Dense down deltas of every expert, unpacked on each access: (N, H, I)."""
         return self._delta(2)
 
     def _use_triton(self, x: Tensor) -> bool:
