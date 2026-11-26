@@ -6,7 +6,30 @@ Routing is softmax, top-k (`top_k`, default 1), renormalised over the k picks to
 
 $$y = \sum_{i=1}^{k} r_i\,\mathrm{MLP}(x;\,W_b + \Delta_{e_i})$$
 
-The forwards that compute it are in [forwards.md](forwards.md).
+```mermaid
+flowchart LR
+    x([x]) --> R["router<br/>softmax, top-k"]
+    R -->|r_1| E1["MLP: W_b + Δ_1"]
+    R -->|r_2| E2["MLP: W_b + Δ_n"]
+    R -->|r_3| Z["zero expert<br/>MLP: W_b"]
+    E1 & E2 & Z --> S(("Σ"))
+    S --> y([y])
+```
+
+Stored per layer: $W_b$ once, one $\Delta_e$ per delta expert, the router; a zero expert has no parameters.
+
+The forwards that compute it are in [forwards.md](forwards.md). A $\Delta_e$ can also be stored compressed; the base
+is always dense:
+
+```mermaid
+flowchart LR
+    D["Δ_e dense<br/>(R, C) bf16"] --> DARE["seeded DARE<br/>kept values Δ / keep<br/>+ row starts; mask from the seed"]
+    D --> BIT["BitDelta<br/>sign bits, 32 per int32<br/>+ scales per matrix / row / block"]
+    DARE -->|"unpack: delta(e) or in the fused kernel"| U["Δ_e used in W_b + Δ_e"]
+    BIT -->|"unpack: delta(e) or in the fused kernel"| U
+```
+
+See [dare.md](dare.md) and [bitdelta.md](bitdelta.md).
 
 Note two things that would not be equivalent:
 

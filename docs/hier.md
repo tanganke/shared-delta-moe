@@ -1,8 +1,9 @@
 # Two-level shared delta MoE (`HierDeltaMoE`)
 
-An optional shared base expert plus delta experts arranged in groups, routed first over groups and then within the chosen groups
-(`models/hier.py`). Group $i$ holds $E_i$ delta experts with weights $W_b+\Delta_{ij}$ and $Z_i$ zero experts (no
-parameters, output 0); $E_i$ and $Z_i$ may differ between groups, and a group may hold only zero experts.
+Delta experts arranged in groups over one shared base $W_b$, routed first over groups and then within the chosen
+groups (`models/hier.py`). Group $i$ holds $E_i$ delta experts with weights $W_b+\Delta_{ij}$ and $Z_i$ zero experts
+(no parameters, $\Delta=0$: the base MLP itself, as in `DeltaMoE`); $E_i$ and $Z_i$ may differ between groups, and a
+group may hold only zero experts. "Shared" is the storage: $W_b$ once per layer, one $\Delta_{ij}$ per delta expert.
 
 - Group router: $h = \mathrm{softmax}(R_0 x)$ over the $G$ groups; dense / soft (`group_top_k=None`: every group,
   weight $h_i$) or top-$k_0$ renormalised over the chosen groups.
@@ -10,14 +11,31 @@ parameters, output 0); $E_i$ and $Z_i$ may differ between groups, and a group ma
   experts compete like the others.
 
 $$
-y = [\mathrm{MLP}(x; W_b)] + \sum_{i \in S(x)} h_i(x) \sum_{j \in \text{top-}k_1,\ j \text{ a delta}} \tilde p_{ij}(x)\, \mathrm{MLP}(x; W_b+\Delta_{ij})
+y = \sum_{i \in S(x)} h_i(x) \sum_{j \in \text{top-}k_1} \tilde p_{ij}(x)\, \mathrm{MLP}(x; W_b+\Delta_{ij}),
+\qquad \Delta_{ij}=0 \text{ for a zero expert}
 $$
 
-The bracketed base term is there with `shared_base=True` (the default) and absent with `shared_base=False`, the
-form for upscaling a dense model from its fine-tunes (below): with experts close to the base, the base term would make
-each MLP about $2f(x)$. Either way this equals the plain two-level ensemble of the full experts $\theta_{ij}=W_b+\Delta_{ij}$ (with the base as a shared
-expert of weight 1 when `shared_base`) (`from_experts` takes those full experts and stores $\Delta_{ij}=\theta_{ij}-W_b$). One linear layer
-holds both routers: rows $0..G-1$ are $R_0$, then group by group its $E_i$ delta rows and $Z_i$ zero-expert rows.
+The weights sum to 1, so $y$ is the plain two-level ensemble of the full experts $\theta_{ij}=W_b+\Delta_{ij}$
+($\theta=W_b$ for a zero expert), on the scale of the original MLP. One linear layer holds both routers: rows
+$0..G-1$ are $R_0$, then group by group its $E_i$ delta rows and $Z_i$ zero-expert rows.
+
+```mermaid
+flowchart LR
+    x([x]) --> R0["group router R0<br/>h = softmax"]
+    R0 -->|h_1| G1
+    R0 -->|h_2| G2
+    subgraph G1 ["group 1: top-k1"]
+        e11["W_b + Δ_11"]
+        e12["W_b + Δ_12"]
+        z1["zero expert: W_b"]
+    end
+    subgraph G2 ["group 2: top-k1"]
+        e21["W_b + Δ_21"]
+    end
+    G1 -->|"h_1 p̃_1j"| sum(("Σ"))
+    G2 -->|"h_2 p̃_2j"| sum
+    sum --> y([y])
+```
 
 **Usage.**
 
@@ -30,49 +48,29 @@ full = random_experts(H, I, 6, torch.bfloat16, "cuda")    # (gate, up, down) eac
 base, groups = full[0], [full[1:3], full[3:4], full[4:6]]  # E = 2, 1, 2 experts per group
 zeros = [1, 0, 0]                                         # Z: one zero expert in group 0
 router = torch.randn(3 + sum(len(g) + z for g, z in zip(groups, zeros)), H, dtype=torch.bfloat16, device="cuda") * H**-0.5
-moe = HierDeltaMoE.from_experts(base, groups, router, zeros, top_k=1, group_top_k=None, shared_base=False)
+moe = HierDeltaMoE.from_experts(base, groups, router, zeros, top_k=1, group_top_k=None)
 
 x = torch.randn(32, H, dtype=torch.bfloat16, device="cuda")
 y = moe.forward_param(x)  # the fused Triton kernel on CUDA; differentiable (Triton backward with triton_train)
 ```
 
 `from_experts` takes the full experts $\theta_{ij}$ and stores $\Delta_{ij}=\theta_{ij}-W_b$. To start from shapes
-instead, use `HierDeltaMoE(hidden, inter, group_sizes, group_zeros, top_k, group_top_k, shared_base=...)` and load
+instead, use `HierDeltaMoE(hidden, inter, group_sizes, group_zeros, top_k, group_top_k)` and load
 `gate`/`up`/`down`, `d_gate`/`d_up`/`d_down` and `router.weight`.
 
 **Implementation.** `topk` flattens the routing into ordinary `DeltaMoE` slots: per token $S\cdot k_1$ slots
-($S=G$ dense, else $k_0$) weighted $h_i\tilde p_{ij}$, plus, with `shared_base`, one base slot of weight 1; a picked zero expert becomes a base
-slot of weight 0. Every `DeltaMoE` forward (materialised, split, grouped, fused Triton) and the Triton training path
+($S=G$ dense, else $k_0$) weighted $h_i\tilde p_{ij}$; a picked zero expert is a base slot. Every `DeltaMoE` forward (materialised, split, grouped, fused Triton) and the Triton training path
 ([training.md](training.md)) then compute $y$ unchanged, gradients through the two softmaxes included.
 
-**Limits.** Zero-weight base slots are still computed (one base MLP each in the parameter-aggregation forwards):
-waste that grows with $S\cdot k_1$ minus the deltas picked. Dense deltas only: `DareDeltaMoE.from_delta_moe` refuses a
-`HierDeltaMoE`. The routing tables are built per device on first use (not buffers), so modules made on the meta device,
+**Limits.** Zero experts picked in several groups each take a base slot, so the base MLP may run more than once per
+token (the slots are not merged). Dense deltas only: `DareDeltaMoE.from_delta_moe` and `BitDeltaMoE.from_delta_moe`
+refuse a `HierDeltaMoE`. The routing tables are built per device on first use (not buffers), so modules made on the meta device,
 as transformers' `from_pretrained` does, work. `tests/test_hier.py` checks every forward and the gradients against the ensemble
 written out token by token.
 
 ## Upscaling a dense Qwen3.5 / Qwen3.8 model from domain fine-tunes
 
-```bash
-python -m shared_delta_moe.models.qwen3_5.qwen3_5_hier_delta_moe.convert BASE DST \
-    --group medical=FT1,FT2 --group code=FT3 [--zeros 0] [--top-k 1] [--group-top-k K] [--shared-base] \
-    [--merge simple_average | task_arithmetic | ties_merging] [--merge-arg scaling_factor=0.3 --merge-arg threshold=20]
-```
-
-```python
-import shared_delta_moe.models.qwen3_5.qwen3_5_hier_delta_moe  # patches Qwen3_5DecoderLayer
-model = Qwen3_5ForConditionalGeneration.from_pretrained(DST)  # or Qwen3_5ForCausalLM for a text-only checkpoint
-```
-
-One group per domain; each fine-tune's decoder MLP becomes an expert of its group ($\Delta_{ij}=\theta_{ij}-W_b$,
-subtracted in fp32), `BASE`'s MLP is $W_b$. Every other tensor (attention, linear attention, norms, embeddings,
-`lm_head`, vision tower, MTP) is merged across the fine-tunes that have it with a method of `merging.py` (a
-tensor no fine-tune has, like Qwen3.8's `mtp.*` that transformers drops on load, is kept from the base), named and parametrised
-after fusion_bench (`simple_average` default; TIES trims per tensor, not over the whole task vector). Routers start at
-zero (uniform), to be trained. The text config gets `hier_delta_moe` (groups, sizes, zeros, top-k, `shared_base`,
-merge). Tensors are streamed from the safetensors shards and written in shards (`--shard-gb`), so memory stays at a
-few tensors. `tests/test_qwen3_5_hier_delta_moe.py` converts a tiny model with perturbed fine-tunes and compares its
-logits with the stock dense model running the ensemble of the fine-tunes' full MLPs.
+See [Qwen3.5: converting a whole model](qwen3_5.md).
 
 ## Serving with vLLM
 

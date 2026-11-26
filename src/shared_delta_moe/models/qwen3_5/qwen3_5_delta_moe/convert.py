@@ -5,24 +5,25 @@ output (``down_proj`` all zero); it is dropped.
 
 ::
 
-    python -m shared_delta_moe.models.qwen3_5.qwen3_5_delta_moe.convert SRC DST [--base INDEX] [--top-k K]
+    python -m shared_delta_moe.models.qwen3_5.qwen3_5_delta_moe.convert SRC DST [--base INDEX] [--top-k K] [--shard-gb 5]
 
 BASE defaults to the expert named ``"base"`` in ``SRC/upscale_info.json``. ``--top-k`` sets ``num_experts_per_tok``
-(default: SRC's).
+(default: SRC's). Tensors are read one MLP at a time and written in shards of ``--shard-gb``.
 """
 
 import argparse
 import json
 import re
-import shutil
 from pathlib import Path
 from typing import Any
 
 import torch
-from safetensors.torch import load_file, save_file
+
+from ..common import Checkpoint, ShardWriter, copy_config
 
 SPLIT = re.compile(r"(.+\.mlp)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight")
 FUSED = re.compile(r"(.+\.mlp)\.experts\.(gate_up_proj|down_proj)")
+LAYER = re.compile(r"(.+\.mlp)\.")
 
 
 def convert_state(state: dict[str, torch.Tensor], base: int) -> dict[str, torch.Tensor]:
@@ -64,36 +65,32 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("dst", type=Path)
     ap.add_argument("--base", type=int)
     ap.add_argument("--top-k", type=int)
+    ap.add_argument("--shard-gb", type=float, default=5.0)
     a = ap.parse_args(argv)
     base = a.base
     if base is None:
-        base = json.loads((a.src / "upscale_info.json").read_text())[
-            "expert_domains"
-        ].index("base")
+        base = json.loads((a.src / "upscale_info.json").read_text())["expert_domains"].index("base")
     a.dst.mkdir(parents=True)
-    for f in a.src.iterdir():
-        if (
-            f.is_file()
-            and f.suffix != ".safetensors"
-            and f.name != "model.safetensors.index.json"
-        ):
-            shutil.copy(f, a.dst / f.name)
-    config = json.loads((a.src / "config.json").read_text())
-    text = config.get("text_config", config)
-    text["delta_moe_zero_experts"] = 1
-    text["num_experts_per_tok"] = a.top_k or text["num_experts_per_tok"]
-    (a.dst / "config.json").write_text(json.dumps(config, indent=2) + "\n")
-    state: dict[str, torch.Tensor] = {}
-    for f in sorted(a.src.glob("*.safetensors")):
-        state.update(load_file(f))
-    save_file(
-        convert_state(state, base),
-        a.dst / "model.safetensors",
-        metadata={"format": "pt"},
-    )
-    print(
-        f"base expert {base}; {text['num_experts'] - 1} deltas + 1 zero expert, top-{text['num_experts_per_tok']}"
-    )
+    text: dict[str, Any] = {}
+
+    def edit(t: dict[str, Any]) -> None:
+        t["delta_moe_zero_experts"] = 1
+        t["num_experts_per_tok"] = a.top_k or t["num_experts_per_tok"]
+        text.update(t)
+
+    copy_config(a.src, a.dst, edit)
+    # one MLP at a time: memory stays at one layer's experts
+    src, w, layers = Checkpoint(a.src), ShardWriter(a.dst, int(a.shard_gb * 2**30)), {}
+    for k in src.keys():
+        if m := LAYER.match(k):
+            layers.setdefault(m[1], []).append(k)
+        else:
+            w.add(k, src.get(k))
+    for keys in layers.values():
+        for k, t in convert_state({k: src.get(k) for k in keys}, base).items():
+            w.add(k, t)
+    w.close()
+    print(f"base expert {base}; {text['num_experts'] - 1} deltas + 1 zero expert, top-{text['num_experts_per_tok']}")
 
 
 if __name__ == "__main__":

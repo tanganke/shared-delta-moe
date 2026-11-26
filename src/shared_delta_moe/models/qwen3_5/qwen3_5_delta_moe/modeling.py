@@ -12,11 +12,11 @@ deltas, ``models/bitdelta.py``).
 
 from typing import Any
 
-from torch import Tensor
 from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as M
 
 from ...bitdelta import BitDeltaMoE
 from ...delta_moe import DeltaMoE
+from ..common import block_forward, patch_decoder_layer
 
 
 class Qwen3_5DeltaMoeBlock(DeltaMoE):
@@ -38,17 +38,7 @@ class Qwen3_5DeltaMoeBlock(DeltaMoE):
             z,
         )
 
-    def forward(self, hidden_states: Tensor) -> Tensor:  # type: ignore[override]
-        """Run ``forward_param`` over the flattened tokens.
-
-        Args:
-            hidden_states: (..., H) hidden states, e.g. (batch, seq, H).
-
-        Returns:
-            MoE output, same shape as hidden_states.
-        """
-        shape = hidden_states.shape
-        return self.forward_param(hidden_states.reshape(-1, shape[-1])).view(shape)
+    forward = block_forward
 
 
 class Qwen3_5BitDeltaMoeBlock(BitDeltaMoE):
@@ -57,7 +47,7 @@ class Qwen3_5BitDeltaMoeBlock(BitDeltaMoE):
     Built by ``to_bitdelta`` from a ``Qwen3_5DeltaMoeBlock``; constructor args as ``BitDeltaMoE``.
     """
 
-    forward = Qwen3_5DeltaMoeBlock.forward
+    forward = block_forward
 
 
 def to_bitdelta(model: Any, scale: "str | int" = "matrix") -> Any:
@@ -80,13 +70,4 @@ def to_bitdelta(model: Any, scale: "str | int" = "matrix") -> Any:
     return model
 
 
-_layer_init = M.Qwen3_5MoeDecoderLayer.__init__
-
-
-def _init(self: Any, config: Any, layer_idx: int) -> None:
-    _layer_init(self, config, layer_idx)
-    if getattr(config, "delta_moe_zero_experts", None) is not None:
-        self.mlp = Qwen3_5DeltaMoeBlock(config)
-
-
-M.Qwen3_5MoeDecoderLayer.__init__ = _init  # type: ignore[method-assign]
+patch_decoder_layer(M.Qwen3_5MoeDecoderLayer, "delta_moe_zero_experts", Qwen3_5DeltaMoeBlock)

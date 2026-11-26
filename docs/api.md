@@ -47,6 +47,9 @@ Generated from the docstrings.
 ## Qwen3.5 in transformers
 
 ```{eval-rst}
+.. automodule:: shared_delta_moe.models.qwen3_5.common
+   :members:
+
 .. automodule:: shared_delta_moe.models.qwen3_5.qwen3_5_delta_moe.modeling
    :members:
 

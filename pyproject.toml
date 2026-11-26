@@ -20,7 +20,7 @@ dev = [
     "black",
     "transformers==5.16.1",
 ]
-docs = ["sphinx", "myst-parser", "furo"]
+docs = ["sphinx", "myst-parser", "furo", "sphinxcontrib-mermaid>=2.1.1"]
 
 [build-system]
 requires = ["hatchling"]

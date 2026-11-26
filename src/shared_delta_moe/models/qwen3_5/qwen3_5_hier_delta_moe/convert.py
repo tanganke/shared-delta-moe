@@ -4,13 +4,13 @@ One group per domain; each fine-tune's decoder MLP becomes an expert :math:`\the
 :math:`W_b` (the base MLP) and :math:`\Delta_{ij} = \theta_{ij} - W_b` (subtracted in float32, stored in the checkpoint
 dtype). Every other tensor (attention, linear attention, norms, embeddings, ``lm_head``, vision tower, MTP) is merged
 from the fine-tunes with a ``merging.MERGE`` method (default ``simple_average``). Routers start at zero: uniform over
-groups and within each group. With ``shared_base`` off (the default), one expert per group, no zero experts and dense
-group routing, each layer's MLP is then the plain average of the fine-tunes' MLPs.
+groups and within each group. With one expert per group, no zero experts and dense group routing, each layer's MLP is
+then the plain average of the fine-tunes' MLPs; a zero expert is the base MLP.
 
 Usage::
 
     python -m shared_delta_moe.models.qwen3_5.qwen3_5_hier_delta_moe.convert BASE DST \
-        --group medical=FT1,FT2 --group code=FT3 [--zeros 0] [--top-k 1] [--group-top-k K] [--shared-base] \
+        --group medical=FT1,FT2 --group code=FT3 [--zeros 0] [--top-k 1] [--group-top-k K] \
         [--merge ties_merging --merge-arg scaling_factor=0.3 --merge-arg threshold=20]
 
 Tensors are streamed one at a time from the safetensors shards and written in shards of ``--shard-gb``.
@@ -19,16 +19,14 @@ Tensors are streamed one at a time from the safetensors shards and written in sh
 import argparse
 import json
 import re
-import shutil
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, Protocol
 
 import torch
-from safetensors import safe_open
-from safetensors.torch import save_file
 
 from ....merging import MERGE
+from ..common import Checkpoint, ShardWriter, copy_config
 
 MLP = re.compile(r"(model\.(?:language_model\.)?layers\.\d+\.mlp)\.(gate|up|down)_proj\.weight")
 
@@ -38,61 +36,11 @@ class Source(Protocol):
     def get(self, key: str) -> torch.Tensor: ...
 
 
-class Checkpoint:
-    """A safetensors checkpoint directory (sharded with model.safetensors.index.json, or one model.safetensors)."""
-
-    def __init__(self, path: str | Path) -> None:
-        self.path = Path(path)
-        index = self.path / "model.safetensors.index.json"
-        if index.exists():
-            self.files = {k: self.path / f for k, f in json.loads(index.read_text())["weight_map"].items()}
-        else:
-            f = self.path / "model.safetensors"
-            with safe_open(f, "pt") as h:
-                self.files = dict.fromkeys(h.keys(), f)
-        self._open: dict[Path, Any] = {}
-
-    def keys(self) -> list[str]:
-        return list(self.files)
-
-    def get(self, key: str) -> torch.Tensor:
-        f = self.files[key]
-        if f not in self._open:
-            self._open[f] = safe_open(f, "pt")
-        return self._open[f].get_tensor(key)
-
-
-class _Writer:
-    def __init__(self, dst: Path, shard_bytes: int) -> None:
-        self.dst, self.limit, self.buf, self.size, self.n, self.map, self.total = dst, shard_bytes, {}, 0, 0, {}, 0
-
-    def add(self, key: str, t: torch.Tensor) -> None:
-        self.buf[key] = t.contiguous()
-        self.size += t.numel() * t.element_size()
-        if self.size >= self.limit:
-            self.flush()
-
-    def flush(self) -> None:
-        if not self.buf:
-            return
-        self.n += 1
-        name = f"model-{self.n:05d}.safetensors"
-        save_file(self.buf, self.dst / name, metadata={"format": "pt"})
-        self.map.update(dict.fromkeys(self.buf, name))
-        self.total += self.size
-        self.buf, self.size = {}, 0
-
-    def close(self) -> None:
-        self.flush()
-        index = {"metadata": {"total_size": self.total}, "weight_map": dict(sorted(self.map.items()))}
-        (self.dst / "model.safetensors.index.json").write_text(json.dumps(index, indent=2) + "\n")
-
-
 def convert(base: Source, groups: dict[str, Sequence[Source]], dst: Path, zeros: Sequence[int], top_k: int = 1,
-            group_top_k: int | None = None, shared_base: bool = False, merge: str = "simple_average",
+            group_top_k: int | None = None, merge: str = "simple_average",
             merge_args: dict[str, Any] | None = None, shard_gb: float = 5.0,
             log: Callable[[str], None] = print, router_std: float = 0.0) -> dict[str, Any]:  # fmt: skip
-    r"""Write the converted tensors to ``dst`` (config and tokenizer files are ``main``'s job).
+    r"""Write the converted tensors to ``dst`` (config and tokenizer files are ``main``'s job, ``copy_config``).
 
     Args:
         base: the dense base checkpoint; its decoder MLP is :math:`W_b`.
@@ -101,7 +49,6 @@ def convert(base: Source, groups: dict[str, Sequence[Source]], dst: Path, zeros:
         zeros: zero experts per group.
         top_k: experts per group.
         group_top_k: groups per token; None = dense group routing.
-        shared_base: add the base MLP with weight 1.
         merge: a ``merging.MERGE`` method for every non-MLP tensor.
         merge_args: keyword arguments of the merge method.
         shard_gb: output shard size in GiB.
@@ -131,7 +78,7 @@ def convert(base: Source, groups: dict[str, Sequence[Source]], dst: Path, zeros:
     if base_only:
         log(f"{len(base_only)} tensors in no fine-tune, kept from the base: {base_only[:3]}...")
     dst.mkdir(parents=True, exist_ok=True)
-    w = _Writer(dst, int(shard_gb * 2**30))
+    w = ShardWriter(dst, int(shard_gb * 2**30))
     done: set[str] = set()
     for i, k in enumerate(sorted(keys)):
         m = MLP.fullmatch(k)
@@ -158,18 +105,8 @@ def convert(base: Source, groups: dict[str, Sequence[Source]], dst: Path, zeros:
         log(f"{prefix}: {len(tuned)} experts in {len(names)} groups")
     w.close()
     return {"groups": names, "group_sizes": [len(groups[n]) for n in names], "group_zeros": list(zeros),
-            "top_k": top_k, "group_top_k": group_top_k, "shared_base": shared_base,
+            "top_k": top_k, "group_top_k": group_top_k,
             "merge": merge, "merge_args": kw}  # fmt: skip
-
-
-def write_config(base_dir: Path, dst: Path, entry: dict[str, Any]) -> None:
-    """Copy the base's non-weight files, the config with hier_delta_moe set in its text config."""
-    for f in base_dir.iterdir():
-        if f.is_file() and f.suffix != ".safetensors" and f.name != "model.safetensors.index.json":
-            shutil.copy(f, dst / f.name)
-    config = json.loads((base_dir / "config.json").read_text())
-    config.get("text_config", config)["hier_delta_moe"] = entry
-    (dst / "config.json").write_text(json.dumps(config, indent=2) + "\n")
 
 
 def _value(v: str) -> Any:
@@ -187,7 +124,6 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--zeros", default="0", help="zero experts per group: one int, or one per group (a,b,...)")
     ap.add_argument("--top-k", type=int, default=1, help="experts per group")
     ap.add_argument("--group-top-k", type=int, help="groups per token (default: dense over every group)")
-    ap.add_argument("--shared-base", action="store_true", help="add the base MLP with weight 1 (models/hier.py)")
     ap.add_argument("--merge", default="simple_average", choices=sorted(MERGE))
     ap.add_argument("--merge-arg", action="append", default=[], help="KEY=VALUE for the merge method")
     ap.add_argument("--shard-gb", type=float, default=5.0)
@@ -200,9 +136,9 @@ def main(argv: list[str] | None = None) -> None:
     zeros = zeros * len(groups) if len(zeros) == 1 else zeros
     merge_args = {k: _value(v) for k, v in (s.split("=", 1) for s in a.merge_arg)}
     a.dst.mkdir(parents=True)
-    entry = convert(Checkpoint(a.base), groups, a.dst, zeros, a.top_k, a.group_top_k, a.shared_base, a.merge,
+    entry = convert(Checkpoint(a.base), groups, a.dst, zeros, a.top_k, a.group_top_k, a.merge,
                     merge_args, a.shard_gb)  # fmt: skip
-    write_config(a.base, a.dst, entry)
+    copy_config(a.base, a.dst, lambda text: text.update(hier_delta_moe=entry))
     print(f"{sum(entry['group_sizes'])} experts in groups {dict(zip(entry['groups'], entry['group_sizes']))}, "
           f"zeros {zeros}, top-{a.top_k} per group, groups {'dense' if a.group_top_k is None else a.group_top_k}, "
           f"merge {a.merge} {merge_args}")  # fmt: skip

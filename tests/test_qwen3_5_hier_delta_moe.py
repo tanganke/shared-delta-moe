@@ -8,6 +8,8 @@ import tempfile
 from pathlib import Path
 
 import torch
+
+sys.modules["fla"] = None  # CPU test: with flash-linear-attention installed, transformers runs its Triton kernels even on CPU tensors
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
 
@@ -22,13 +24,12 @@ GROUPS = {"a": [0, 1], "b": [2]}  # domain -> fine-tune indices
 
 
 class Ensemble(torch.nn.Module):
-    def __init__(self, src, k1, k0, zeros, shared):
+    def __init__(self, src, k1, k0, zeros):
         super().__init__()
-        self.src, self.args = src, (k1, k0)
-        self.kw = {"zeros": zeros, "shared": shared}
+        self.src, self.args, self.zeros = src, (k1, k0), zeros
 
     def forward(self, h):
-        return reference(self.src, *self.args, h.reshape(-1, h.shape[-1]), **self.kw).view(h.shape)
+        return reference(self.src, *self.args, h.reshape(-1, h.shape[-1]), self.zeros).view(h.shape)
 
 
 def tiny():
@@ -59,18 +60,17 @@ def test_converted_matches_ensemble():
         for i, t in enumerate(tuned):
             t.save_pretrained(d / f"ft{i}")
         groups = [f"{n}=" + ",".join(str(d / f"ft{i}") for i in ix) for n, ix in GROUPS.items()]
-        # (zeros, k1, k0, shared_base)
-        for j, (zeros, k1, k0, shared) in enumerate(((0, 1, None, False), (1, 2, None, False), (1, 1, 1, True))):
+        # (zeros, k1, k0)
+        for j, (zeros, k1, k0) in enumerate(((0, 1, None), (1, 2, None), (1, 1, 1))):
             dst = d / f"moe{j}"
             args = [str(d / "base"), str(dst), *sum((["--group", g] for g in groups), []), "--zeros", str(zeros),
-                    "--top-k", str(k1), "--shard-gb", "0.0001"] + (["--group-top-k", str(k0)] if k0 else []) + (
-                    ["--shared-base"] if shared else [])  # fmt: skip
+                    "--top-k", str(k1), "--shard-gb", "0.0001"] + (["--group-top-k", str(k0)] if k0 else [])  # fmt: skip
             convert_main(args)
             assert len(list(dst.glob("model-*.safetensors"))) > 1, "sharded"
             moe = Qwen3_5ForCausalLM.from_pretrained(dst).eval()
             blocks = [layer.mlp for layer in moe.model.layers]
             assert all(isinstance(b, Qwen3_5HierDeltaMoeBlock) for b in blocks)
-            assert blocks[0].group_sizes == [2, 1] and blocks[0].shared_base == shared
+            assert blocks[0].group_sizes == [2, 1]
             assert all(not b.router.weight.any() for b in blocks), "routers start at zero"
             sd = moe.state_dict()
             want = torch.stack([t.state_dict()["model.embed_tokens.weight"] for t in tuned]).mean(0)
@@ -84,7 +84,7 @@ def test_converted_matches_ensemble():
                 mlp = lambda m: (m.gate_proj.weight, m.up_proj.weight, m.down_proj.weight)  # noqa: E731
                 full = [[mlp(tuned[i].model.layers[li].mlp) for i in ix] for ix in GROUPS.values()]
                 src = (mlp(base.model.layers[li].mlp), full, b.router.weight)
-                layer.mlp = Ensemble(src, k1, k0, [zeros] * 2, shared)
+                layer.mlp = Ensemble(src, k1, k0, [zeros] * 2)
             with torch.no_grad():
                 got, want = moe(x).logits, ref(x).logits
             err = ((got - want).abs().max() / want.abs().max()).item()

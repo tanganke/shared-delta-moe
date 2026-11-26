@@ -116,8 +116,8 @@ def test_hier():
         print("skipped: no CUDA/Triton")
         return
     big = ([3] * 16, [1] * 16)
-    for k1, k0, shared, (sizes, zeros) in [(2, None, True, (hier.SIZES, hier.ZEROS)), (1, 2, False, (hier.SIZES, hier.ZEROS)), (2, 8, True, big)]:
-        m, _, _ = hier.make(k1, k0, shared, torch.bfloat16, "cuda", 192, 320, sizes, zeros)
+    for k1, k0, (sizes, zeros) in [(2, None, (hier.SIZES, hier.ZEROS)), (1, 2, (hier.SIZES, hier.ZEROS)), (2, 8, big)]:
+        m, _, _ = hier.make(k1, k0, torch.bfloat16, "cuda", 192, 320, sizes, zeros)
         for t in (1, 300):
             check(m, t)
         check(m, 300, router_only=True)

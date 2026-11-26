@@ -49,7 +49,7 @@ class VllmHierDeltaMoeBlock(HierDeltaMoE):
         c, inter = config.hier_delta_moe, config.intermediate_size
         assert inter % tp == 0, f"intermediate_size {inter} does not split over {tp} ranks"
         super().__init__(config.hidden_size, inter // tp, c["group_sizes"], c["group_zeros"], c["top_k"],
-                         c.get("group_top_k"), shared_base=c.get("shared_base", False))  # fmt: skip
+                         c.get("group_top_k"))  # fmt: skip
         self.tp = tp
         for name, dim in SHARD_DIM.items():
             getattr(self, name).weight_loader = partial(_load_shard, dim=dim, rank=rank, tp=tp)

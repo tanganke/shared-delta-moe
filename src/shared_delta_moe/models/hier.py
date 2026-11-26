@@ -1,8 +1,8 @@
-r"""Two-level shared delta MoE: an optional shared base expert (weight 1) plus grouped delta experts, routed group then
-expert.
+r"""Two-level shared delta MoE: grouped delta experts over one shared base :math:`W_b`, routed group then expert.
 
 Group :math:`i` holds :math:`E_i` delta experts (weights :math:`W_b + \Delta_{ij}`) and :math:`Z_i` zero experts (no
-parameters, output 0). Routing:
+parameters, :math:`\Delta = 0`: the base MLP itself, as in ``DeltaMoE``). "Shared" is the storage: :math:`W_b` once,
+one :math:`\Delta_{ij}` per delta expert. Routing:
 
 - :math:`h = \mathrm{softmax}(R_0 x)` over the :math:`G` groups; dense (every group, weight :math:`h_i`) or
   top-:math:`k_0` renormalised.
@@ -12,18 +12,16 @@ parameters, output 0). Routing:
 
   .. math::
 
-     y = [\mathrm{MLP}(x; W_b)] + \sum_i h_i \sum_{j \in \text{top-}k_1,\ j \text{ a delta}} p_{ij}\,
-     \mathrm{MLP}(x; W_b + \Delta_{ij})
+     y = \sum_i h_i \sum_{j \in \text{top-}k_1} p_{ij}\, \mathrm{MLP}(x; W_b + \Delta_{ij}),
+     \qquad \Delta_{ij} = 0 \text{ for a zero expert}
 
-The bracketed term only with ``shared_base`` (the default); without it (upscaling a dense model from its fine-tunes)
-:math:`y` is the routed ensemble alone. Either way :math:`y` equals the plain two-level ensemble of full experts
-:math:`\theta_{ij} = W_b + \Delta_{ij}`. One linear layer holds both routers: rows :math:`0 \ldots G-1` are
-:math:`R_0`, then group by group :math:`E_i` delta rows and :math:`Z_i` zero-expert rows.
+The weights sum to 1, so :math:`y` is the plain two-level ensemble of full experts :math:`\theta_{ij} = W_b +
+\Delta_{ij}` (:math:`\theta = W_b` for a zero expert). One linear layer holds both routers: rows :math:`0 \ldots G-1`
+are :math:`R_0`, then group by group :math:`E_i` delta rows and :math:`Z_i` zero-expert rows.
 
 The routing is flattened into DeltaMoE slots: per token :math:`S \cdot k_1` slots (:math:`S = G` dense, else
-:math:`k_0`) weighted :math:`h_i p_{ij}`, plus one base slot weighted 1 with ``shared_base``; a picked zero expert
-becomes a base slot with weight 0. Every DeltaMoE forward (materialised, split, grouped, fused Triton) then computes
-:math:`y` unchanged.
+:math:`k_0`) weighted :math:`h_i p_{ij}`; a picked zero expert is a base slot. Every DeltaMoE forward (materialised,
+split, grouped, fused Triton) then computes :math:`y` unchanged.
 """
 
 from collections.abc import Sequence
@@ -54,7 +52,6 @@ class HierDeltaMoE(DeltaMoE):
             all groups.
         device: device of the parameters.
         dtype: dtype of the parameters.
-        shared_base: add :math:`\mathrm{MLP}(x; W_b)` with weight 1 (one extra base slot per token).
     """
 
     def __init__(
@@ -67,7 +64,6 @@ class HierDeltaMoE(DeltaMoE):
         group_top_k: int | None = None,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
-        shared_base: bool = True,
     ) -> None:
         G = len(group_sizes)
         assert G == len(group_zeros) and G > 0 and min(group_zeros) >= 0
@@ -77,8 +73,7 @@ class HierDeltaMoE(DeltaMoE):
         factory: dict[str, Any] = {"device": device, "dtype": dtype}
         self.group_sizes, self.group_zeros = list(group_sizes), list(group_zeros)
         self.k1, self.group_top_k, self.num_zero_experts = top_k, group_top_k, sum(group_zeros)
-        self.shared_base = shared_base
-        self.top_k = (G if group_top_k is None else group_top_k) * top_k + shared_base  # DeltaMoE slots per token
+        self.top_k = (G if group_top_k is None else group_top_k) * top_k  # DeltaMoE slots per token
         widths = [e + z for e, z in zip(group_sizes, group_zeros)]
         self.router = nn.Linear(hidden, G + sum(widths), bias=False, **factory)
         self._table_cache: dict[torch.device, tuple[Tensor, Tensor, Tensor]] = {}
@@ -108,7 +103,6 @@ class HierDeltaMoE(DeltaMoE):
         group_zeros: Sequence[int],
         top_k: int = 1,
         group_top_k: int | None = None,
-        shared_base: bool = True,
     ) -> "HierDeltaMoE":
         r"""Build from the plain two-level ensemble of full experts.
 
@@ -122,14 +116,13 @@ class HierDeltaMoE(DeltaMoE):
             group_zeros: :math:`Z_i`, the number of zero experts in each group.
             top_k: :math:`k_1`, experts picked per group.
             group_top_k: :math:`k_0`, groups picked per token; None = dense routing over all groups.
-            shared_base: add :math:`\mathrm{MLP}(x; W_b)` with weight 1.
 
         Returns:
             The HierDeltaMoE holding :math:`W_b`, the deltas and the router.
         """
         gate, up, down = base
         m = cls(gate.shape[1], gate.shape[0], [len(g) for g in groups], group_zeros, top_k, group_top_k,
-                gate.device, gate.dtype, shared_base)  # fmt: skip
+                gate.device, gate.dtype)  # fmt: skip
         assert router.shape == m.router.weight.shape
         m.router.weight.copy_(router)
         experts = [w for g in groups for w in g]
@@ -143,8 +136,7 @@ class HierDeltaMoE(DeltaMoE):
         r"""Route tokens to the flattened DeltaMoE slots.
 
         Per token :math:`S \cdot k_1` slots (:math:`S = G` if ``group_top_k`` is None, else :math:`k_0`) weighted
-        :math:`h_i p_{ij}`; a picked zero expert becomes a base slot with weight 0. With ``shared_base`` the last slot
-        is the shared base with weight 1.
+        :math:`h_i p_{ij}`; a picked zero expert is a base slot.
 
         Args:
             x: (T, H) tokens.
@@ -167,9 +159,4 @@ class HierDeltaMoE(DeltaMoE):
             pick = gi[..., None].expand(-1, -1, self.k1)
             pv, pj = pv.gather(1, pick), pj.gather(1, pick)
         e = delta[gi[..., None], pj].flatten(1)  # T S*k1
-        w = (h[..., None] * pv).flatten(1).masked_fill(e < 0, 0.0)
-        e = torch.where(e < 0, self.n_delta, e)
-        if not self.shared_base:
-            return e, w
-        one = torch.ones_like(w[:, :1])
-        return torch.cat((e, torch.full_like(e[:, :1], self.n_delta)), 1), torch.cat((w, one), 1)
+        return torch.where(e < 0, self.n_delta, e), (h[..., None] * pv).flatten(1)

@@ -2,10 +2,13 @@
 the patched decoder layer, and compare logits to the stock MoE at top-1, top-2 and soft routing (fp32, CPU).
 """
 
+import sys
 import tempfile
 from pathlib import Path
 
 import torch
+
+sys.modules["fla"] = None  # CPU test: with flash-linear-attention installed, transformers runs its Triton kernels even on CPU tensors
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
     Qwen3_5MoeTextConfig,
 )

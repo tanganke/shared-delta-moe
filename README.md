@@ -4,13 +4,17 @@ A small Python library: a top-k SwiGLU MoE written as **a shared base expert plu
 
 ```
 src/shared_delta_moe/models/delta_moe.py  DeltaMoE: from_experts, routing, the forward implementations
-src/shared_delta_moe/ops.py               stateless helpers: mlp, grouping routed rows, one grouped GEMM
+src/shared_delta_moe/ops.py               stateless helpers: mlp, grouping routed rows, one grouped GEMM, bit packing, pow2
 src/shared_delta_moe/triton_kernels/      fused.py: the fused parameter-aggregation forward (sort, gate_up + SiLU,
                                           down + routing weight; dense or seeded-DARE deltas; Hopper TMA); train.py:
                                           its backward for training (dense deltas, triton_train)
-src/shared_delta_moe/models/hier.py       HierDeltaMoE: groups of deltas + zero experts, two-level routing
+src/shared_delta_moe/models/hier.py       HierDeltaMoE: groups of deltas + zero experts (= the base), two-level routing
+src/shared_delta_moe/models/packed.py     PackedDeltaMoE: the common part of the packed formats (DARE, BitDelta)
 src/shared_delta_moe/models/dare.py       seeded DARE: Philox mask, its bitmap, pack, DareDeltaMoE
 src/shared_delta_moe/models/bitdelta.py   BitDelta: 1-bit sign deltas with per-matrix or per-row scales, BitDeltaMoE
+src/shared_delta_moe/models/qwen3_5/common.py
+                                          shared by both Qwen3.5 integrations: block forward, decoder-layer patch,
+                                          streaming checkpoint reader / shard writer, config copy
 src/shared_delta_moe/models/qwen3_5/qwen3_5_delta_moe/
                                           transformers' Qwen3.5 MoE with DeltaMoE blocks (forward_param): modeling.py
                                           (patches the decoder layer for configs with delta_moe_zero_experts), convert.py
@@ -72,8 +76,8 @@ main (pull requests build only).
 - [dare.md](docs/dare.md): seeded DARE deltas, the mask bitmap, speed
 - [bitdelta.md](docs/bitdelta.md): 1-bit BitDelta deltas (sign bits plus scales), the kernel's mode 2, speed
 - [training.md](docs/training.md): gradients through `forward_param`, the fused Triton backward (`triton_train`), DARE training memory
-- [hier.md](docs/hier.md): the two-level shared delta MoE (`HierDeltaMoE`): groups, dense or top-k group routing, zero experts; upscaling a dense Qwen3.5 / Qwen3.8 and its domain fine-tunes (`qwen3_5_hier_delta_moe`, merge methods)
-- [qwen3_5.md](docs/qwen3_5.md): Qwen3.5 MoE in transformers with DeltaMoE blocks, checkpoint converter
+- [hier.md](docs/hier.md): the two-level shared delta MoE (`HierDeltaMoE`): groups, dense or top-k group routing, zero experts; serving with vLLM
+- [qwen3_5.md](docs/qwen3_5.md): converting a whole Qwen3.5 model: plain MoE -> DeltaMoE (and BitDelta), dense base + domain fine-tunes -> HierDeltaMoE (merge methods)
 - [speed-per-implementation.md](docs/speed-per-implementation.md): every implementation per layer, H200 and RTX 6000 Ada (previous kernel 5522b23)
 - [transformers-decode.md](docs/transformers-decode.md): why the plain MoE looked slow in transformers' `generate()` (`batched_mm` switch) and the fix
 - [api.md](docs/api.md): API reference, generated from the docstrings (models, merging, Triton kernels, Qwen3.5 blocks, checkpoint converters)

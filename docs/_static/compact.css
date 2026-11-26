@@ -1,9 +1,19 @@
-/* Denser than Furo's default: 14px base (Furo sizes in rem / em), a wider text column for the speed tables, and
-   tighter vertical spacing. */
+/* Denser than Furo's default: 14px base (Furo sizes in rem / em) and tighter vertical spacing. */
 html { font-size: 87.5%; }
-.content { width: 58em; }
 article { line-height: 1.5; }
 article p, article ul, article ol, article dl { margin-top: 0.5em; margin-bottom: 0.5em; }
 article h2 { margin-top: 1.5em; }
 article h3 { margin-top: 1.2em; }
-article table.docutils td, article table.docutils th { padding: 0.15rem 0.5rem; }
+article table.docutils td, article table.docutils th { padding: 0.25rem 0.6rem; vertical-align: top; }
+
+/* Diagrams at their natural size (useMaxWidth off in conf.py), shrunk only when wider than the column:
+   sphinxcontrib-mermaid otherwise fits every diagram into a 100%-wide, 500px-high box. */
+.mermaid-container > pre > svg, pre.mermaid > svg { width: auto !important; height: auto !important; max-width: 100% !important; }
+
+/* Wide windows: Furo keeps the text at a fixed 46em and centres it by growing the sidebar to 50% - 26em, which leaves
+   a wide grey band on the left and an empty one on the right. Fix the sidebar's width and let the text take the rest,
+   up to a readable maximum. Below 63em Furo's own mobile layout applies unchanged. */
+@media (min-width: 63em) {
+  .sidebar-drawer { width: 18em; flex: none; }
+  .content { width: auto; flex: 1 1 auto; max-width: 80em; }
+}

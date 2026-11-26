@@ -7,10 +7,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 project = "shared-delta-moe"
-extensions = ["myst_parser", "sphinx.ext.autodoc", "sphinx.ext.napoleon", "sphinx.ext.mathjax", "sphinx.ext.viewcode"]
+copyright = "2026, Anke Tang"
+extensions = ["myst_parser", "sphinx.ext.autodoc", "sphinx.ext.napoleon", "sphinx.ext.mathjax", "sphinx.ext.viewcode",
+              "sphinxcontrib.mermaid"]
 napoleon_google_docstring = True
 napoleon_numpy_docstring = False
 myst_enable_extensions = ["dollarmath", "amsmath"]
+myst_fence_as_directive = ["mermaid"]  # ```mermaid blocks render as diagrams (also on GitHub)
+mermaid_init_config = {"startOnLoad": False, "flowchart": {"useMaxWidth": False}}  # natural size, not stretched
 myst_heading_anchors = 3
 autodoc_member_order = "bysource"
 autodoc_typehints = "description"
