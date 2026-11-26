@@ -194,6 +194,18 @@ def shared_fraction(gram: Tensor, members: Sequence[int]) -> tuple[float, list[f
     return top, (s.square() / c.sum()).tolist()
 
 
+def matching_coefficients(gram: Tensor, members: Sequence[int]) -> list[float]:
+    r"""Merge coefficients :math:`\alpha` for :math:`\theta = \sum_j \alpha_j \Delta_j` whose projection on every
+    member's own direction equals that member's size, :math:`\langle \theta, \Delta_i \rangle = \|\Delta_i\|^2`:
+    :math:`G \alpha = \operatorname{diag}(G)` (indices count the fine-tunes from 0). Orthogonal deltas give
+    :math:`\alpha = 1` (task arithmetic), identical ones :math:`\sum_j \alpha_j = 1` (averaging); it is the minimiser
+    of :math:`\sum_i h_i (\langle \theta, u_i \rangle - \|\Delta_i\|)^2` for losses that only feel their own
+    direction (guide: similarity.md)."""
+    m = list(members)
+    g = gram[1:, 1:][m][:, m]
+    return torch.linalg.solve(g, g.diagonal()).tolist()
+
+
 def neuron_overlap(tensors: Mapping[str, Any], i: int, j: int, top: float = 0.1) -> dict[str, float]:
     """Do two deltas concentrate on the same MLP channels? Mean over layers of the Pearson correlation of their
     per-channel energies (gate + up + down) and the overlap of their top ``top`` fraction of channels (chance =
@@ -241,6 +253,7 @@ def report(g: Mapping[str, Any], fits: Sequence[str] = (), sets: Sequence[str] =
         a = aggregate(T, lambda n, L=L: layer(n) == L and group(n) == "mlp")
         out["layers"][L] = {"rel": relative_norm(a["gram"]).tolist(), "cos": cosine(a["gram"]).tolist()}
     mlp = aggregate(T, lambda n: group(n) == "mlp")["gram"]
+    rest = aggregate(T, lambda n: group(n) != "mlp")["gram"]
     for spec in fits:
         t, src = spec.split("=")
         beta, resid = fit(mlp, ix[t], [ix[s] for s in src.split(",")])
@@ -248,7 +261,9 @@ def report(g: Mapping[str, Any], fits: Sequence[str] = (), sets: Sequence[str] =
     for spec in sets:
         lab, mem = spec.split("=")
         top, frac = shared_fraction(mlp, [ix[m] for m in mem.split(",")])
-        out["sets"][lab] = {"members": mem.split(","), "top_eig": top, "mean_dir_energy": frac}
+        idx = [ix[m] for m in mem.split(",")]
+        out["sets"][lab] = {"members": mem.split(","), "top_eig": top, "mean_dir_energy": frac,
+                            "match_mlp": matching_coefficients(mlp, idx), "match_rest": matching_coefficients(rest, idx)}  # fmt: skip
     for spec in pairs:
         a, b = spec.split(",")
         out["neurons"][spec] = neuron_overlap(T, ix[a], ix[b])

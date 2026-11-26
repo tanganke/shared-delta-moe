@@ -134,3 +134,19 @@ def test_read_docs(tmp_path):
     assert S.read_docs(_Tok(), f, 1, 10, score="last") == [([1, 3, 4, 0, 9, 5, 6, 0], 6, 7)]
     assert S.read_docs(_Tok(), f, 1, 5, score="content") == [([0, 9, 5, 6, 0], 2, 4)]  # long chat: keep the end
     assert S.read_docs(_Tok(), f, 1, 3, score="content") == []  # the reply itself does not fit
+
+
+def test_matching_coefficients():
+    g = torch.Generator().manual_seed(0)
+    q, _ = torch.linalg.qr(torch.randn(50, 3, generator=g, dtype=torch.float64))
+    def gram(d):
+        m = torch.cat([torch.ones(1, 50, dtype=torch.float64), d])
+        return m @ m.T
+    orth = (q.T * torch.tensor([[1.0], [2.0], [3.0]], dtype=torch.float64))
+    assert torch.allclose(torch.tensor(S.matching_coefficients(gram(orth), [0, 1, 2]), dtype=torch.float64), torch.ones(3, dtype=torch.float64))
+    c = q[:, 0]
+    same = torch.stack([c, c + 1e-6 * q[:, 1], c + 1e-6 * q[:, 2]])  # nearly identical: any split with sum 1
+    assert abs(sum(S.matching_coefficients(gram(same), [0, 1, 2])) - 1) < 1e-3
+    shared = torch.stack([c + q[:, 1], c + q[:, 2]])  # one shared unit part, one own part each: theta = c + q1 + q2
+    a = S.matching_coefficients(gram(shared), [0, 1])
+    assert torch.allclose(torch.tensor(a, dtype=torch.float64), torch.tensor([2 / 3, 2 / 3], dtype=torch.float64))
