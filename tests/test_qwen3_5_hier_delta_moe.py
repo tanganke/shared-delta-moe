@@ -113,6 +113,12 @@ def test_merge_methods():
         assert tv["w"][0].abs()[kept].min() >= tv["w"][0].abs()[~kept].max(), th
     m = ties_merging(b, ts, 0.3, 20, "mean")
     assert all(m[k].dtype == torch.bfloat16 and m[k].shape == b[k].shape for k in b)
+    # fp64 is not rounded through fp32: a task vector of 1e-12 survives
+    b64 = {"w": torch.ones(4, dtype=torch.float64)}
+    t64 = [{"w": b64["w"] + 1e-12}]
+    for f in (simple_average, task_arithmetic, ties_merging):
+        out = f(b64, t64)["w"]
+        assert out.dtype == torch.float64 and (out != 1).all(), f.__name__
 
 
 class Dict:

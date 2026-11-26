@@ -1,7 +1,7 @@
 """Model merging for the parameters an upscaled MoE keeps one copy of (attention, norms, embeddings, ...), done by
 ``fusion_bench`` (extra ``merging``). Each method follows a ``fusion_bench`` algorithm step for step (named and
 parametrised as it) on state dicts: it takes the base state dict and the fine-tuned ones (same keys and shapes) and
-returns the merged state dict in the base's dtypes, computed in float32.
+returns the merged state dict in the base's dtypes, computed in at least float32 (bf16 / fp16 are upcast, fp64 stays).
 
 ponytail: the converter merges tensor by tensor (it streams the checkpoints), so TIES trims each tensor at its own
 threshold, where ``fusion_bench``'s ``TiesMergingAlgorithm`` trims the whole flattened model at once. Pass larger
@@ -18,8 +18,9 @@ from torch import Tensor
 StateDict = Mapping[str, Tensor]
 
 
-def _f32(sd: StateDict) -> dict[str, Tensor]:
-    return {k: v.float() for k, v in sd.items()}
+def _upcast(sd: StateDict) -> dict[str, Tensor]:
+    """At least float32: bf16 / fp16 upcast, fp64 kept."""
+    return {k: v.to(torch.promote_types(v.dtype, torch.float32)) for k, v in sd.items()}
 
 
 def _like(sd: StateDict, ref: StateDict) -> dict[str, Tensor]:
@@ -39,7 +40,7 @@ def simple_average(base: StateDict, tuned: Sequence[StateDict]) -> dict[str, Ten
     """
     from fusion_bench.utils.state_dict_arithmetic import state_dict_avg
 
-    return _like(state_dict_avg([_f32(s) for s in tuned]), base)
+    return _like(state_dict_avg([_upcast(s) for s in tuned]), base)
 
 
 def task_arithmetic(base: StateDict, tuned: Sequence[StateDict], scaling_factor: float = 0.3) -> dict[str, Tensor]:
@@ -56,8 +57,8 @@ def task_arithmetic(base: StateDict, tuned: Sequence[StateDict], scaling_factor:
     """
     from fusion_bench.utils.state_dict_arithmetic import state_dict_add, state_dict_mul, state_dict_sub, state_dict_sum
 
-    b = _f32(base)
-    task_vector = state_dict_sum([state_dict_sub(_f32(s), b) for s in tuned])
+    b = _upcast(base)
+    task_vector = state_dict_sum([state_dict_sub(_upcast(s), b) for s in tuned])
     return _like(state_dict_add(b, state_dict_mul(task_vector, scaling_factor)), base)
 
 
@@ -84,9 +85,9 @@ def ties_merging(base: StateDict, tuned: Sequence[StateDict], scaling_factor: fl
         vector_to_state_dict,
     )
 
-    b = _f32(base)
+    b = _upcast(base)
     flat_ptm = state_dict_to_vector(b)
-    tv_flat_checks = torch.vstack([state_dict_to_vector(_f32(s)) for s in tuned]) - flat_ptm
+    tv_flat_checks = torch.vstack([state_dict_to_vector(_upcast(s)) for s in tuned]) - flat_ptm
     with contextlib.redirect_stdout(io.StringIO()):  # it prints two lines per call; the converter calls it per tensor
         merged_tv = ties_merging(tv_flat_checks, reset_thresh=threshold, merge_func=merge_func)
     return _like(vector_to_state_dict(flat_ptm + scaling_factor * merged_tv, b), base)
