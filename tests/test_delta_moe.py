@@ -143,6 +143,12 @@ def test_training_skips_forward_only_kernel():
         assert m._use_triton(x[:37]) == HAS_TRITON
 
 
+def test_module_forward_is_forward_param():
+    m, _, x = make(1, 2)
+    with torch.no_grad():
+        torch.testing.assert_close(m(x.view(4, 50, -1)), m.forward_param(x).view(4, 50, -1))
+
+
 if __name__ == "__main__":
     for name, f in list(globals().items()):
         if name.startswith("test_"):

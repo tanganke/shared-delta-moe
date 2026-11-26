@@ -19,7 +19,15 @@ PROJ = ("gate", "up", "down")
 
 
 class PackedDeltaMoE(DeltaMoE):
-    """DeltaMoE with packed deltas, unpacked per expert (see the module docstring). Not used on its own."""
+    r"""DeltaMoE with packed deltas, unpacked per expert (see the module docstring). Not used on its own.
+
+    The module's forward is ``forward_matrix`` (output aggregation, the CUDA kernels) up to ``MATRIX_FORWARD_PAIRS``
+    (token, slot) pairs when those kernels take the call, else ``forward_param``: at decode sizes the packed deltas'
+    products alone are cheaper than rebuilding :math:`W_b + \Delta` per routed expert. The two differ in rounding
+    (about 1e-3 relative), so a batch's output depends slightly on its size.
+    """
+
+    MATRIX_FORWARD_PAIRS = 0  # set per format from H200 measurements (docs/forwards.md)
 
     def _unpack(self, name: str, e: int) -> Tensor:
         """Dense delta of projection ``name`` of expert ``e``: (I, H) for gate / up, (H, I) for down."""
@@ -75,12 +83,18 @@ class PackedDeltaMoE(DeltaMoE):
         Returns:
             (T, H) MoE output.
         """
-        if self._matrix_cuda(x):
-            from ..cuda_kernels.packed_ops import matrix_moe_any
+        return self._forward_matrix_cuda(x) if self._matrix_cuda(x) else super().forward_matrix(x)
 
-            idx, r = self.topk(x)
-            return matrix_moe_any(x, idx, r, self.n_delta, (self.gate, self.up, self.down), self._kernel_deltas())
-        return super().forward_matrix(x)
+    def _forward_matrix_cuda(self, x: Tensor) -> Tensor:
+        from ..cuda_kernels.packed_ops import matrix_moe_any
+
+        idx, r = self.topk(x)
+        return matrix_moe_any(x, idx, r, self.n_delta, (self.gate, self.up, self.down), self._kernel_deltas())
+
+    def _forward_auto(self, x: Tensor) -> Tensor:
+        if x.shape[0] * self.top_k <= self.MATRIX_FORWARD_PAIRS and self._matrix_cuda(x):
+            return self._forward_matrix_cuda(x)
+        return self.forward_param(x)
 
     def _matrix_cuda(self, x: Tensor) -> bool:
         if not (HAS_TRITON and x.is_cuda and x.dim() == 2) or self._needs_grad(x):

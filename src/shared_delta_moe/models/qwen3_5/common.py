@@ -1,4 +1,4 @@
-"""Shared by the two Qwen3.5 integrations (``qwen3_5_delta_moe``, ``qwen3_5_hier_delta_moe``): the block forward, the
+"""Shared by the two Qwen3.5 integrations (``qwen3_5_delta_moe``, ``qwen3_5_hier_delta_moe``): the
 transformers decoder-layer patch, and safetensors checkpoint I/O for the converters. (vLLM's decoder layer has another
 constructor; ``vllm_plugin.py`` patches it on its own.)"""
 
@@ -11,20 +11,6 @@ from typing import Any
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
-from torch import Tensor
-
-
-def block_forward(self: Any, hidden_states: Tensor) -> Tensor:
-    """The decoder MLP forward of a DeltaMoE block: ``forward_param`` over the flattened tokens.
-
-    Args:
-        hidden_states: (..., H) hidden states, any leading shape.
-
-    Returns:
-        Tensor of the same shape as ``hidden_states``.
-    """
-    shape = hidden_states.shape
-    return self.forward_param(hidden_states.reshape(-1, shape[-1])).view(shape)
 
 
 def patch_decoder_layer(layer: type, field: str, block: Callable[[Any], Any]) -> None:

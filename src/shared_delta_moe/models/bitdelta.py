@@ -117,6 +117,10 @@ class BitDeltaMoE(PackedDeltaMoE):
         scale: Fixes the scales' shape: an int B for block scales, else (``"matrix"`` or ``"row"``) one per row.
     """
 
+    # forward_matrix up to here (H200, hidden 2560, inter 9216, 5 deltas, matrix scales: faster than forward_param
+    # at 1-64 pairs, slower from 128)
+    MATRIX_FORWARD_PAIRS = 64
+
     def __init__(self, hidden: int, inter: int, n_delta: int, top_k: int = 1, num_zero_experts: int = 1,
                  device: torch.device | str | None = None, dtype: torch.dtype | None = None,
                  scale: "str | int" = "row") -> None:  # fmt: skip

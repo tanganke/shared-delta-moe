@@ -106,3 +106,21 @@ def test_autocast_other_dtype():
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 got = mod.forward_matrix(x[:8])
         assert got.dtype == torch.float16 and rel(got, want) < 1e-2
+
+
+def test_module_forward_picks_by_batch(monkeypatch):
+    """mod(x): forward_matrix (the CUDA kernels) up to MATRIX_FORWARD_PAIRS pairs, forward_param beyond; any leading
+    shape."""
+    m, _, x = make(1, 2, 256, 384, torch.bfloat16, "cuda")
+    for mod in (DareDeltaMoE.from_delta_moe(m, 0.2, 64, seed=1), BitDeltaMoE.from_delta_moe(m, 64)):
+        calls = []
+        monkeypatch.setattr(mod, "_forward_matrix_cuda", lambda t, f=mod._forward_matrix_cuda: calls.append("m") or f(t))
+        monkeypatch.setattr(mod, "forward_param", lambda t, f=mod.forward_param: calls.append("p") or f(t))
+        small = mod.MATRIX_FORWARD_PAIRS // mod.top_k
+        with torch.no_grad():
+            y = mod(x[: 2 * (small // 2)].view(2, small // 2, -1))
+            assert y.shape == (2, small // 2, x.shape[1]) and calls == ["m"]
+            assert rel(y.view(-1, x.shape[1]), mod._forward_matrix(x[: 2 * (small // 2)])) < 1e-2
+            n = min(x.shape[0], small + 8)
+            mod(x[:n])
+        assert calls[-1] == "p", calls

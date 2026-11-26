@@ -410,6 +410,22 @@ class DeltaMoE(nn.Module):
         limit = TRITON_MAX_PAIRS_HOPPER if hopper else TRITON_MAX_PAIRS_OLDER
         return TRITON_MIN_PAIRS <= P <= limit
 
+    def forward(self, x: Tensor) -> Tensor:
+        """The module's forward: the MoE over tokens of any leading shape.
+
+        Args:
+            x: (..., H) tokens.
+
+        Returns:
+            MoE output, same shape as ``x``: ``forward_param``, except where a subclass picks another forward by batch
+            size (``PackedDeltaMoE``: ``forward_matrix`` at small batches).
+        """
+        shape = x.shape
+        return self._forward_auto(x.reshape(-1, shape[-1])).view(shape)
+
+    def _forward_auto(self, x: Tokens) -> Tokens:
+        return self.forward_param(x)
+
     def forward_param(self, x: Tokens) -> Tokens:
         r"""MoE forward by parameter aggregation.
 

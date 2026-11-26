@@ -175,6 +175,10 @@ class DareDeltaMoE(PackedDeltaMoE):
         dtype: Dtype of the parameters and packed values.
     """
 
+    # forward_matrix up to here (H200, hidden 2560, inter 9216, 5 deltas, keep 0.2 / block 64: 2-3x faster than
+    # forward_param at 1-192 pairs, 1.8x slower at 512)
+    MATRIX_FORWARD_PAIRS = 256
+
     def __init__(
         self,
         hidden: int,

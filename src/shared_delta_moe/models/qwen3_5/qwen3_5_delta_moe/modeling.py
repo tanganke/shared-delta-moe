@@ -1,5 +1,5 @@
 r"""transformers' Qwen3.5 MoE (``Qwen3_5MoeForCausalLM``, ``Qwen3_5MoeForConditionalGeneration``) with every sparse
-MoE block a DeltaMoE run by ``forward_param``.
+MoE block a DeltaMoE run by ``DeltaMoE.forward``.
 
 A text config with ``delta_moe_zero_experts: Z`` (an int, 0 allowed) turns it on: ``num_experts`` = n deltas + Z
 router rows, rows n .. n+Z-1 being zero experts (the base MLP itself); ``num_experts_per_tok`` is the top-k
@@ -16,11 +16,11 @@ from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as M
 
 from ...bitdelta import BitDeltaMoE
 from ...delta_moe import DeltaMoE
-from ..common import block_forward, patch_decoder_layer
+from ..common import patch_decoder_layer
 
 
 class Qwen3_5DeltaMoeBlock(DeltaMoE):
-    """A Qwen3.5 sparse MoE block as a DeltaMoE, run by ``forward_param``.
+    """A Qwen3.5 sparse MoE block as a DeltaMoE, run by ``DeltaMoE.forward``.
 
     Args:
         config: The Qwen3.5 MoE text config: ``hidden_size``, ``moe_intermediate_size``, ``num_experts`` (N deltas
@@ -38,16 +38,13 @@ class Qwen3_5DeltaMoeBlock(DeltaMoE):
             z,
         )
 
-    forward = block_forward
-
 
 class Qwen3_5BitDeltaMoeBlock(BitDeltaMoE):
-    """A Qwen3.5 sparse MoE block as a BitDeltaMoE (1-bit deltas), with ``Qwen3_5DeltaMoeBlock``'s forward.
+    """A Qwen3.5 sparse MoE block as a BitDeltaMoE (1-bit deltas), run by ``DeltaMoE.forward`` (``forward_matrix``
+    at decode sizes).
 
     Built by ``to_bitdelta`` from a ``Qwen3_5DeltaMoeBlock``; constructor args as ``BitDeltaMoE``.
     """
-
-    forward = block_forward
 
 
 def to_bitdelta(model: Any, scale: "str | int" = "matrix") -> Any:
