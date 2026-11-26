@@ -56,6 +56,9 @@ Details live in `docs/`, a Sphinx site: guide pages in MyST Markdown, one topic 
 uv run --group docs --extra transformers sphinx-build -W -b html docs docs/_build/html   # open docs/_build/html/index.html
 ```
 
+Published at https://tanganke.github.io/shared-delta-moe/, built by `.github/workflows/docs.yml` on every push to
+main (pull requests build only).
+
 - A new page goes into a toctree in `docs/index.md` (and this list); a new public module into `docs/api.md`.
 - Docstrings are reStructuredText (Sphinx's default): aligned blocks after `::` and a blank line, `|x|` as
   ``` ``|x|`` ```. The build runs with `-W`, so a malformed docstring or a page missing from a toctree fails it.
