@@ -60,8 +60,10 @@ Published at https://tanganke.github.io/shared-delta-moe/, built by `.github/wor
 main (pull requests build only).
 
 - A new page goes into a toctree in `docs/index.md` (and this list); a new public module into `docs/api.md`.
-- Docstrings are reStructuredText (Sphinx's default): aligned blocks after `::` and a blank line, `|x|` as
-  ``` ``|x|`` ```. The build runs with `-W`, so a malformed docstring or a page missing from a toctree fails it.
+- Public docstrings are Google style (summary line, then `Args:` / `Returns:` / `Raises:`, shapes in each argument),
+  rendered by napoleon; the text inside is reStructuredText: aligned blocks after `::` and a blank line, `|x|` as
+  ``` ``|x|`` ```. NamedTuple fields go in `:ivar name:` entries, not `Attributes:`. The build runs with `-W`, so a
+  malformed docstring or a page missing from a toctree fails it.
 
 
 - [design.md](docs/design.md): the delta form, zero experts, routing, what is and is not equivalent, `from_experts`, dtypes
