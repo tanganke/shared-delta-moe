@@ -90,8 +90,22 @@ node, other GPUs running the tests.
   | 8192 | 3.447 | 4.691 | 6.136 | 5.966 |
 
   12–30% slower than row scales from 8 tokens up.
-- **Room left.** Faster expansion (e.g. unpacking 32 entries with fewer integer ops, or dequantising once per tile
-  into shared memory) is not done yet.
+- **CUDA kernels at decode.** Up to 16 (token, slot) pairs, prebuilt CUDA kernels take over
+  (`cuda_kernels/packed_moe.cu`; build and design in [dare.md](dare.md#cuda-kernels-at-decode)). A byte of sign
+  bits indexes a 256-entry table of sign-flip masks, so $W_b \pm s$ costs one XOR and one bf16x2 add per two
+  entries. They cover one scale per row or matrix, or blocks of 32 or more. Matrix scales, µs per layer, top-1 / top-2
+  (% of the byte bound at 4.8 TB/s):
+
+  | tokens | dense $\Delta$, Triton | BitDelta, Triton | **BitDelta, CUDA** |
+  |---:|---:|---:|---:|
+  | 1 | 80.5 / 117.0 | 89.4 / 144.6 (35% / 22%) | **78.0 / 108.2 (40% / 29%)** |
+  | 8 | 191.4 / 234.6 | 276.4 / 312.8 (13% / 12%) | **198.3 / 275.6 (18% / 13%)** |
+  | 16 | 228.4 / 236.2 | 363.6 / 369.0 (11% / 11%) | **310.2** / (Triton) |
+  | 512 | 342.5 / 584.3 | 553.6 / 860.1 (8% / 6%) | (Triton) |
+
+  It is 1.1–1.4x faster than Triton and about as fast as dense deltas at 1 token. From 8 tokens up, every routed
+  group's rebuild of $W_b + \Delta_g$ keeps it latency-bound, so it does not reach the byte bound
+  ([dare.md](dare.md#cuda-kernels-at-decode)).
 
 ## Accuracy
 

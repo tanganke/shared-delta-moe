@@ -649,6 +649,11 @@ def fused_moe(x: Tensor, idx: Tensor, rw: Tensor, n_delta: int, base: tuple[Tens
     if x.shape[0] == 0:
         return x.new_empty(x.shape)
     r = route(idx, rw, n_delta)
+    if deltas[0].mode:  # packed deltas at decode sizes: the prebuilt CUDA kernels, when built
+        from ..cuda_kernels import packed_ops
+
+        if packed_ops.supports(x, r.perm.numel(), base, deltas):
+            return packed_ops.moe(x, r, base, deltas)
     return down(gate_up(x, r, base[0], base[1], deltas[0], deltas[1]), r, base[2], deltas[2])
 
 

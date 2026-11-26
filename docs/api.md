@@ -44,6 +44,13 @@ Generated from the docstrings.
    :members:
 ```
 
+## CUDA kernels
+
+```{eval-rst}
+.. automodule:: shared_delta_moe.cuda_kernels.packed_ops
+   :members: available, supports, moe, build
+```
+
 ## Qwen3.5 in transformers
 
 ```{eval-rst}
