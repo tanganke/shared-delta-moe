@@ -77,4 +77,19 @@ node, other GPUs running the tests.
 
 ## Accuracy
 
-Not yet measured on a real model.
+Qwen3.5-4B MoE (5 full-finetuned deltas + zero expert, top-1), accuracy in % (4 samples per question), against the
+same model with dense deltas. Scale distillation: logit MSE to the dense-delta model, 200 steps, scales only
+(qwen3-vl-moe `scripts/distill_bitdelta_scales.py`).
+
+| deltas | engineering | history | law | NLI4CT |
+|---|---:|---:|---:|---:|
+| base model, no delta | 67.5 | 61.2 | 61.1 | 62.5 |
+| dense bf16 | 73.5 | 75.4 | 68.4 | 79.0 |
+| BitDelta, matrix scales | 73.5 | 74.2 | 67.5 | 75.8 |
+| BitDelta, row scales | 73.4 | 74.2 | 67.2 | 75.8 |
+| matrix scales, distilled | 73.6 | 74.2 | 68.3 | 76.8 |
+| row scales, distilled | 73.6 | 74.1 | 68.3 | 76.7 |
+
+- Row scales are no better than matrix scales.
+- Distillation recovers about 1 point on law and NLI4CT, nothing on history.
+- The largest drop is on the set with the largest delta (NLI4CT, -2.3 after distillation).
