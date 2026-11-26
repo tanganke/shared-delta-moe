@@ -129,4 +129,8 @@ def test_read_docs(tmp_path):
             {"text": "1234"}]  # fmt: skip
     f.write_text("\n".join(json.dumps(r) for r in rows))
     out = S.read_docs(_Tok(), f, docs=5, max_length=10, min_tokens=3)
-    assert out == [([1, 3, 4, 0, 9, 5, 6, 0], 5), ([1, 2, 3, 4], 1)]  # reply scored from its first token; short text dropped
+    assert out == [([1, 3, 4, 0, 9, 5, 6, 0], 5, 8), ([1, 2, 3, 4], 1, 4)]  # reply from its first token; short text dropped
+    assert S.read_docs(_Tok(), f, 1, 10, score="content") == [([1, 3, 4, 0, 9, 5, 6, 0], 5, 7)]  # without the closing 0
+    assert S.read_docs(_Tok(), f, 1, 10, score="last") == [([1, 3, 4, 0, 9, 5, 6, 0], 6, 7)]
+    assert S.read_docs(_Tok(), f, 1, 5, score="content") == [([0, 9, 5, 6, 0], 2, 4)]  # long chat: keep the end
+    assert S.read_docs(_Tok(), f, 1, 3, score="content") == []  # the reply itself does not fit
