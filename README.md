@@ -23,11 +23,14 @@ src/shared_delta_moe/models/qwen3_5/qwen3_5_hier_delta_moe/
                                           dense Qwen3.5 / Qwen3.8 with HierDeltaMoE MLPs: modeling.py, convert.py
                                           (base + domain fine-tunes -> one group per domain, other tensors merged)
 src/shared_delta_moe/merging.py           merge methods for the shared tensors: fusion_bench calls (extra merging)
+src/shared_delta_moe/similarity.py        how alike the fine-tunes are before upscaling: delta Gram statistics, report,
+                                          LM loss of merged / forced-routing dense models (docs/guide/similarity.md)
 src/shared_delta_moe/constants.py         HAS_TRITON and the thresholds that pick an implementation
 src/shared_delta_moe/type_hints.py        shape-annotated tensor aliases (T tokens, H hidden, ...)
 src/shared_delta_moe/testing.py           random_experts for tests and benchmarks
 tests/test_delta_moe.py                   every forward == plain MoE, token by token (Triton part needs CUDA)
 tests/test_dare.py                        Philox known-answer, CPU == CUDA masks, bitmap == mask, DARE forwards and gradients
+tests/test_similarity.py                  Gram statistics == direct computation on tiny checkpoints, shards, fits, ulp counts
 tests/test_hier.py                        HierDeltaMoE forwards and gradients == the two-level ensemble, token by token
 tests/test_qwen3_5_hier_delta_moe.py     tiny dense Qwen3.5 upscaled == ensemble of its fine-tunes' MLPs
 tests/test_train.py                       the Triton backward == the materialised path (x, router, every weight; Hier)
