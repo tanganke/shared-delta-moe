@@ -16,4 +16,5 @@ article table.docutils td, article table.docutils th { padding: 0.25rem 0.6rem; 
 @media (min-width: 63em) {
   .sidebar-drawer { width: 18em; flex: none; }
   .content { width: auto; flex: 1 1 auto; max-width: 80em; }
+  .toc-drawer { flex: none; width: 15em; }  /* the text column must not squeeze the page's contents list */
 }

@@ -17,6 +17,7 @@ myst_fence_as_directive = ["mermaid"]  # ```mermaid blocks render as diagrams (a
 mermaid_init_config = {"startOnLoad": False, "flowchart": {"useMaxWidth": False},  # natural size, not stretched
                        "deterministicIds": True}  # else ids are Date.now(): two diagrams in one ms collide
 myst_heading_anchors = 3
+toc_object_entries_show_parents = "hide"  # contents list: "forward_param", not "DeltaMoE.forward_param"
 autodoc_member_order = "bysource"
 autodoc_typehints = "description"
 exclude_patterns = ["_build"]
