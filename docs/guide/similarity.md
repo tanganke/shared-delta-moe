@@ -160,7 +160,7 @@ Loss along and across deltas (4B CPT):
 2. Compute the Gram for all candidates and read seeds as the noise floor: a pair of experts whose cosine is not above
    their seed-to-seed cosine has no weight evidence of being different (or alike).
 3. Build the loss matrix (every expert on every domain's validation set, scored on the answer, `--score last` for
-   MCQ) and group experts whose loss rows are alike; a group's members should each beat the others on their own
+   MCQ; compare top-1 accuracy, not only NLL) and group experts whose rows are alike; a group's members should each beat the others on their own
    domain, otherwise one expert or a merge serves the group.
 4. Merge the shared tensors (a plain average of the SFT experts was enough at 4B; `matching_coefficients` when the
    deltas are near-orthogonal, as CPT on different sources) and check the forced-routing models on the loss matrix:
