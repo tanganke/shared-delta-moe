@@ -1,12 +1,12 @@
 # shared-delta-moe
 
-A small Python library: a top-k SwiGLU MoE written as **a shared base expert plus per-expert deltas**, with several forward implementations that are exactly equivalent to the original MoE, including a Triton kernel that fuses $W_b+\Delta_e$ into the GEMM.
+A small Python library: a top-k SwiGLU MoE stored as **one shared base $W_b$ plus a delta per expert**, $W_e = W_b+\Delta_e$ (dense, seeded-DARE or 1-bit BitDelta deltas; also a two-level `HierDeltaMoE`), with several forward implementations that are exactly equivalent to the original MoE, including a Triton kernel that fuses $W_b+\Delta_e$ into the GEMM.
 
 ```
 src/shared_delta_moe/models/delta_moe.py  DeltaMoE: from_experts, routing, the forward implementations
 src/shared_delta_moe/ops.py               stateless helpers: mlp, grouping routed rows, one grouped GEMM, bit packing, pow2
 src/shared_delta_moe/triton_kernels/      fused.py: the fused parameter-aggregation forward (sort, gate_up + SiLU,
-                                          down + routing weight; dense or seeded-DARE deltas; Hopper TMA); train.py:
+                                          down + routing weight; dense, seeded-DARE or BitDelta deltas; Hopper TMA); train.py:
                                           its backward for training (dense deltas, triton_train)
 src/shared_delta_moe/models/hier.py       HierDeltaMoE: groups of deltas + zero experts (= the base), two-level routing
 src/shared_delta_moe/models/packed.py     PackedDeltaMoE: the common part of the packed formats (DARE, BitDelta)
@@ -68,6 +68,8 @@ main (pull requests build only).
   rendered by napoleon; the text inside is reStructuredText: aligned blocks after `::` and a blank line, `|x|` as
   ``` ``|x|`` ```. NamedTuple fields go in `:ivar name:` entries, not `Attributes:`. The build runs with `-W`, so a
   malformed docstring or a page missing from a toctree fails it.
+- Diagrams are ```` ```mermaid ```` blocks (sphinxcontrib-mermaid; GitHub renders them too). `docs/_static/compact.css`
+  holds the layout changes over Furo.
 
 
 - [design.md](docs/design.md): the delta form, zero experts, routing, what is and is not equivalent, `from_experts`, dtypes
