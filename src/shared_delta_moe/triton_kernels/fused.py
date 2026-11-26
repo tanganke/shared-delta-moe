@@ -39,6 +39,7 @@ import triton.language as tl
 from torch import Tensor
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from .. import constants
 from ..constants import SORT_ONE_HOT
 
 AUTOTUNE = os.environ.get("SHARED_DELTA_MOE_AUTOTUNE", "1") != "0"  # "0": first fitting config only (tests)
@@ -633,7 +634,8 @@ def down(h: Tensor, r: Routing, w: Tensor, d: Delta, config: triton.Config | Non
 
 def fused_moe(x: Tensor, idx: Tensor, rw: Tensor, n_delta: int, base: tuple[Tensor, Tensor, Tensor],
               deltas: tuple[Delta, Delta, Delta]) -> Tensor:  # fmt: skip
-    """Parameter-aggregation MoE forward: ``route``, ``gate_up``, ``down``.
+    """Parameter-aggregation MoE forward: ``route``, ``gate_up``, ``down``; dense deltas on sm90 from
+    ``DENSE_PREFILL_PAIRS_PER_GROUP`` * (``n_delta`` + 1) pairs on: ``route`` and ``cuda_kernels.dense_moe.prefill``.
 
     Args:
         x: (T, H) tokens.
@@ -649,6 +651,12 @@ def fused_moe(x: Tensor, idx: Tensor, rw: Tensor, n_delta: int, base: tuple[Tens
     if x.shape[0] == 0:
         return x.new_empty(x.shape)
     r = route(idx, rw, n_delta)
+    if deltas[0].mode == 0 and idx.numel() >= constants.DENSE_PREFILL_PAIRS_PER_GROUP * (n_delta + 1):
+        from ..cuda_kernels import dense_moe  # prefill: materialised W_b + Delta and grouped GEMMs
+
+        ds = tuple(d.d for d in deltas)
+        if dense_moe.supports(x, base, ds):  # type: ignore[arg-type]
+            return dense_moe.prefill(x, r, base, ds)  # type: ignore[arg-type]
     return down(gate_up(x, r, base[0], base[1], deltas[0], deltas[1]), r, base[2], deltas[2])
 
 

@@ -27,6 +27,7 @@ bitdelta
 :maxdepth: 2
 
 fused-kernel
+dense-prefill
 training
 ```
 

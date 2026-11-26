@@ -44,6 +44,16 @@ Generated from the docstrings.
    :members:
 ```
 
+## CUDA kernels (dense prefill)
+
+```{eval-rst}
+.. automodule:: shared_delta_moe.cuda_kernels.dense_ext
+   :members:
+
+.. automodule:: shared_delta_moe.cuda_kernels.dense_moe
+   :members: materialise, grouped_moe, unsort
+```
+
 ## Qwen3.5 in transformers
 
 ```{eval-rst}
