@@ -19,6 +19,27 @@ each MLP about $2f(x)$. Either way this equals the plain two-level ensemble of t
 expert of weight 1 when `shared_base`) (`from_experts` takes those full experts and stores $\Delta_{ij}=\theta_{ij}-W_b$). One linear layer
 holds both routers: rows $0..G-1$ are $R_0$, then group by group its $E_i$ delta rows and $Z_i$ zero-expert rows.
 
+**Usage.**
+
+```python
+import torch
+from shared_delta_moe import HierDeltaMoE, random_experts
+
+H, I = 1024, 4096
+full = random_experts(H, I, 6, torch.bfloat16, "cuda")    # (gate, up, down) each
+base, groups = full[0], [full[1:3], full[3:4], full[4:6]]  # E = 2, 1, 2 experts per group
+zeros = [1, 0, 0]                                         # Z: one zero expert in group 0
+router = torch.randn(3 + sum(len(g) + z for g, z in zip(groups, zeros)), H, dtype=torch.bfloat16, device="cuda") * H**-0.5
+moe = HierDeltaMoE.from_experts(base, groups, router, zeros, top_k=1, group_top_k=None, shared_base=False)
+
+x = torch.randn(32, H, dtype=torch.bfloat16, device="cuda")
+y = moe.forward_param(x)  # the fused Triton kernel on CUDA; differentiable (Triton backward with triton_train)
+```
+
+`from_experts` takes the full experts $\theta_{ij}$ and stores $\Delta_{ij}=\theta_{ij}-W_b$. To start from shapes
+instead, use `HierDeltaMoE(hidden, inter, group_sizes, group_zeros, top_k, group_top_k, shared_base=...)` and load
+`gate`/`up`/`down`, `d_gate`/`d_up`/`d_down` and `router.weight`.
+
 **Implementation.** `topk` flattens the routing into ordinary `DeltaMoE` slots: per token $S\cdot k_1$ slots
 ($S=G$ dense, else $k_0$) weighted $h_i\tilde p_{ij}$, plus, with `shared_base`, one base slot of weight 1; a picked zero expert becomes a base
 slot of weight 0. Every `DeltaMoE` forward (materialised, split, grouped, fused Triton) and the Triton training path
@@ -52,3 +73,18 @@ zero (uniform), to be trained. The text config gets `hier_delta_moe` (groups, si
 merge). Tensors are streamed from the safetensors shards and written in shards (`--shard-gb`), so memory stays at a
 few tensors. `tests/test_qwen3_5_hier_delta_moe.py` converts a tiny model with perturbed fine-tunes and compares its
 logits with the stock dense model running the ensemble of the fine-tunes' full MLPs.
+
+## Serving with vLLM
+
+`vllm_plugin.py` is a vLLM general plugin (entry point in `pyproject.toml`): with the package installed in vLLM's
+environment, vLLM serves a converted checkpoint as it is, with no materialisation, every decoder MLP a
+`HierDeltaMoE` on the fused Triton kernel:
+
+```bash
+vllm serve DST --tensor-parallel-size 2
+```
+
+Tensor parallelism splits the intermediate dimension ($W_g$, $W_u$ and their deltas by rows, $W_d$ and its deltas by
+columns), the router is replicated, and an all-reduce sums the down projections. torch.compile and CUDA graphs work
+(the kernel is one custom op). Dense deltas only. Checked with vLLM 0.29.0 on the synthetic Qwen3.8-27B upscale (3
+fine-tunes in 2 groups, random routers), TP=2 on H200: coherent greedy output; per rank 74.6 GiB of weights.

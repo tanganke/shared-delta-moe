@@ -1,17 +1,19 @@
-"""Upscale a dense Qwen3.5 / Qwen3.8 base and its domain fine-tunes into the HierDeltaMoE layout of modeling.py.
+r"""Upscale a dense Qwen3.5 / Qwen3.8 base and its domain fine-tunes into the HierDeltaMoE layout of ``modeling.py``.
 
-One group per domain; each fine-tune's decoder MLP becomes an expert theta_ij of its group, stored as W_b (the base
-MLP) and Delta_ij = theta_ij - W_b (subtracted in float32, stored in the checkpoint dtype). Every other tensor
-(attention, linear attention, norms, embeddings, lm_head, vision tower, MTP) is merged from the fine-tunes with a
-merging.MERGE method (default simple_average). Routers start at zero: uniform over groups and within each group. With
-shared_base off (the default) and one expert per group, no zero experts and dense group routing, each layer's MLP is
-then the plain average of the fine-tunes' MLPs.
+One group per domain; each fine-tune's decoder MLP becomes an expert :math:`\theta_{ij}` of its group, stored as
+:math:`W_b` (the base MLP) and :math:`\Delta_{ij} = \theta_{ij} - W_b` (subtracted in float32, stored in the checkpoint
+dtype). Every other tensor (attention, linear attention, norms, embeddings, ``lm_head``, vision tower, MTP) is merged
+from the fine-tunes with a ``merging.MERGE`` method (default ``simple_average``). Routers start at zero: uniform over
+groups and within each group. With ``shared_base`` off (the default), one expert per group, no zero experts and dense
+group routing, each layer's MLP is then the plain average of the fine-tunes' MLPs.
 
-    python -m shared_delta_moe.models.qwen3_5.qwen3_5_hier_delta_moe.convert BASE DST \\
-        --group medical=FT1,FT2 --group code=FT3 [--zeros 0] [--top-k 1] [--group-top-k K] [--shared-base] \\
+Usage::
+
+    python -m shared_delta_moe.models.qwen3_5.qwen3_5_hier_delta_moe.convert BASE DST \
+        --group medical=FT1,FT2 --group code=FT3 [--zeros 0] [--top-k 1] [--group-top-k K] [--shared-base] \
         [--merge ties_merging --merge-arg scaling_factor=0.3 --merge-arg threshold=20]
 
-Tensors are streamed one at a time from the safetensors shards and written in shards of --shard-gb.
+Tensors are streamed one at a time from the safetensors shards and written in shards of ``--shard-gb``.
 """
 
 import argparse
@@ -89,9 +91,27 @@ class _Writer:
 def convert(base: Source, groups: dict[str, Sequence[Source]], dst: Path, zeros: Sequence[int], top_k: int = 1,
             group_top_k: int | None = None, shared_base: bool = False, merge: str = "simple_average",
             merge_args: dict[str, Any] | None = None, shard_gb: float = 5.0,
-            log: Callable[[str], None] = print) -> dict[str, Any]:  # fmt: skip
-    """Write the converted tensors to dst (config and tokenizer files are main's job); returns the hier_delta_moe
-    config entry."""
+            log: Callable[[str], None] = print, router_std: float = 0.0) -> dict[str, Any]:  # fmt: skip
+    r"""Write the converted tensors to ``dst`` (config and tokenizer files are ``main``'s job).
+
+    Args:
+        base: the dense base checkpoint; its decoder MLP is :math:`W_b`.
+        groups: domain name -> its fine-tunes, one expert each, in order.
+        dst: output directory (created if missing).
+        zeros: zero experts per group.
+        top_k: experts per group.
+        group_top_k: groups per token; None = dense group routing.
+        shared_base: add the base MLP with weight 1.
+        merge: a ``merging.MERGE`` method for every non-MLP tensor.
+        merge_args: keyword arguments of the merge method.
+        shard_gb: output shard size in GiB.
+        log: progress messages.
+        router_std: > 0 draws the routers from :math:`\mathcal{N}(0, \sigma^2)`, :math:`\sigma` = ``router_std``
+            (seeded per layer) instead of zero, for tests.
+
+    Returns:
+        The ``hier_delta_moe`` config entry.
+    """
     names = list(groups)
     tuned = [s for n in names for s in groups[n]]
     assert len(zeros) == len(names) and all(groups[n] for n in names)
@@ -131,7 +151,10 @@ def convert(base: Source, groups: dict[str, Sequence[Source]], dst: Path, zeros:
             w.add(f"{prefix}.d_{p}", d.to(b.dtype))
             if p == "gate":
                 rows = len(names) + sum(len(groups[n]) + z for n, z in zip(names, zeros))
-                w.add(f"{prefix}.router.weight", b.new_zeros(rows, b.shape[1]))
+                rt = torch.zeros(rows, b.shape[1])
+                if router_std:
+                    rt.normal_(std=router_std, generator=torch.Generator().manual_seed(len(done)))
+                w.add(f"{prefix}.router.weight", rt.to(b.dtype))
         log(f"{prefix}: {len(tuned)} experts in {len(names)} groups")
     w.close()
     return {"groups": names, "group_sizes": [len(groups[n]) for n in names], "group_zeros": list(zeros),

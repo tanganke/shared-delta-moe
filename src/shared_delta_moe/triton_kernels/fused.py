@@ -227,7 +227,7 @@ def _set_blocks(nargs):
     """TMA descriptors take the box shape of the config being launched (autotune pre_hook)."""
     bm, bn, bk = nargs["BM"], nargs["BN"], nargs["BK"]
     for name, shape in (("wg_desc", [bn, bk]), ("wu_desc", [bn, bk]), ("w_desc", [bn, bk]), ("h_desc", [bm, bk]),
-                        ("dg_desc", [1, bn, bk]), ("du_desc", [1, bn, bk]), ("d_desc", [1, bn, bk])):  # fmt: skip
+                        ("x_desc", [bm, bk]), ("dg_desc", [1, bn, bk]), ("du_desc", [1, bn, bk]), ("d_desc", [1, bn, bk])):  # fmt: skip
         if nargs.get(name) is not None:
             nargs[name].block_shape = shape
 
@@ -289,14 +289,15 @@ _KEY = ["N", "K", "P_BUCKET", "TOPK", "MODE", "B", "S", "TMA"]
 @triton.jit
 def _gate_up_kernel(
     x_ptr, perm_ptr, gstart_ptr, wg_ptr, wu_ptr, dg_ptr, du_ptr, pg_ptr, pu_ptr, mg_ptr, mu_ptr, h_ptr,
-    wg_desc, wu_desc, dg_desc, du_desc,
+    x_desc, wg_desc, wu_desc, dg_desc, du_desc,
     N, K, G, P_BUCKET, MW,
     sxm, sxk, swn, swk, sun, suk, sdg, sdn, sdk, seg, sen, sek, shm, shn,
     TOPK: tl.constexpr, MODE: tl.constexpr, B: tl.constexpr, S: tl.constexpr, GP: tl.constexpr, TMA: tl.constexpr,
     MWP: tl.constexpr,
     BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, OCC: tl.constexpr, GROUP_M: tl.constexpr,
 ):  # fmt: skip
-    """sw* / su*: strides of W_g / W_u; sd* / se*: of D_g / D_u (dense mode)."""
+    """sw* / su*: strides of W_g / W_u; sd* / se*: of D_g / D_u (dense mode). TMA: x_desc over x gathered in sorted
+    pair order (rows past the group's end belong to the next group: computed, not stored)."""
     lo, hi, mt, mend, MT = _groups(gstart_ptr, G, BM, GP)
     NT = tl.cdiv(N, BN)
     ks = tl.arange(0, BK)
@@ -329,11 +330,12 @@ def _gate_up_kernel(
             kmask = kk < K
             wmask = cmask[:, None] & kmask[None, :]
             dmask = dcols[:, None] & kmask[None, :]
-            a = tl.load(x_ptr + tok.to(tl.int64)[:, None] * sxm + kk[None, :] * sxk, mask=rmask[:, None] & kmask[None, :], other=0.0)
             if TMA:  # out-of-bounds boxes read as zeros: ragged N / K, and the zero expert (g = G) in the deltas
+                a = x_desc.load([row0, k0])
                 wg = wg_desc.load([ni * BN, k0])
                 wu = wu_desc.load([ni * BN, k0])
             else:
+                a = tl.load(x_ptr + tok.to(tl.int64)[:, None] * sxm + kk[None, :] * sxk, mask=rmask[:, None] & kmask[None, :], other=0.0)
                 wg = tl.load(wg_ptr + cols[:, None] * swn + kk[None, :] * swk, mask=wmask, other=0.0)
                 wu = tl.load(wu_ptr + cols[:, None] * sun + kk[None, :] * suk, mask=wmask, other=0.0)
             if MODE == 0 and TMA:
@@ -578,7 +580,8 @@ def gate_up(x: Tensor, r: Routing, wg: Tensor, wu: Tensor, dg: Delta, du: Delta,
     h = torch.empty(P, N, dtype=x.dtype, device=x.device)
     grid, _ = _grid(x.device, P, G, N, 1)
     tma = dg.mode == 0 and _tma(P, wg, wu, dg.d, du.d)  # DARE: pointer loads (TMA on W_b alone: 2.3x slower, H200)
-    descs = (_desc(wg), _desc(wu), *((_desc(dg.d), _desc(du.d)) if dg.mode == 0 else (None, None))) if tma else (None,) * 4
+    # TMA: x gathered into sorted pair order first (P x K, a few % of the GEMM), so its tiles come in by TMA too
+    descs = (_desc(x[r.perm // r.top_k]), _desc(wg), _desc(wu), _desc(dg.d), _desc(du.d)) if tma else (None,) * 5
     with torch.cuda.device(x.device):
         _launch(_gate_up_kernel, grid, config,
             x, r.perm, r.gstart, wg, wu, dg.d, du.d, dg.ptrs()[0], du.ptrs()[0], dg.ptrs()[1], du.ptrs()[1], h, *descs,

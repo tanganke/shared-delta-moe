@@ -63,3 +63,10 @@ Command-line tools (`python -m <module> --help`).
 
 .. automodule:: shared_delta_moe.models.qwen3_5.qwen3_5_hier_delta_moe.convert
 ```
+
+## vLLM
+
+```{eval-rst}
+.. automodule:: shared_delta_moe.vllm_plugin
+   :members:
+```

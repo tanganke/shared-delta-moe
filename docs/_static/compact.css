@@ -1,0 +1,9 @@
+/* Denser than Furo's default: 14px base (Furo sizes in rem / em), a wider text column for the speed tables, and
+   tighter vertical spacing. */
+html { font-size: 87.5%; }
+.content { width: 58em; }
+article { line-height: 1.5; }
+article p, article ul, article ol, article dl { margin-top: 0.5em; margin-bottom: 0.5em; }
+article h2 { margin-top: 1.5em; }
+article h3 { margin-top: 1.2em; }
+article table.docutils td, article table.docutils th { padding: 0.15rem 0.5rem; }
