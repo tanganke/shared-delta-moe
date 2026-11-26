@@ -30,6 +30,7 @@ nvcc needed; without it (or after an edit of ``packed_moe.cu``, until rebuilt), 
 ``SHARED_DELTA_MOE_CUDA=0``, everything runs on Triton.
 """
 
+import functools
 import hashlib
 import os
 from pathlib import Path
@@ -41,7 +42,7 @@ MAX_PAIRS = 16  # H200, hidden 2560, inter 9216, 5 deltas: CUDA wins up to 16 (t
 ENABLED = os.environ.get("SHARED_DELTA_MOE_CUDA", "1") != "0"
 DIR = Path(os.environ.get("SHARED_DELTA_MOE_CUDA_DIR", Path.home() / ".cache" / "shared_delta_moe" / "cuda"))
 SRC = Path(__file__).with_name("packed_moe.cu")
-HASH = hashlib.sha256(SRC.read_bytes()).hexdigest()[:12]
+HASH = hashlib.sha256(SRC.read_bytes()).hexdigest()[:12] if SRC.exists() else "nosrc"
 LIB = DIR / f"sdm_packed-{torch.__version__}-{HASH}.so"  # never a stale build
 ARCHS = ("90a",)  # sm_90 only: the layout wants Hopper's 227 KB of shared memory per CTA
 
@@ -83,7 +84,10 @@ def supports(x: Tensor, pairs: int, base: tuple[Tensor, Tensor, Tensor], deltas)
     d = deltas[0]
     if not (d.mode in (1, 2) and 0 < pairs <= MAX_PAIRS and x.is_cuda and x.dtype in (torch.bfloat16, torch.float16)):
         return False
-    if torch.cuda.get_device_capability(x.device) != (9, 0) or x.shape[1] % 64 or base[0].shape[0] % 64:
+    if not available():  # first: unbuilt or disabled costs nothing more per call
+        return False
+    cap, smax = _device(x.device.index if x.device.index is not None else torch.cuda.current_device())
+    if cap != (9, 0) or x.shape[1] % 64 or base[0].shape[0] % 64 or x.contiguous().data_ptr() % 16:
         return False
     extra = (torch.int64, torch.int32) if d.mode == 1 else (x.dtype, torch.int32)  # (p, m) or (scales, sign words)
     if any(dl.mode != d.mode or dl.d.numel() == 0 for dl in deltas) or deltas[1].block != d.block:  # one gate/up block
@@ -97,10 +101,15 @@ def supports(x: Tensor, pairs: int, base: tuple[Tensor, Tensor, Tensor], deltas)
     for dl in deltas:
         if dl.mode == 1 and (dl.block < 8 or dl.block & (dl.block - 1)) or dl.mode == 2 and dl.block and dl.block < 32:
             return False
-    smax = torch.cuda.get_device_properties(x.device).shared_memory_per_block_optin
     g = d.p.shape[0]
-    fits = _smem(d.mode, 2, g, pairs, d.block) <= smax and _smem(d.mode, 1, g, pairs, deltas[2].block) <= smax
-    return fits and available()
+    return _smem(d.mode, 2, g, pairs, d.block) <= smax and _smem(d.mode, 1, g, pairs, deltas[2].block) <= smax
+
+
+@functools.cache
+def _device(index: int) -> tuple[tuple[int, int], int]:
+    """(compute capability, opt-in shared memory per block) of a CUDA device."""
+    p = torch.cuda.get_device_properties(index)
+    return (p.major, p.minor), p.shared_memory_per_block_optin
 
 
 def _smem(mode: int, mats: int, g: int, pairs: int, block: int) -> int:

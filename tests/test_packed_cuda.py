@@ -79,10 +79,13 @@ def test_other_gpus_fall_back(monkeypatch):
     d = BitDeltaMoE.from_delta_moe(m, "row")
     args = (x[:4], 8, (d.gate, d.up, d.down), d._kernel_deltas())
     assert packed_ops.supports(*args)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (8, 0))
+    monkeypatch.setattr(packed_ops, "_device", lambda i: ((8, 0), 232448))
     assert not packed_ops.supports(*args)
-    d.gate.data = d.gate.data.t().contiguous().t()  # not contiguous
     monkeypatch.undo()
+    buf = torch.empty(x[:4].numel() + 3, dtype=x.dtype, device=x.device)
+    xm = buf[3:].view(4, -1)  # contiguous, not 16-byte aligned
+    assert not packed_ops.supports(xm, *args[1:])
+    d.gate.data = d.gate.data.t().contiguous().t()  # not contiguous
     assert not packed_ops.supports(*args)
 
 
