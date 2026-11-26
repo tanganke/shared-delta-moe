@@ -124,16 +124,26 @@ Loss of SFT experts (4B, answer-letter NLL on 100 validation items per domain):
 
 - Scoring the whole reply measures the shared answer format: every expert gained about 0.28 nats on every MCQ set.
   Score the option letter (`--score last`) or the reply text (`--score content`).
-- Only some experts are better on their own domain than the other experts: medical dialogue ($-2.1$ nats against
-  about 0 for the others), generation, law-exam MCQ and short-answer law. Engineering, history, CS and finance
-  experts are not distinguishable from the others within a standard error, and two seeds of one domain differ as
-  much as two domains (finance: 0.16 nats between seeds, 0.01 between finance and CS).
+- Letter NLL measures confidence, not the argmax, and on 100 items it misled: it showed no own-domain gain for the
+  engineering and history experts, while top-1 accuracy (`acc` in the output) does. Every domain's seed-mean expert
+  is best on its own set (history: 75 % against 62–73 % for the others), and merging engineering, history, CS and
+  finance into one MLP expert costs 4 points on history, as the converted HierDeltaMoE under oracle routing did
+  ($-4.6$). Use accuracy to compare layouts, loss only alongside it.
 - Averaging seeds is as good as the best seed and steadier than any one.
-- Forced routing with the shared tensors averaged over five experts keeps every expert's own-domain gain (within
-  0.03 nats); the dense average of the same five loses 0.65 (medical) and 0.15 (generation), all of it in the MLP.
-  The MLP delta alone keeps the full gain as well. Summing experts hurts almost everywhere.
-- Weight cosine does not predict this: engineering and medical have MLP cosine 0.49, yet only the medical expert is
-  specific.
+- Forced routing with the shared tensors averaged over five experts keeps the experts' own-domain gains; the dense
+  average of the same five loses 14 points on medical dialogue. The MLP delta alone keeps the full gain as well.
+  Summing experts hurts almost everywhere.
+- Weight cosine does not predict function: engineering and medical have MLP cosine 0.49, and both are specific.
+
+Loss of 27B CPT models (literature by department, textbook, drugs):
+
+- Department-specific gains exist but are small (0.006–0.015 nats, under 16 % of the gain), and the average of two
+  department models is within 0.006 of each on its own department: one literature expert is enough.
+- Textbook and drug CPT are orthogonal to the literature CPT (cosine 0.03–0.07) and each only helps its own data,
+  yet a dense merge with them interferes: the plain average keeps 43 % of the drug gain, and the matching
+  coefficients keep the drug gain but make clinical notes worse by 0.07 nats and halve the literature gain. The
+  matching condition only sees each delta's own direction, not what the others cost on its domain. Forced routing
+  keeps 86–95 % of each gain: separate MLP experts.
 
 Loss along and across deltas (4B CPT):
 
