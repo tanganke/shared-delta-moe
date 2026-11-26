@@ -15,12 +15,17 @@ src/shared_delta_moe/models/qwen3_5/qwen3_5_delta_moe/
                                           transformers' Qwen3.5 MoE with DeltaMoE blocks (forward_param): modeling.py
                                           (patches the decoder layer for configs with delta_moe_zero_experts), convert.py
                                           (plain MoE checkpoint -> delta layout)
+src/shared_delta_moe/models/qwen3_5/qwen3_5_hier_delta_moe/
+                                          dense Qwen3.5 / Qwen3.8 with HierDeltaMoE MLPs: modeling.py, convert.py
+                                          (base + domain fine-tunes -> one group per domain, other tensors merged)
+src/shared_delta_moe/merging.py           merge methods for the shared tensors (simple_average, task_arithmetic, ties)
 src/shared_delta_moe/constants.py         HAS_TRITON and the thresholds that pick an implementation
 src/shared_delta_moe/type_hints.py        shape-annotated tensor aliases (T tokens, H hidden, ...)
 src/shared_delta_moe/testing.py           random_experts for tests and benchmarks
 tests/test_delta_moe.py                   every forward == plain MoE, token by token (Triton part needs CUDA)
 tests/test_dare.py                        Philox known-answer, CPU == CUDA masks, bitmap == mask, DARE forwards and gradients
 tests/test_hier.py                        HierDeltaMoE forwards and gradients == the two-level ensemble, token by token
+tests/test_qwen3_5_hier_delta_moe.py     tiny dense Qwen3.5 upscaled == ensemble of its fine-tunes' MLPs
 tests/test_train.py                       the Triton backward == the materialised path (x, router, every weight; Hier)
 tests/test_bitdelta.py                    sign packing, BitDelta scales, forwards == plain MoE, scale gradients, Triton mode 2
 tests/test_qwen3_5_delta_moe.py           tiny Qwen3.5 MoE: converted == stock MoE at top-1, top-2, soft routing
@@ -52,7 +57,7 @@ Details live in `docs/`, one topic per file; this README keeps only the layout, 
 - [dare.md](docs/dare.md): seeded DARE deltas, the mask bitmap, speed
 - [bitdelta.md](docs/bitdelta.md): 1-bit BitDelta deltas (sign bits plus scales), the kernel's mode 2, speed
 - [training.md](docs/training.md): gradients through `forward_param`, the fused Triton backward (`triton_train`), DARE training memory
-- [hier.md](docs/hier.md): the two-level shared delta MoE (`HierDeltaMoE`): groups, dense or top-k group routing, zero experts
+- [hier.md](docs/hier.md): the two-level shared delta MoE (`HierDeltaMoE`): groups, dense or top-k group routing, zero experts; upscaling a dense Qwen3.5 / Qwen3.8 and its domain fine-tunes (`qwen3_5_hier_delta_moe`, merge methods)
 - [qwen3_5.md](docs/qwen3_5.md): Qwen3.5 MoE in transformers with DeltaMoE blocks, checkpoint converter
 - [speed-per-implementation.md](docs/speed-per-implementation.md): every implementation per layer, H200 and RTX 6000 Ada (previous kernel 5522b23)
 - [transformers-decode.md](docs/transformers-decode.md): why the plain MoE looked slow in transformers' `generate()` (`batched_mm` switch) and the fix

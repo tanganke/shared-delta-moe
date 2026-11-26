@@ -9,10 +9,10 @@ from shared_delta_moe import DareDeltaMoE, HierDeltaMoE, mlp, random_experts
 from shared_delta_moe.constants import HAS_TRITON
 
 SIZES, ZEROS = [2, 0, 3], [1, 2, 0]  # a group of only zero experts, a group without any
-CASES = list(itertools.product((1, 2), (None, 1, 2)))  # (k1, k0); k0 None = dense over groups
+CASES = list(itertools.product((1, 2), (None, 1, 2), (True, False)))  # (k1, k0, shared_base); k0 None = dense
 
 
-def make(k1, k0, dtype=torch.float32, device="cpu", hidden=16, inter=24, sizes=SIZES, zeros=ZEROS):
+def make(k1, k0, shared=True, dtype=torch.float32, device="cpu", hidden=16, inter=24, sizes=SIZES, zeros=ZEROS):
     torch.manual_seed(0)
     full = random_experts(hidden, inter, 1 + sum(sizes), dtype, device)
     groups, c = [], 1
@@ -20,12 +20,12 @@ def make(k1, k0, dtype=torch.float32, device="cpu", hidden=16, inter=24, sizes=S
         groups.append(full[c : c + e])
         c += e
     router = torch.randn(len(sizes) + sum(sizes) + sum(zeros), hidden, dtype=dtype, device=device)
-    m = HierDeltaMoE.from_experts(full[0], groups, router, zeros, k1, k0)
+    m = HierDeltaMoE.from_experts(full[0], groups, router, zeros, k1, k0, shared)
     return m, (full[0], groups, router), torch.randn(100, hidden, dtype=dtype, device=device)
 
 
-def reference(src, k1, k0, x, zeros=ZEROS):
-    """y = MLP(x; W_b) + sum_{i in S} h_i sum_{j in top-k1, j a delta} p_ij MLP(x; theta_ij), per token."""
+def reference(src, k1, k0, x, zeros=ZEROS, shared=True):
+    """y = [MLP(x; W_b)] + sum_{i in S} h_i sum_{j in top-k1, j a delta} p_ij MLP(x; theta_ij), per token."""
     base, groups, router = src
     G, out = len(groups), []
     for xt in x:
@@ -33,7 +33,7 @@ def reference(src, k1, k0, x, zeros=ZEROS):
         h = lg[:G].softmax(-1)
         S = range(G) if k0 is None else h.topk(k0).indices.tolist()
         hs = h[list(S)].sum()
-        y, c = mlp(xt[None], *base)[0], G
+        y, c = mlp(xt[None], *base)[0] * shared, G
         for i in range(G):
             w = len(groups[i]) + zeros[i]
             if i in S:
@@ -58,30 +58,31 @@ def forwards(m):
 
 
 def test_forwards_match_ensemble():
-    for k1, k0 in CASES:
-        m, src, x = make(k1, k0)
+    for k1, k0, shared in CASES:
+        m, src, x = make(k1, k0, shared)
         idx, r = m.route(x)
-        assert (idx >= 0).any() and ((idx < 0) & (r != 0)).any(-1).all(), "deltas hit; base slot on every token"
+        assert (idx >= 0).any()
+        assert ((idx < 0) & (r != 0)).any(-1).all() == shared, "a base slot of weight 1 on every token iff shared_base"
         if k0 is None or k0 > 1:
-            assert ((idx[:, :-1] < 0) & (r[:, :-1] == 0)).any(), "a zero expert picked"
-        ref = reference(src, k1, k0, x)
+            assert ((idx < 0) & (r == 0)).any(), "a zero expert picked"
+        ref = reference(src, k1, k0, x, shared=shared)
         for name, f in forwards(m).items():
             if name == "matrix grouped" and not hasattr(torch.nn.functional, "grouped_mm"):
                 continue
-            torch.testing.assert_close(f(x), ref, atol=1e-5, rtol=1e-5, msg=f"{name} k1={k1} k0={k0}")
+            torch.testing.assert_close(f(x), ref, atol=1e-5, rtol=1e-5, msg=f"{name} k1={k1} k0={k0} shared={shared}")
 
 
 def test_gradients_match_ensemble():
     """dL/dx and dL/d every parameter (router, base, deltas) through the trainable forwards equal the ensemble's,
     the ensemble built from the module's own parameters (theta_ij = W_b + Delta_ij)."""
-    for k1, k0 in CASES:
-        m, _, x = make(k1, k0)
+    for k1, k0, shared in CASES:
+        m, _, x = make(k1, k0, shared)
         groups, c = [], 0
         for e in SIZES:
             groups.append([(m.gate + m.d_gate[j], m.up + m.d_up[j], m.down + m.d_down[j]) for j in range(c, c + e)])
             c += e
         src = ((m.gate, m.up, m.down), groups, m.router.weight)
-        fs = {"ensemble": lambda x: reference(src, k1, k0, x)} | {n: forwards(m)[n] for n in ("param", "param split", "matrix loop")}
+        fs = {"ensemble": lambda x: reference(src, k1, k0, x, shared=shared)} | {n: forwards(m)[n] for n in ("param", "param split", "matrix loop")}
         grads = {}
         for name, f in fs.items():
             xg = x.clone().requires_grad_()
@@ -98,6 +99,10 @@ def test_state_dict_roundtrip():
     n = HierDeltaMoE(16, 24, SIZES, ZEROS, 2, None)
     n.load_state_dict(m.state_dict())
     torch.testing.assert_close(n.forward_param(x), m.forward_param(x))
+    # built on the meta device (as transformers' from_pretrained does), then materialised and loaded
+    n = HierDeltaMoE(16, 24, SIZES, ZEROS, 2, None, device="meta").to_empty(device="cpu")
+    n.load_state_dict(m.state_dict())
+    torch.testing.assert_close(n.forward_param(x), m.forward_param(x))
 
 
 def test_triton_matches_materialised():
@@ -106,8 +111,8 @@ def test_triton_matches_materialised():
         print("skipped: no CUDA")
         return
     big = ([3] * 16, [1] * 16)
-    for k1, k0, (sizes, zeros) in [(k1, k0, (SIZES, ZEROS)) for k1, k0 in CASES] + [(2, 8, big), (2, None, big)]:
-        m, src, x = make(k1, k0, torch.bfloat16, "cuda", 128, 256, sizes, zeros)
+    for k1, k0, shared, (sizes, zeros) in [(*c, (SIZES, ZEROS)) for c in CASES] + [(2, 8, True, big), (2, None, False, big)]:
+        m, src, x = make(k1, k0, shared, torch.bfloat16, "cuda", 128, 256, sizes, zeros)
         with torch.no_grad():
             assert m._use_triton(x)
             torch.testing.assert_close(m.forward_param(x), m._forward_param(x), atol=5e-2, rtol=5e-2)  # matches the ensemble in fp32
