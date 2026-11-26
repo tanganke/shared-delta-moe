@@ -43,7 +43,6 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from .. import constants
 from ..constants import (
     GROUPED_DTYPES,
     GROUPED_MIN_PAIRS,
@@ -393,7 +392,7 @@ class DeltaMoE(nn.Module):
     def _use_triton(self, x: Tokens) -> bool:
         """Fused Triton kernels? Triton, CUDA, a ``TRITON_DTYPES`` dtype, a routing sort that fits; with a gradient
         needed only when ``triton_train`` is set (any pair count), else ``TRITON_MIN_PAIRS`` ..
-        ``TRITON_MAX_PAIRS_*`` (token, slot) pairs."""
+        ``TRITON_MAX_PAIRS_*`` (token, slot) pairs (on Hopper with dense deltas no upper limit)."""
         if not (HAS_TRITON and x.is_cuda and x.dtype in TRITON_DTYPES and self.gate.dtype == x.dtype):
             return False  # (weights in another dtype: e.g. an fp32 model under bf16 autocast)
         if pow2(self.top_k) * pow2(self.n_delta + 2) > SORT_ONE_HOT_MAX:
@@ -403,17 +402,13 @@ class DeltaMoE(nn.Module):
             return self.triton_train and hasattr(F, "grouped_mm") and self.gate.shape[0] % 8 == self.gate.shape[1] % 8 == 0
         hopper = torch.cuda.get_device_capability(x.device) >= (9, 0)
         P = x.shape[0] * self.top_k
-        if hopper and P >= constants.DENSE_PREFILL_PAIRS_PER_GROUP * (self.n_delta + 1) and self._dense_prefill(x):
-            return True  # the fused forward takes its grouped-GEMM path here (cuda_kernels/dense_moe.py): no limit
+        if hopper and self._kernel_deltas()[0].mode == 0:
+            # dense deltas: no upper limit, the fused forward goes to its grouped-GEMM path past
+            # DENSE_PREFILL_PAIRS_PER_GROUP * (n_delta + 1) pairs (cuda_kernels/dense_moe.py) when it can, and stays
+            # capturable either way (the materialised loop syncs with the host)
+            return P >= TRITON_MIN_PAIRS
         limit = TRITON_MAX_PAIRS_HOPPER if hopper else TRITON_MAX_PAIRS_OLDER
         return TRITON_MIN_PAIRS <= P <= limit
-
-    def _dense_prefill(self, x: Tokens) -> bool:
-        """Dense deltas that the fused forward's prefill path (``cuda_kernels/dense_moe.py``) takes."""
-        from ..cuda_kernels import dense_moe
-
-        ds = self._kernel_deltas()
-        return ds[0].mode == 0 and dense_moe.supports(x, (self.gate, self.up, self.down), tuple(d.d for d in ds))
 
     def forward_param(self, x: Tokens) -> Tokens:
         r"""MoE forward by parameter aggregation.

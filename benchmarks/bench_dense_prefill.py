@@ -4,7 +4,7 @@ times) and % of H200 peak (989 TFLOPS bf16, 4.8 TB/s).
 python benchmarks/bench_dense_prefill.py [--kernels]   (--kernels: per-kernel breakdown too)
 
 triton   the fused Triton kernels (route, gate_up, down)
-grouped  route + W_b + Delta materialised into scratch + F.grouped_mm (cuda_kernels/dense_moe.py)
+grouped  route + W_b + Delta materialised per call + F.grouped_mm (cuda_kernels/dense_moe.py)
 plain    F.grouped_mm on pre-materialised experts (forward_dense, incl. its routing; not a delta model)
 """
 

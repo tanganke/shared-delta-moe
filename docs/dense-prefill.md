@@ -5,11 +5,11 @@ fused forward (`triton_kernels.fused.fused_moe`, so `forward_param`, the `fused_
 and the vLLM plugin) leaves the Triton GEMMs for `cuda_kernels/dense_moe.py`:
 
 1. The Triton routing sort, as before.
-2. $W_b + \Delta_g$ for every group with rows into a scratch per projection, (G + 1, N, K), with the base in the
+2. $W_b + \Delta_g$ for every group with rows into a buffer per projection, (G + 1, N, K), with the base in the
    last slot for the zero expert. One Triton add per projection; an empty group is skipped on the device, so there is
-   no host sync. The scratch is reused across forwards and layers: 3 · (G + 1) · I · H elements per shape, dtype, device
-   and stream (27B shard in bf16: 1.07 GB), never freed (`dense_moe._SCRATCH.clear()` releases it). It is never
-   allocated during CUDA-graph capture: until it exists for the capturing stream, a captured forward stays on Triton.
+   no host sync. The buffers are allocated per call and freed when it returns (the caching allocator, or a CUDA
+   graph's private pool, owns them): a transient peak of 3 · (G + 1) · I · H elements during the call (27B shard in
+   bf16: 1.07 GB). Reusing them across calls saves nothing measurable (below).
 3. `F.grouped_mm` (CUTLASS on sm90) for gate and up, SiLU · up in torch, `F.grouped_mm` for down, then back to pair
    order (a gather) times the routing weight, the slots summed. These are the materialised forward's own ops, so
    the rounding (g, u, SiLU(g), h, y, routing weight in bf16) is the model's; at 2048 tokens and more the output
@@ -22,8 +22,9 @@ weights costs more than that, and Triton stays.
 
 Inference only (bf16, no input that needs a gradient; fp16 would hit torch's host-synchronising grouped-GEMM
 fallback), contiguous weights. The routing sort's Triton kernel and the add need Triton; no compiled extension is
-needed, so the vLLM image (no nvcc) runs it as is. Since this path has no upper limit, `forward_param` on Hopper no longer falls back to the
-host-synchronising materialised loop past `TRITON_MAX_PAIRS_HOPPER`.
+needed, so the vLLM image (no nvcc) runs it as is. With dense deltas on Hopper, `forward_param` has no upper pair
+limit: past `TRITON_MAX_PAIRS_HOPPER` it stays on the fused forward (grouped path, or Triton when `supports` says
+no) instead of the host-synchronising materialised loop, so a prefill of any size can be captured in a CUDA graph.
 
 ## Measurements
 
@@ -57,6 +58,12 @@ vLLM prefill case):
 The grouped path is 8–40% faster than Triton from the threshold on, and within 10–25% of the plain MoE; the rest is
 the materialisation (27B, 8192 tokens: add 0.45 ms, base copies 0.13 ms) and the elementwise passes (SiLU · up,
 gather, slot sum: ~0.5 ms). `python benchmarks/bench_dense_prefill.py [--kernels]` reproduces the tables.
+
+Per-call buffers against a cache kept across calls (H200, 8192 tokens, grouped path, two alternating runs each,
+device ms from the profiler / wall ms from CUDA events): 27B shard per-call 7.45–8.36 / 8.15–8.24, cached
+8.43–8.50 / 8.23–8.33; flat top-2 per-call 4.46–4.64 / 4.77–4.78, cached 4.65–4.68 / 4.94–5.01. The caching
+allocator hands the same blocks back, so the allocation costs nothing measurable; the peak during the call is the
+same either way (+1.95 GiB and +1.71 GiB including activations).
 
 ## The hand-written CUDA kernel (not kept)
 

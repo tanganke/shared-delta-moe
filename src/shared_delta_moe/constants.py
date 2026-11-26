@@ -17,7 +17,7 @@ GROUPED_MIN_PAIRS = (
 )
 TRITON_DTYPES = (torch.bfloat16, torch.float16)
 TRITON_MIN_PAIRS = 1
-TRITON_MAX_PAIRS_HOPPER = 8192  # sm90+: past this cuBLAS (wgmma) on materialised weights wins
+TRITON_MAX_PAIRS_HOPPER = 8192  # sm90+, packed deltas: past this cuBLAS (wgmma) on materialised weights wins (dense: no limit)
 TRITON_MAX_PAIRS_OLDER = 16384  # Ada and older: the Triton GEMM keeps up with cuBLAS longer
 PARAM_MIN_ROWS = 256  # materialise W_b + Delta_e only for experts with at least this many routed rows
 SORT_ONE_HOT = 16384  # elements of the Triton routing sort's per-chunk one-hot (32768 ran out of shared memory on Ada)
