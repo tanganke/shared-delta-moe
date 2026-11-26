@@ -120,6 +120,21 @@ CPT:
   conv1d channels blown up (taps from about 0 to $\pm 2$–6, impossible for Adam at that lr). Screen every tensor's
   $\max|\Delta|$ against $\max|W|$ before merging; a whole-model cosine hides single channels.
 
+Loss of SFT experts (4B, answer-letter NLL on 100 validation items per domain):
+
+- Scoring the whole reply measures the shared answer format: every expert gained about 0.28 nats on every MCQ set.
+  Score the option letter (`--score last`) or the reply text (`--score content`).
+- Only some experts are better on their own domain than the other experts: medical dialogue ($-2.1$ nats against
+  about 0 for the others), generation, law-exam MCQ and short-answer law. Engineering, history, CS and finance
+  experts are not distinguishable from the others within a standard error, and two seeds of one domain differ as
+  much as two domains (finance: 0.16 nats between seeds, 0.01 between finance and CS).
+- Averaging seeds is as good as the best seed and steadier than any one.
+- Forced routing with the shared tensors averaged over five experts keeps every expert's own-domain gain (within
+  0.03 nats); the dense average of the same five loses 0.65 (medical) and 0.15 (generation), all of it in the MLP.
+  The MLP delta alone keeps the full gain as well. Summing experts hurts almost everywhere.
+- Weight cosine does not predict this: engineering and medical have MLP cosine 0.49, yet only the medical expert is
+  specific.
+
 Loss along and across deltas (4B CPT):
 
 - Along one delta the loss is lowest near $\alpha = 1$: $0.5\,\Delta$ keeps 76 % of the gain, $2\,\Delta$ is worse
@@ -137,7 +152,9 @@ Loss along and across deltas (4B CPT):
 3. Build the loss matrix (every expert on every domain's validation set, scored on the answer, `--score last` for
    MCQ) and group experts whose loss rows are alike; a group's members should each beat the others on their own
    domain, otherwise one expert or a merge serves the group.
-4. Merge shared tensors within a group with `matching_coefficients` rather than a plain average; check the merge and
-   the forced-routing models on the loss matrix.
+4. Merge the shared tensors (a plain average of the SFT experts was enough at 4B; `matching_coefficients` when the
+   deltas are near-orthogonal, as CPT on different sources) and check the forced-routing models on the loss matrix:
+   each should match its expert on its domain.
 5. Seeds of one domain are merged (their $\alpha$ is close to $1/(1 + 2\rho)$, i.e. about 0.5 for three seeds), not
    kept as separate experts: the router has nothing to tell them apart by.
+6. Experts without a specific gain on the loss matrix are merged into one expert, for the same reason.
