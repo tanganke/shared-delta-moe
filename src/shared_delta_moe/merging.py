@@ -1,82 +1,98 @@
-"""Model-merging methods for the parameters an upscaled MoE keeps one copy of (attention, norms, embeddings, ...),
-named and parametrised after ``fusion_bench``'s algorithms. Each takes the base tensor and the fine-tuned tensors (same
-shape) and returns the merged tensor in the base's dtype, computed in float32.
+"""Model merging for the parameters an upscaled MoE keeps one copy of (attention, norms, embeddings, ...), done by
+``fusion_bench`` (extra ``merging``). Each method follows a ``fusion_bench`` algorithm step for step (named and
+parametrised as it) on state dicts: it takes the base state dict and the fine-tuned ones (same keys and shapes) and
+returns the merged state dict in the base's dtypes, computed in float32.
 
-ponytail: per tensor. ``fusion_bench``'s TIES trims over the whole flattened task vector; here each tensor keeps its own
-top threshold. Add a global pass if that difference matters.
+ponytail: the converter merges tensor by tensor (it streams the checkpoints), so TIES trims each tensor at its own
+threshold, where ``fusion_bench``'s ``TiesMergingAlgorithm`` trims the whole flattened model at once. Pass larger
+state dicts (e.g. a whole layer) if that difference matters.
 """
 
-from collections.abc import Callable, Sequence
+import contextlib
+import io
+from collections.abc import Callable, Mapping, Sequence
 
 import torch
 from torch import Tensor
 
+StateDict = Mapping[str, Tensor]
 
-def simple_average(base: Tensor, tuned: Sequence[Tensor]) -> Tensor:
-    r"""Mean of the fine-tuned tensors.
+
+def _f32(sd: StateDict) -> dict[str, Tensor]:
+    return {k: v.float() for k, v in sd.items()}
+
+
+def _like(sd: StateDict, ref: StateDict) -> dict[str, Tensor]:
+    return {k: sd[k].to(ref[k].dtype) for k in ref}
+
+
+def simple_average(base: StateDict, tuned: Sequence[StateDict]) -> dict[str, Tensor]:
+    r"""Mean of the fine-tuned state dicts, :math:`\frac{1}{N} \sum_i \theta_i` (``fusion_bench``'s
+    ``SimpleAverageAlgorithm``: ``state_dict_avg``).
 
     Args:
-        base: the base tensor; only its dtype is used.
-        tuned: the fine-tuned tensors, each shaped like ``base``.
+        base: the base state dict; only its dtypes are used.
+        tuned: the :math:`N` fine-tuned state dicts :math:`\theta_i`, keyed and shaped like ``base``.
 
     Returns:
-        :math:`\frac{1}{N} \sum_i \theta_i` over the :math:`N` fine-tuned tensors :math:`\theta_i`, shaped like
-        ``base``, in ``base``'s dtype (computed in float32).
+        The merged state dict, in ``base``'s dtypes.
     """
-    return torch.stack([t.float() for t in tuned]).mean(0).to(base.dtype)
+    from fusion_bench.utils.state_dict_arithmetic import state_dict_avg
+
+    return _like(state_dict_avg([_f32(s) for s in tuned]), base)
 
 
-def task_arithmetic(base: Tensor, tuned: Sequence[Tensor], scaling_factor: float = 0.3) -> Tensor:
-    r"""Task arithmetic: :math:`\theta_0 + \lambda \sum_i (\theta_i - \theta_0)`, with base :math:`\theta_0`, fine-tuned
-    :math:`\theta_i` and :math:`\lambda` = ``scaling_factor``.
+def task_arithmetic(base: StateDict, tuned: Sequence[StateDict], scaling_factor: float = 0.3) -> dict[str, Tensor]:
+    r"""Task arithmetic, :math:`\theta_0 + \lambda \sum_i (\theta_i - \theta_0)` with base :math:`\theta_0` and
+    :math:`\lambda` = ``scaling_factor`` (``fusion_bench``'s ``task_arithmetic_merge``).
 
     Args:
-        base: the base tensor.
-        tuned: the fine-tuned tensors, each shaped like ``base``.
+        base: the base state dict :math:`\theta_0`.
+        tuned: the fine-tuned state dicts :math:`\theta_i`, keyed and shaped like ``base``.
         scaling_factor: scale of the summed task vectors.
 
     Returns:
-        The merged tensor, shaped like ``base``, in base's dtype (computed in float32).
+        The merged state dict, in ``base``'s dtypes.
     """
-    b = base.float()
-    return (b + scaling_factor * sum(t.float() - b for t in tuned)).to(base.dtype)
+    from fusion_bench.utils.state_dict_arithmetic import state_dict_add, state_dict_mul, state_dict_sub, state_dict_sum
+
+    b = _f32(base)
+    task_vector = state_dict_sum([state_dict_sub(_f32(s), b) for s in tuned])
+    return _like(state_dict_add(b, state_dict_mul(task_vector, scaling_factor)), base)
 
 
-def ties_merging(base: Tensor, tuned: Sequence[Tensor], scaling_factor: float = 0.3, threshold: float = 20,
-                 merge_func: str = "sum") -> Tensor:  # fmt: skip
-    r"""TIES merging: trim, elect sign, merge agreeing values.
-
-    Keeps each task vector's (:math:`\tau_i = \theta_i - \theta_0`, fine-tuned minus base) top ``threshold`` entries
-    by magnitude :math:`|\tau_i|` (at least one), elects a sign per entry (the sign of the sum of the kept values),
-    merges the kept values agreeing with it into :math:`\tau`, and returns :math:`\theta_0 + \lambda \tau` with
-    :math:`\lambda` = ``scaling_factor``.
+def ties_merging(base: StateDict, tuned: Sequence[StateDict], scaling_factor: float = 0.3, threshold: float = 20,
+                 merge_func: str = "sum") -> dict[str, Tensor]:  # fmt: skip
+    r"""TIES merging (``fusion_bench``'s ``TiesMergingAlgorithm``): flattens each task vector
+    :math:`\tau_i = \theta_i - \theta_0`, keeps its top ``threshold`` entries by magnitude, elects a sign per entry,
+    merges the agreeing values into :math:`\tau` and returns :math:`\theta_0 + \lambda \tau`.
 
     Args:
-        base: the base tensor (any shape, 0-dim included).
-        tuned: the fine-tuned tensors, each shaped like ``base``.
-        scaling_factor: scale of the merged task vector.
-        threshold: share of entries kept per task vector, as ``fusion_bench``: a fraction if :math:`\le 1`, else a
-            percentage.
-        merge_func: ``"sum"`` (sum of the agreeing values) or ``"mean"`` (their mean over the task vectors that agree).
+        base: the base state dict :math:`\theta_0`.
+        tuned: the fine-tuned state dicts, keyed and shaped like ``base``.
+        scaling_factor: :math:`\lambda`, scale of the merged task vector.
+        threshold: share of entries kept per task vector: a fraction if :math:`\le 1`, else a percentage; below 100%
+            (``fusion_bench`` fails when nothing is trimmed).
+        merge_func: ``"sum"``, ``"mean"`` or ``"max"``, as ``fusion_bench``.
 
     Returns:
-        The merged tensor, shaped like ``base``, in base's dtype (computed in float32).
+        The merged state dict, in ``base``'s dtypes.
     """
-    b = base.float()
-    tv = torch.stack([t.float() - b for t in tuned]).reshape(len(tuned), -1)  # N, numel (0-dim tensors too)
-    k = max(1, int(tv.shape[1] * (threshold if threshold <= 1 else threshold / 100)))
-    cut = tv.abs().kthvalue(tv.shape[1] - k + 1, dim=1, keepdim=True).values if k < tv.shape[1] else 0
-    tv = tv * (tv.abs() >= cut)
-    agree = (tv.sign() == tv.sum(0).sign()) & (tv != 0)
-    merged = (tv * agree).sum(0)
-    if merge_func == "mean":
-        merged = merged / agree.sum(0).clamp_min(1)
-    else:
-        assert merge_func == "sum", merge_func
-    return (b + scaling_factor * merged.view_as(b)).to(base.dtype)
+    from fusion_bench.method.ties_merging.ties_merging_utils import (
+        state_dict_to_vector,
+        ties_merging,
+        vector_to_state_dict,
+    )
+
+    b = _f32(base)
+    flat_ptm = state_dict_to_vector(b)
+    tv_flat_checks = torch.vstack([state_dict_to_vector(_f32(s)) for s in tuned]) - flat_ptm
+    with contextlib.redirect_stdout(io.StringIO()):  # it prints two lines per call; the converter calls it per tensor
+        merged_tv = ties_merging(tv_flat_checks, reset_thresh=threshold, merge_func=merge_func)
+    return _like(vector_to_state_dict(flat_ptm + scaling_factor * merged_tv, b), base)
 
 
-MERGE: dict[str, Callable[..., Tensor]] = {
+MERGE: dict[str, Callable[..., dict[str, Tensor]]] = {
     "simple_average": simple_average,
     "task_arithmetic": task_arithmetic,
     "ties_merging": ties_merging,

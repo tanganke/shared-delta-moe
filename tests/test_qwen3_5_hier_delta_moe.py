@@ -16,7 +16,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
 sys.path.insert(0, str(Path(__file__).parent))
 from test_hier import reference  # noqa: E402
 
-from shared_delta_moe.merging import task_arithmetic, ties_merging  # noqa: E402
+from shared_delta_moe.merging import simple_average, task_arithmetic, ties_merging  # noqa: E402
 from shared_delta_moe.models.qwen3_5.qwen3_5_hier_delta_moe import Qwen3_5HierDeltaMoeBlock  # noqa: E402
 from shared_delta_moe.models.qwen3_5.qwen3_5_hier_delta_moe.convert import main as convert_main  # noqa: E402
 
@@ -92,19 +92,27 @@ def test_converted_matches_ensemble():
 
 
 def test_merge_methods():
+    """The fusion_bench calls behind merging.py, on a state dict of a matrix and a 0-dim tensor in bf16 (merged in
+    fp32, returned in bf16)."""
     torch.manual_seed(0)
-    b = torch.randn(64, 32)
-    ts = [b + torch.randn_like(b) for _ in range(3)]
-    tv = torch.stack([t - b for t in ts])
-    torch.testing.assert_close(task_arithmetic(b, ts, 0.5), b + 0.5 * tv.sum(0))
-    # threshold 100: no trimming; the elected sign is that of the sum; mean over the agreeing entries
-    agree = (tv.sign() == tv.sum(0).sign()).float()
-    want = b + 0.3 * (tv * agree).sum(0) / agree.sum(0).clamp_min(1)
-    torch.testing.assert_close(ties_merging(b, ts, 0.3, 100, "mean"), want)
-    # threshold 10: at most ~10% of each task vector survives
-    for th in (10, 0.1):  # a percentage, or a fraction (<= 1) as in fusion_bench
+    b = {"w": torch.randn(64, 32, dtype=torch.bfloat16), "s": torch.tensor(0.5, dtype=torch.bfloat16)}
+    ts = [{k: v + torch.randn_like(v) for k, v in b.items()} for _ in range(3)]
+    tv = {k: torch.stack([t[k].float() - v.float() for t in ts]) for k, v in b.items()}
+    for k, v in task_arithmetic(b, ts, 0.5).items():
+        assert v.dtype == torch.bfloat16 and v.shape == b[k].shape
+        torch.testing.assert_close(v, (b[k].float() + 0.5 * tv[k].sum(0)).bfloat16())
+    for k, v in simple_average(b, ts).items():
+        torch.testing.assert_close(v, torch.stack([t[k].float() for t in ts]).mean(0).bfloat16())
+    # one task vector, scale 1: the kept entries are its largest, unchanged; about threshold of them survive
+    for th in (10, 0.1):  # a percentage, or a fraction (<= 1), as in fusion_bench
         one = ties_merging(b, ts[:1], 1.0, th)
-        assert 0.08 < ((one - b) != 0).float().mean() < 0.12, th
+        d = one["w"].float() - b["w"].float()
+        kept = d != 0
+        assert 0.08 < kept.float().mean() < 0.12, th
+        torch.testing.assert_close(d[kept], (ts[0]["w"].float() - b["w"].float())[kept], atol=0.02, rtol=0.02)
+        assert tv["w"][0].abs()[kept].min() >= tv["w"][0].abs()[~kept].max(), th
+    m = ties_merging(b, ts, 0.3, 20, "mean")
+    assert all(m[k].dtype == torch.bfloat16 and m[k].shape == b[k].shape for k in b)
 
 
 class Dict:

@@ -9,6 +9,7 @@ dependencies = ["torch"]
 [project.optional-dependencies]
 triton = ["triton"]
 transformers = ["transformers>=5.13"]
+merging = ["fusion-bench>=0.2.33"]  # merging.py, the HierDeltaMoE converter
 
 [project.entry-points."vllm.general_plugins"]
 shared_delta_moe = "shared_delta_moe.vllm_plugin:register"
@@ -19,6 +20,7 @@ dev = [
     "mypy",
     "black",
     "transformers==5.16.1",
+    "fusion-bench>=0.2.33",
 ]
 docs = ["sphinx", "myst-parser", "furo", "sphinxcontrib-mermaid>=2.1.1"]
 

@@ -22,7 +22,7 @@ src/shared_delta_moe/models/qwen3_5/qwen3_5_delta_moe/
 src/shared_delta_moe/models/qwen3_5/qwen3_5_hier_delta_moe/
                                           dense Qwen3.5 / Qwen3.8 with HierDeltaMoE MLPs: modeling.py, convert.py
                                           (base + domain fine-tunes -> one group per domain, other tensors merged)
-src/shared_delta_moe/merging.py           merge methods for the shared tensors (simple_average, task_arithmetic, ties)
+src/shared_delta_moe/merging.py           merge methods for the shared tensors: fusion_bench calls (extra merging)
 src/shared_delta_moe/constants.py         HAS_TRITON and the thresholds that pick an implementation
 src/shared_delta_moe/type_hints.py        shape-annotated tensor aliases (T tokens, H hidden, ...)
 src/shared_delta_moe/testing.py           random_experts for tests and benchmarks

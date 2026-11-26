@@ -3,7 +3,7 @@ r"""Upscale a dense Qwen3.5 / Qwen3.8 base and its domain fine-tunes into the Hi
 One group per domain; each fine-tune's decoder MLP becomes an expert :math:`\theta_{ij}` of its group, stored as
 :math:`W_b` (the base MLP) and :math:`\Delta_{ij} = \theta_{ij} - W_b` (subtracted in float32, stored in the checkpoint
 dtype). Every other tensor (attention, linear attention, norms, embeddings, ``lm_head``, vision tower, MTP) is merged
-from the fine-tunes with a ``merging.MERGE`` method (default ``simple_average``). Routers start at zero: uniform over
+from the fine-tunes with a ``merging.MERGE`` method (``fusion_bench``, extra ``merging``; default ``simple_average``). Routers start at zero: uniform over
 groups and within each group. With one expert per group, no zero experts and dense group routing, each layer's MLP is
 then the plain average of the fine-tunes' MLPs; a zero expert is the base MLP.
 
@@ -85,7 +85,7 @@ def convert(base: Source, groups: dict[str, Sequence[Source]], dst: Path, zeros:
         if m is None:
             b = base.get(k)
             ts = [s.get(k) for s, h in zip(tuned, have) if k in h]
-            w.add(k, merge_fn(b, ts, **kw) if b.is_floating_point() and ts else b)
+            w.add(k, merge_fn({k: b}, [{k: t} for t in ts], **kw)[k] if b.is_floating_point() and ts else b)
             continue
         prefix = m[1]
         if prefix in done:

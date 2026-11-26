@@ -59,8 +59,9 @@ model = Qwen3_5ForConditionalGeneration.from_pretrained(DST)  # or Qwen3_5ForCau
 One group per domain; each fine-tune's decoder MLP becomes an expert of its group ($\Delta_{ij}=\theta_{ij}-W_b$,
 subtracted in fp32), `BASE`'s MLP is $W_b$. Every other tensor (attention, linear attention, norms, embeddings,
 `lm_head`, vision tower, MTP) is merged across the fine-tunes that have it with a method of `merging.py` (a
-tensor no fine-tune has, like Qwen3.8's `mtp.*` that transformers drops on load, is kept from the base), named and parametrised
-after fusion_bench (`simple_average` default; TIES trims per tensor, not over the whole task vector). Routers start at
+tensor no fine-tune has, like Qwen3.8's `mtp.*` that transformers drops on load, is kept from the base). The methods
+call fusion_bench (install the `merging` extra: `pip install -e ".[transformers,merging]"`), with its names and
+arguments (`simple_average` default; TIES trims per tensor, not over the whole task vector). Routers start at
 zero (uniform), to be trained. The text config gets `hier_delta_moe` (groups, sizes, zeros, top-k,
 merge). Tensors are streamed from the safetensors shards and written in shards (`--shard-gb`), so memory stays at a
 few tensors. `tests/test_qwen3_5_hier_delta_moe.py` converts a tiny model with perturbed fine-tunes and compares its
