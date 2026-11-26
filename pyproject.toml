@@ -17,6 +17,7 @@ dev = [
     "black",
     "transformers==5.16.1",
 ]
+docs = ["sphinx", "myst-parser", "furo"]
 
 [build-system]
 requires = ["hatchling"]

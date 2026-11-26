@@ -3,9 +3,11 @@ the input dimension), rescaled by 1/keep; only the kept values are stored. The m
 (seed, expert, projection, position) through Philox4x32-10, pure 32-bit integer arithmetic, so it regenerates
 bit for bit on any device.
 
-Mask spec, for projection j (0 gate, 1 up, 2 down) of delta e, an (R, C) matrix, block size B dividing C:
+Mask spec, for projection j (0 gate, 1 up, 2 down) of delta e, an (R, C) matrix, block size B dividing C::
+
   unit u = row * (C / B) + col // B,  counter = (u, 3e + j, 0, 0),  key = (seed mod 2^32, seed >> 32)
   kept  <=>  word 0 of Philox4x32-10(counter, key) < round(keep * 2^32)
+
 Kept values are stored row-major, expert by expert, as Delta / keep in the model dtype; p_<proj> (N, R) holds where
 each row starts. The fused kernel and the materialised (training) path read the mask as a bitmap (mask_bits: 1 bit per
 block, built once per model and kept as a non-persistent buffer) rather than running Philox each time: rows x C / B
@@ -161,6 +163,8 @@ class DareDeltaMoE(DeltaMoE):
     def from_delta_moe(
         cls, m: DeltaMoE, keep: float, block: int = 1, seed: int = 0
     ) -> "DareDeltaMoE":
+        """DARE form of a DeltaMoE (same base, router, top-k and zero experts): each delta keeps the fraction `keep`
+        of its 1 x `block` blocks chosen by `seed`, rescaled by 1 / keep. A HierDeltaMoE is refused."""
         from .hier import HierDeltaMoE
 
         if isinstance(m, HierDeltaMoE):

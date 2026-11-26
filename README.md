@@ -49,7 +49,17 @@ y = m.forward_param(x)   # or forward_matrix(x); forward_dense(x, m.dense_expert
 
 ## Docs
 
-Details live in `docs/`, one topic per file; this README keeps only the layout, setup and this index.
+Details live in `docs/`, a Sphinx site: guide pages in MyST Markdown, one topic per file, and an API reference
+(`docs/api.md`) generated from the docstrings. This README keeps only the layout, setup and this index.
+
+```bash
+uv run --group docs --extra transformers sphinx-build -W -b html docs docs/_build/html   # open docs/_build/html/index.html
+```
+
+- A new page goes into a toctree in `docs/index.md` (and this list); a new public module into `docs/api.md`.
+- Docstrings are reStructuredText (Sphinx's default): aligned blocks after `::` and a blank line, `|x|` as
+  ``` ``|x|`` ```. The build runs with `-W`, so a malformed docstring or a page missing from a toctree fails it.
+
 
 - [design.md](docs/design.md): the delta form, zero experts, routing, what is and is not equivalent, `from_experts`, dtypes
 - [forwards.md](docs/forwards.md): `forward_param` / `forward_matrix` / `forward_dense` and how an implementation is picked
@@ -61,3 +71,4 @@ Details live in `docs/`, one topic per file; this README keeps only the layout, 
 - [qwen3_5.md](docs/qwen3_5.md): Qwen3.5 MoE in transformers with DeltaMoE blocks, checkpoint converter
 - [speed-per-implementation.md](docs/speed-per-implementation.md): every implementation per layer, H200 and RTX 6000 Ada (previous kernel 5522b23)
 - [transformers-decode.md](docs/transformers-decode.md): why the plain MoE looked slow in transformers' `generate()` (`batched_mm` switch) and the fix
+- [api.md](docs/api.md): API reference, generated from the docstrings (models, merging, Triton kernels, Qwen3.5 blocks, checkpoint converters)

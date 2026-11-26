@@ -4,7 +4,7 @@ Routed expert e has weights W_e = W_b + Delta_e for each of gate, up and down. R
 deltas; rows n .. n+Z-1 are zero experts (num_zero_experts = Z, default 1): no parameters, each stands for the base
 MLP itself. Routing is softmax, top-k, renormalised over the k picks (weights r). Both forms below equal the plain MoE
 sum_i r_i MLP(x; W_{e_i})  with experts [W_b + Delta_1, ..., W_b + Delta_n] + [W_b] * Z; they differ only in where
-the addition happens:
+the addition happens::
 
   forward_param   parameter aggregation: per expert, materialise W_b + Delta_e once and run one MLP on the
                   (token, slot) pairs routed to it, weighted by r (small groups skip the materialisation)

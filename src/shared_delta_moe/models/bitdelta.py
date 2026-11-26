@@ -1,7 +1,7 @@
 """BitDelta deltas (Liu et al. 2024, "BitDelta: Your Fine-Tune May Only Be Worth One Bit"): each Delta_e is stored as
 its sign, 1 bit per entry, times a scale: Delta_e ~ diag(s_e) sign(Delta_e). BitDelta takes one scale per matrix,
-mean |Delta_e| (for a fixed sign matrix, the scalar closest to Delta_e in Frobenius norm); scale="row" takes one per
-output row (that row's mean |Delta_e|); an int scale B one per 1 x B block of a row (its mean |Delta_e|, as DARE's
+mean ``|Delta_e|`` (for a fixed sign matrix, the scalar closest to Delta_e in Frobenius norm); scale="row" takes one per
+output row (that row's mean ``|Delta_e|``); an int scale B one per 1 x B block of a row (its mean ``|Delta_e|``, as DARE's
 blocks: R C / B values per matrix). The scales are nn.Parameters, so they can be
 trained afterwards (BitDelta's scale distillation) through the materialised forward; the signs are fixed.
 
@@ -45,7 +45,7 @@ def scale_block(scale: "str | int", cols: int) -> int:
 
 
 def scales(d: Tensor, scale: "str | int") -> Tensor:
-    """(N, R, C) deltas -> (N, R, ceil(C / SB)) scales: mean |Delta| per matrix ("matrix", BitDelta), per row ("row")
+    """(N, R, C) deltas -> (N, R, ceil(C / SB)) scales: mean ``|Delta|`` per matrix ("matrix", BitDelta), per row ("row")
     or per 1 x B block of a row (int B)."""
     a = d.float().abs()
     if scale == "matrix":
@@ -80,6 +80,8 @@ class BitDeltaMoE(DeltaMoE):
     @classmethod
     @torch.no_grad()
     def from_delta_moe(cls, m: DeltaMoE, scale: "str | int" = "matrix") -> "BitDeltaMoE":
+        """BitDelta form of a DeltaMoE (same base, router, top-k and zero experts): each delta's sign bits and its
+        scales, "matrix" (BitDelta), "row" or an int block size (see `scales`)."""
         g = m.gate
         out = cls(g.shape[1], g.shape[0], m.n_delta, m.top_k, m.num_zero_experts, g.device, g.dtype, scale)
         out.router.weight.copy_(m.router.weight)
