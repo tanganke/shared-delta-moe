@@ -1,6 +1,7 @@
 // Decode-size MoE kernels for packed deltas (seeded DARE, BitDelta): see packed_ops.py for the dispatch. Built ahead
 // of time into a plain shared library (python -m shared_delta_moe.cuda_kernels.packed_ops), ops registered as
-// torch.ops.sdm_packed.{gate_up,down}.
+// torch.ops.sdm_packed.{gate_up,down} (parameter aggregation) and {matrix_gate_up,matrix_down} (output
+// aggregation, the kernels at the end of the file).
 //
 // A CTA owns one K range (split-K across CTAs; the warp that finishes a row strip last sums the splits in a fixed
 // order) and holds the routed pairs' activations for it in shared memory; each of its warps owns 16 output rows of
@@ -23,6 +24,7 @@
 #include <torch/library.h>
 
 #include <map>
+#include <type_traits>
 
 namespace {
 
@@ -570,6 +572,349 @@ at::Tensor down(const at::Tensor& h, const at::Tensor& perm, const at::Tensor& g
   return o;
 }
 
+// ------------------------------------------------------------------------------------- output aggregation
+// forward_matrix: x W_b^T comes from cuBLAS (g0 / u0 (T, N) for gate/up, d0 (P, N) sorted for down); these kernels
+// add the deltas' products. The grid's y is the group, the last one the zero expert's, which adds nothing; a CTA
+// whose group has no pairs exits.
+// DARE (dare_kernel): a warp owns one row and its group's pairs in passes of MT, on CUDA cores (20% of the entries
+// are kept; tensor cores would multiply the dropped ones too). The row's kept block indices go to shared memory once
+// (a popcount scan of the bitmap), then each lane takes 8 kept values at a time and the 8 activations they meet.
+// mma_kernel (BitDelta; DARE from about 5 pairs per group): a CTA owns 16 rows, its 8 warps split K, and the pairs
+// are the N side of mma.m16n8k16 in passes of 8. Lane (row r0, quad q) takes entries 8q .. 8q + 7 of each 32-wide K
+// chunk of rows r0 and r0 + 8, and 16 contiguous bytes of its pair's activations there (the k permutation of
+// packed_kernel). BitDelta: byte q of the sign word indexes a 256-entry table of the sign flips of 4 pairs, XORed
+// into the scale. DARE: the 8 entries are kept or dropped together (blocks >= 8); a running popcount of the row's
+// bitmap gives where they sit in the kept values. Partials sum in warp order.
+// Rounded as _forward_matrix_grouped: g = x W_b^T + (x delta^T), both rounded, likewise u and y; h and r y as in the
+// parameter-aggregation epilogue.
+
+__device__ __forceinline__ float to_f(__nv_bfloat16 v) { return __bfloat162float(v); }
+__device__ __forceinline__ float to_f(__half v) { return __half2float(v); }
+
+struct MParams {
+  const void* x;      // gate_up: (T, K) tokens; down: (P, K) h, sorted
+  const int* perm;    // (P,) sorted position -> pair
+  const int* gstart;  // (G + 2,)
+  const float* rw;    // (P,) routing weights (down)
+  const void* b0[2];  // x W_b^T: gate_up (T, N) gate and up; down (P, N) sorted
+  const void* d[2];   // DARE kept values; BitDelta (G, N, K / 32) sign words
+  const void* p[2];   // DARE (G, N) int64 row starts; BitDelta (G, N, nsb) scales
+  const int* m[2];    // DARE (G, N, mw) keep bitmap
+  void* out;          // gate_up: (P, N) h sorted; down: (P, N) r y by pair
+  int N, K, G, topk, mw, nsb, bs, sbs, gather;
+};
+
+// output (sorted pair pr, row n) from the deltas' products dg (and du)
+template <int MATS, typename T>
+__device__ __forceinline__ void epilogue(const MParams& p, int pr, int n, float dg, float du) {
+  T* out = reinterpret_cast<T*>(p.out);
+  const int N = p.N;
+  if (MATS == 2) {
+    const long long i = (long long)(p.perm[pr] / p.topk) * N + n;
+    const float gv = Ty<T>::rnd(to_f(reinterpret_cast<const T*>(p.b0[0])[i]) + Ty<T>::rnd(dg));
+    const float uv = Ty<T>::rnd(to_f(reinterpret_cast<const T*>(p.b0[1])[i]) + Ty<T>::rnd(du));
+    out[(long long)pr * N + n] = Ty<T>::of(Ty<T>::rnd(gv / (1.f + expf(-gv))) * uv);
+  } else {
+    const int pid = p.perm[pr];
+    const float y = Ty<T>::rnd(to_f(reinterpret_cast<const T*>(p.b0[0])[(long long)pr * N + n]) + Ty<T>::rnd(dg));
+    out[(long long)pid * N + n] = Ty<T>::of(y * Ty<T>::rnd(p.rw[pid]));
+  }
+}
+
+__device__ __forceinline__ float2 f2(unsigned v, __nv_bfloat16*) {
+  return make_float2(__uint_as_float(v << 16), __uint_as_float(v & 0xFFFF0000u));
+}
+__device__ __forceinline__ float2 f2(unsigned v, __half*) { return __half22float2(*reinterpret_cast<__half2*>(&v)); }
+template <typename T>
+__device__ __forceinline__ float dot8(uint4 a, uint4 b) {
+  float2 a0 = f2(a.x, (T*)0), a1 = f2(a.y, (T*)0), a2 = f2(a.z, (T*)0), a3 = f2(a.w, (T*)0);
+  float2 b0 = f2(b.x, (T*)0), b1 = f2(b.y, (T*)0), b2 = f2(b.z, (T*)0), b3 = f2(b.w, (T*)0);
+  return a0.x * b0.x + a0.y * b0.y + a1.x * b1.x + a1.y * b1.y + a2.x * b2.x + a2.y * b2.y + a3.x * b3.x + a3.y * b3.y;
+}
+
+template <int MATS, int MT, typename T>
+__global__ void __launch_bounds__(WARPS * 32) dare_kernel(const MParams p) {
+  extern __shared__ __align__(16) unsigned char smem[];
+  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, n = blockIdx.x * WARPS + warp, g = blockIdx.y;
+  const int lo = p.gstart[g], hi = p.gstart[g + 1], N = p.N, K = p.K;
+  if (n >= N || lo == hi) return;
+  const T* x = reinterpret_cast<const T*>(p.x);
+  const int nblk = K >> p.bs;
+  unsigned short* list = reinterpret_cast<unsigned short*>(smem) + warp * MATS * nblk;  // kept blocks
+  int kept[MATS] = {};
+  long long start[MATS] = {};
+  const bool delta = g < p.G;
+  if (delta) {  // both matrices' bitmap words in flight together, then a popcount scan each
+    const int* mrow[MATS];
+#pragma unroll
+    for (int mat = 0; mat < MATS; mat++) {
+      mrow[mat] = p.m[mat] + ((long long)g * N + n) * p.mw;
+      start[mat] = reinterpret_cast<const long long*>(p.p[mat])[(long long)g * N + n];
+    }
+    int base[MATS] = {};
+    for (int w0 = 0; w0 < p.mw; w0 += 32) {
+      const int w = w0 + lane;
+      unsigned bits[MATS];
+#pragma unroll
+      for (int mat = 0; mat < MATS; mat++) bits[mat] = w < p.mw ? __ldg(mrow[mat] + w) : 0u;
+#pragma unroll
+      for (int mat = 0; mat < MATS; mat++) {
+        unsigned b = bits[mat];
+        if (32 * w + 32 > nblk) b &= w * 32 < nblk ? (1u << (nblk - 32 * w)) - 1 : 0u;
+        int c = __popc(b), inc = c;
+#pragma unroll
+        for (int d = 1; d < 32; d <<= 1) {
+          int v = __shfl_up_sync(0xFFFFFFFFu, inc, d);
+          if (lane >= d) inc += v;
+        }
+        int at = base[mat] + inc - c;
+        while (b) {
+          list[mat * nblk + at++] = (unsigned short)(32 * w + __ffs(b) - 1);
+          b &= b - 1;
+        }
+        base[mat] += __shfl_sync(0xFFFFFFFFu, inc, 31);
+      }
+    }
+#pragma unroll
+    for (int mat = 0; mat < MATS; mat++) kept[mat] = base[mat] << p.bs;  // kept entries
+    __syncwarp();
+  }
+  constexpr int UN = 4;  // 8-value chunks per lane in flight
+  for (int t0 = lo; t0 < hi; t0 += MT) {
+    const int nt = min(MT, hi - t0);
+    int xr[MT];
+#pragma unroll
+    for (int t = 0; t < MT; t++) {
+      const int pr = t0 + min(t, nt - 1);
+      xr[t] = (p.gather ? p.perm[pr] / p.topk : pr) * K;
+    }
+    float acc[MATS][MT] = {};
+    if (delta) {
+#pragma unroll
+      for (int mat = 0; mat < MATS; mat++) {
+        const T* v = reinterpret_cast<const T*>(p.d[mat]) + start[mat];
+        for (int e0 = lane * 8; e0 < kept[mat]; e0 += 256 * UN) {
+          uint4 a[UN];
+          int k[UN];
+#pragma unroll
+          for (int u = 0; u < UN; u++) {
+            const int e = e0 + 256 * u;
+            a[u] = e < kept[mat] ? __ldg(reinterpret_cast<const uint4*>(v + e)) : make_uint4(0, 0, 0, 0);
+            k[u] = e < kept[mat] ? list[mat * nblk + (e >> p.bs)] * (1 << p.bs) + (e & ((1 << p.bs) - 1)) : 0;
+          }
+#pragma unroll
+          for (int t = 0; t < MT; t++)
+            if (t < nt)
+#pragma unroll
+              for (int u = 0; u < UN; u++)
+                acc[mat][t] += dot8<T>(a[u], __ldg(reinterpret_cast<const uint4*>(x + xr[t] + k[u])));
+        }
+      }
+#pragma unroll
+      for (int mat = 0; mat < MATS; mat++)
+#pragma unroll
+        for (int t = 0; t < MT; t++)
+          if (t < nt)
+#pragma unroll
+            for (int d = 16; d; d >>= 1) acc[mat][t] += __shfl_xor_sync(0xFFFFFFFFu, acc[mat][t], d);
+    }
+#pragma unroll
+    for (int t = 0; t < MT; t++)
+      if (lane == t && t < nt) epilogue<MATS, T>(p, t0 + t, n, acc[0][t], acc[MATS - 1][t]);
+  }
+}
+
+template <int MODE, int MATS, typename T>
+__global__ void __launch_bounds__(WARPS * 32) mma_kernel(const MParams p) {
+  __shared__ uint4 tab[256];                   // tab[b].j flips the halves of pair j whose bit is clear
+  __shared__ float4 red[WARPS][MATS][32];      // per warp partials
+  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, r0 = lane >> 2, q = lane & 3, g = blockIdx.y;
+  const int lo = p.gstart[g], hi = p.gstart[g + 1], N = p.N, K = p.K, n0 = blockIdx.x * 16;
+  if (lo == hi) return;  // (uniform over the CTA)
+  for (int b = threadIdx.x; b < 256; b += blockDim.x) {
+    unsigned m[4], nb = ~b;
+    for (int j = 0; j < 4; j++) m[j] = (((nb >> (2 * j)) & 1u) << 15) | (((nb >> (2 * j + 1)) & 1u) << 31);
+    tab[b] = make_uint4(m[0], m[1], m[2], m[3]);
+  }
+  __syncthreads();
+  const T* x = reinterpret_cast<const T*>(p.x);
+  const bool delta = g < p.G;
+  const int mw = p.K / 32, per = (mw + WARPS - 1) / WARPS, c_lo = min(mw, warp * per), c_hi = min(mw, c_lo + per);
+  const long long rw0 = (long long)g * N + n0 + r0, rw1 = rw0 + 8;
+  // DARE: per matrix and row half, the bitmap and kept values of the row, and the kept blocks in words [0, cw)
+  const int* mrow[MATS][2];
+  const T* vrow[MATS][2];
+  int cw[MATS][2] = {}, ck[MATS][2] = {};
+  if (MODE == 1 && delta) {
+#pragma unroll
+    for (int mat = 0; mat < MATS; mat++)
+#pragma unroll
+      for (int h = 0; h < 2; h++) {
+        const long long rw = h ? rw1 : rw0;
+        mrow[mat][h] = p.m[mat] + rw * p.mw;
+        vrow[mat][h] = reinterpret_cast<const T*>(p.d[mat]) + reinterpret_cast<const long long*>(p.p[mat])[rw];
+      }
+  }
+  for (int t0 = lo; t0 < hi; t0 += 8) {
+    const int nt = min(8, hi - t0);
+    float acc[MATS][4] = {};
+    if (delta) {
+      const int pr = t0 + min(r0, nt - 1);  // this lane's activation row: pair r0 of the pass
+      const T* xr = x + (long long)(p.gather ? p.perm[pr] / p.topk : pr) * K + 8 * q;
+#pragma unroll 4
+      for (int c = c_lo; c < c_hi; c++) {
+        uint4 b = __ldg(reinterpret_cast<const uint4*>(xr + 32 * c));
+        if (r0 >= nt) b = make_uint4(0, 0, 0, 0);
+#pragma unroll
+        for (int mat = 0; mat < MATS; mat++) {
+          if (MODE == 1) {  // entries 32c + 8q .. + 7 of rows r0, r0 + 8: kept or dropped together (blocks >= 8)
+            const int k = 32 * c + 8 * q, blk = k >> p.bs, wi = blk >> 5;
+            uint4 a[2];
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+              if (wi < cw[mat][h]) cw[mat][h] = 0, ck[mat][h] = 0;  // a new pass: count from the start again
+              while (cw[mat][h] < wi) ck[mat][h] += __popc(__ldg(mrow[mat][h] + cw[mat][h]++));
+              const unsigned wd = __ldg(mrow[mat][h] + wi);
+              const int rank = ck[mat][h] + __popc(wd & ((1u << (blk & 31)) - 1));
+              a[h] = (wd >> (blk & 31)) & 1
+                         ? __ldg(reinterpret_cast<const uint4*>(vrow[mat][h] + ((long long)rank << p.bs) + (k & ((1 << p.bs) - 1))))
+                         : make_uint4(0, 0, 0, 0);
+            }
+            Ty<T>::mma(acc[mat], a[0].x, a[1].x, a[0].y, a[1].y, b.x, b.y);
+            Ty<T>::mma(acc[mat], a[0].z, a[1].z, a[0].w, a[1].w, b.z, b.w);
+            continue;
+          }
+          const unsigned* bits = reinterpret_cast<const unsigned*>(p.d[mat]);
+          const unsigned short* sc = reinterpret_cast<const unsigned short*>(p.p[mat]);
+          const int si = p.sbs >= 0 ? (32 * c) >> p.sbs : 0;
+          const unsigned w0 = __ldg(bits + rw0 * p.mw + c), w1 = __ldg(bits + rw1 * p.mw + c);
+          const unsigned s0 = __ldg(sc + rw0 * p.nsb + si), s1 = __ldg(sc + rw1 * p.nsb + si);
+          const unsigned a0 = s0 | (s0 << 16), a1 = s1 | (s1 << 16);
+          const uint4 m0 = tab[(w0 >> (8 * q)) & 0xFF], m1 = tab[(w1 >> (8 * q)) & 0xFF];
+          Ty<T>::mma(acc[mat], a0 ^ m0.x, a1 ^ m1.x, a0 ^ m0.y, a1 ^ m1.y, b.x, b.y);
+          Ty<T>::mma(acc[mat], a0 ^ m0.z, a1 ^ m1.z, a0 ^ m0.w, a1 ^ m1.w, b.z, b.w);
+        }
+      }
+    }
+#pragma unroll
+    for (int mat = 0; mat < MATS; mat++) red[warp][mat][lane] = make_float4(acc[mat][0], acc[mat][1], acc[mat][2], acc[mat][3]);
+    __syncthreads();
+    if (warp == 0) {
+      float s[MATS][4] = {};
+      for (int w = 0; w < WARPS; w++)
+#pragma unroll
+        for (int mat = 0; mat < MATS; mat++) {
+          const float4 v = red[w][mat][lane];
+          s[mat][0] += v.x, s[mat][1] += v.y, s[mat][2] += v.z, s[mat][3] += v.w;
+        }
+#pragma unroll
+      for (int e = 0; e < 4; e++) {  // C fragment: row r0 + 8 (e >> 1), pair 2q + (e & 1)
+        const int j = 2 * q + (e & 1);
+        if (j < nt) epilogue<MATS, T>(p, t0 + j, n0 + r0 + 8 * (e >> 1), s[0][e], s[MATS - 1][e]);
+      }
+    }
+    __syncthreads();
+  }
+}
+
+template <int MATS>
+void matrix_launch(int mode, MParams& p, const at::Tensor& like, int64_t P) {
+  const bool bf = like.scalar_type() == at::kBFloat16;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  // DARE on the tensor cores from about 5 pairs per group (H200: CUDA cores win below, the mma kernel above)
+  if (mode == 2 || P >= 5 * (p.G + 1)) {
+    const dim3 grid(p.N / 16, p.G + 1);
+    if (mode == 2)
+      bf ? mma_kernel<2, MATS, __nv_bfloat16><<<grid, WARPS * 32, 0, stream>>>(p)
+         : mma_kernel<2, MATS, __half><<<grid, WARPS * 32, 0, stream>>>(p);
+    else
+      bf ? mma_kernel<1, MATS, __nv_bfloat16><<<grid, WARPS * 32, 0, stream>>>(p)
+         : mma_kernel<1, MATS, __half><<<grid, WARPS * 32, 0, stream>>>(p);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return;
+  }
+  const dim3 grid((p.N + WARPS - 1) / WARPS, p.G + 1);
+  const int smem = WARPS * MATS * (p.K >> p.bs) * 2;
+  auto go = [&](auto k) {
+    if (smem > 48 * 1024) C10_CUDA_CHECK(cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    k<<<grid, WARPS * 32, smem, stream>>>(p);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  };
+  auto by_t = [&](auto mt_t) {  // pairs per pass: at most P
+    constexpr int R = decltype(mt_t)::value;
+    bf ? go(dare_kernel<MATS, R, __nv_bfloat16>) : go(dare_kernel<MATS, R, __half>);
+  };
+  if (P <= 1) by_t(std::integral_constant<int, 1>{});
+  else if (P <= 2) by_t(std::integral_constant<int, 2>{});
+  else if (P <= 4) by_t(std::integral_constant<int, 4>{});
+  else by_t(std::integral_constant<int, 8>{});
+}
+
+MParams mmake(int64_t mode, int64_t block, int64_t topk, const at::Tensor& x, const at::Tensor& perm,
+              const at::Tensor& gstart, int64_t N, const at::Tensor& d, const at::Tensor& pp, const at::Tensor& m) {
+  TORCH_CHECK(mode == 1 || mode == 2, "sdm_packed: mode 1 (DARE) or 2 (BitDelta)");
+  TORCH_CHECK(x.scalar_type() == at::kBFloat16 || x.scalar_type() == at::kHalf, "sdm_packed: bf16 or fp16");
+  TORCH_CHECK(x.dim() == 2 && x.size(1) % 32 == 0, "sdm_packed: K a multiple of 32");
+  TORCH_CHECK(perm.scalar_type() == at::kInt && gstart.scalar_type() == at::kInt && perm.is_contiguous() &&
+                  gstart.is_contiguous(), "sdm_packed: int32 routing");
+  check(x, "x");
+  check(d, "d");
+  MParams p{};
+  p.x = x.data_ptr(), p.perm = perm.data_ptr<int>(), p.gstart = gstart.data_ptr<int>();
+  p.N = N, p.K = x.size(1), p.G = gstart.numel() - 2, p.topk = topk;
+  if (mode == 1) {
+    TORCH_CHECK(block >= 8 && pp.scalar_type() == at::kLong && m.scalar_type() == at::kInt && m.is_contiguous() &&
+                    pp.is_contiguous(), "sdm_packed: DARE");
+    p.bs = log2i(block), p.mw = m.size(-1), p.sbs = -1;
+    TORCH_CHECK((p.K >> p.bs) <= 65535 && (p.K & (block - 1)) == 0, "sdm_packed: DARE blocks");
+  } else {
+    TORCH_CHECK(block == 0 || block >= 32, "sdm_packed: BitDelta scale block 0 or >= 32");
+    TORCH_CHECK(d.size(-1) == p.K / 32 && pp.scalar_type() == x.scalar_type() && pp.is_contiguous() &&
+                    N % 16 == 0, "sdm_packed: BitDelta");
+    p.sbs = block ? log2i(block) : -1, p.mw = d.size(-1), p.nsb = pp.size(-1);
+  }
+  return p;
+}
+
+at::Tensor matrix_gate_up(const at::Tensor& x, const at::Tensor& perm, const at::Tensor& gstart, const at::Tensor& g0,
+                          const at::Tensor& u0, const at::Tensor& dg, const at::Tensor& du, const at::Tensor& pg,
+                          const at::Tensor& pu, const at::Tensor& mg, const at::Tensor& mu, int64_t mode,
+                          int64_t block, int64_t topk) {
+  c10::cuda::CUDAGuard guard(x.device());
+  TORCH_CHECK(g0.dim() == 2 && g0.size(0) == x.size(0) && u0.sizes() == g0.sizes() &&
+                  g0.scalar_type() == x.scalar_type() && u0.scalar_type() == x.scalar_type(),
+              "sdm_packed: matrix_gate_up shapes");
+  check(g0, "g0");
+  check(u0, "u0");
+  check(du, "du");
+  MParams p = mmake(mode, block, topk, x, perm, gstart, g0.size(1), dg, pg, mg);
+  p.d[0] = dg.data_ptr(), p.d[1] = du.data_ptr(), p.p[0] = pg.data_ptr(), p.p[1] = pu.data_ptr();
+  p.m[0] = mode == 1 ? mg.data_ptr<int>() : nullptr, p.m[1] = mode == 1 ? mu.data_ptr<int>() : nullptr;
+  p.b0[0] = g0.data_ptr(), p.b0[1] = u0.data_ptr(), p.gather = 1;
+  at::Tensor h = at::empty({perm.numel(), p.N}, x.options());
+  p.out = h.data_ptr();
+  if (perm.numel()) matrix_launch<2>(mode, p, x, perm.numel());
+  return h;
+}
+
+at::Tensor matrix_down(const at::Tensor& h, const at::Tensor& perm, const at::Tensor& gstart, const at::Tensor& rw,
+                       const at::Tensor& d0, const at::Tensor& d, const at::Tensor& pp, const at::Tensor& m,
+                       int64_t mode, int64_t block, int64_t topk) {
+  c10::cuda::CUDAGuard guard(h.device());
+  TORCH_CHECK(d0.dim() == 2 && d0.size(0) == h.size(0) && d0.scalar_type() == h.scalar_type() &&
+                  rw.scalar_type() == at::kFloat && rw.numel() == h.size(0) && perm.numel() == h.size(0),
+              "sdm_packed: matrix_down shapes");
+  check(d0, "d0");
+  MParams p = mmake(mode, block, topk, h, perm, gstart, d0.size(1), d, pp, m);
+  p.d[0] = p.d[1] = d.data_ptr(), p.p[0] = p.p[1] = pp.data_ptr();
+  p.m[0] = p.m[1] = mode == 1 ? m.data_ptr<int>() : nullptr;
+  p.rw = rw.data_ptr<float>(), p.b0[0] = d0.data_ptr(), p.gather = 0;
+  at::Tensor o = at::empty({perm.numel(), p.N}, h.options());
+  p.out = o.data_ptr();
+  if (perm.numel()) matrix_launch<1>(mode, p, h, perm.numel());
+  return o;
+}
+
 }  // namespace
 
 TORCH_LIBRARY(sdm_packed, lib) {
@@ -581,4 +926,12 @@ TORCH_LIBRARY(sdm_packed, lib) {
       "down(Tensor h, Tensor perm, Tensor gstart, Tensor rw, Tensor w, Tensor d, Tensor p, Tensor m, int mode, "
       "int block, int topk) -> Tensor",
       &down);
+  lib.def(
+      "matrix_gate_up(Tensor x, Tensor perm, Tensor gstart, Tensor g0, Tensor u0, Tensor dg, Tensor du, Tensor pg, "
+      "Tensor pu, Tensor mg, Tensor mu, int mode, int block, int topk) -> Tensor",
+      &matrix_gate_up);
+  lib.def(
+      "matrix_down(Tensor h, Tensor perm, Tensor gstart, Tensor rw, Tensor d0, Tensor d, Tensor p, Tensor m, "
+      "int mode, int block, int topk) -> Tensor",
+      &matrix_down);
 }

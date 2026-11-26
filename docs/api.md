@@ -48,7 +48,7 @@ Generated from the docstrings.
 
 ```{eval-rst}
 .. automodule:: shared_delta_moe.cuda_kernels.packed_ops
-   :members: available, supports, moe, build
+   :members: available, supports, moe, matrix_moe, matrix_moe_any, build
 ```
 
 ## Dense prefill

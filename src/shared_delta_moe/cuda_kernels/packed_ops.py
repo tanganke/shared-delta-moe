@@ -17,6 +17,10 @@ materialised forward.
 blocks below 8, BitDelta scale blocks below 32, or the library not built. Under ``torch.compile`` they run inside the
 same registered op (``shared_delta_moe::fused_moe_dare`` / ``_bit``), so CUDA graphs work as before.
 
+``matrix_moe`` is the output-aggregation form (``forward_matrix`` of ``DareDeltaMoE`` / ``BitDeltaMoE``):
+:math:`x W_g^T`, :math:`x W_u^T` and :math:`h W_d^T` by cuBLAS, and only the deltas' products in the kernels, so
+:math:`W_b` is read once however many groups are routed. See ``docs/forwards.md``.
+
 Only sm_90 (H100 / H200) is supported: the build is sm_90a only, and the layout needs Hopper's 227 KB of shared memory
 per CTA; ``supports`` sends every other GPU to Triton. Build once per torch version, on a machine with nvcc:
 
@@ -36,9 +40,11 @@ import os
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 MAX_PAIRS = 16  # H200, hidden 2560, inter 9216, 5 deltas: CUDA wins up to 16 (token, slot) pairs, Triton from 24
+MATRIX_MAX_PAIRS = 1024  # forward_matrix: beyond this the inherited forward (it unpacks every delta)
 ENABLED = os.environ.get("SHARED_DELTA_MOE_CUDA", "1") != "0"
 DIR = Path(os.environ.get("SHARED_DELTA_MOE_CUDA_DIR", Path.home() / ".cache" / "shared_delta_moe" / "cuda"))
 SRC = Path(__file__).with_name("packed_moe.cu")
@@ -67,7 +73,7 @@ def available() -> bool:
     return _loaded
 
 
-def supports(x: Tensor, pairs: int, base: tuple[Tensor, Tensor, Tensor], deltas) -> bool:
+def supports(x: Tensor, pairs: int, base: tuple[Tensor, Tensor, Tensor], deltas, matrix: bool = False) -> bool:
     """Whether these kernels take this call.
 
     Args:
@@ -75,6 +81,8 @@ def supports(x: Tensor, pairs: int, base: tuple[Tensor, Tensor, Tensor], deltas)
         pairs: (token, slot) pairs, T * top_k.
         base: (:math:`W_g`, :math:`W_u`, :math:`W_d`).
         deltas: The three ``Delta`` of the projections (mode 1 DARE or 2 BitDelta).
+        matrix: For ``matrix_moe`` (output aggregation) instead of ``moe``: up to ``MATRIX_MAX_PAIRS`` pairs. Only
+            metadata is read while ``torch.compile`` traces, so it also works on fake tensors.
 
     Returns:
         True on sm_90 for 1 .. ``MAX_PAIRS`` pairs of bf16/fp16, hidden and inter multiples of 64, DARE blocks of at
@@ -82,27 +90,35 @@ def supports(x: Tensor, pairs: int, base: tuple[Tensor, Tensor, Tensor], deltas)
         16-byte aligned, the layout within the device's shared memory, and the library loaded.
     """
     d = deltas[0]
-    if not (d.mode in (1, 2) and 0 < pairs <= MAX_PAIRS and x.is_cuda and x.dtype in (torch.bfloat16, torch.float16)):
+    if not (d.mode in (1, 2) and 0 < pairs <= (MATRIX_MAX_PAIRS if matrix else MAX_PAIRS) and x.is_cuda and x.dtype in (torch.bfloat16, torch.float16)):
         return False
     if not available():  # first: unbuilt or disabled costs nothing more per call
         return False
     cap, smax = _device(x.device.index if x.device.index is not None else torch.cuda.current_device())
-    if cap != (9, 0) or x.shape[1] % 64 or base[0].shape[0] % 64 or x.contiguous().data_ptr() % 16:
+    if cap != (9, 0) or x.shape[1] % 64 or base[0].shape[0] % 64 or not _aligned(x.contiguous()):
         return False
     extra = (torch.int64, torch.int32) if d.mode == 1 else (x.dtype, torch.int32)  # (p, m) or (scales, sign words)
     if any(dl.mode != d.mode or dl.d.numel() == 0 for dl in deltas) or deltas[1].block != d.block:  # one gate/up block
         return False
     ts = [(w, x.dtype) for w in base] + [t for dl in deltas for t in zip((dl.p, dl.m if d.mode == 1 else dl.d), extra)]
-    if any(t is None or t.dtype != dt or not t.is_contiguous() or t.data_ptr() % 16 for t, dt in ts):
+    if any(t is None or t.dtype != dt or not t.is_contiguous() or not _aligned(t) for t, dt in ts):
         return False
     dd = x.dtype if d.mode == 1 else torch.int32  # kept values or sign words
-    if any(dl.d.dtype != dd or not dl.d.is_contiguous() or dl.d.data_ptr() % 16 for dl in deltas):
+    if any(dl.d.dtype != dd or not dl.d.is_contiguous() or not _aligned(dl.d) for dl in deltas):
         return False
     for dl in deltas:
         if dl.mode == 1 and (dl.block < 8 or dl.block & (dl.block - 1)) or dl.mode == 2 and dl.block and dl.block < 32:
             return False
     g = d.p.shape[0]
+    if matrix:  # a few KB of shared memory per CTA
+        return True
     return _smem(d.mode, 2, g, pairs, d.block) <= smax and _smem(d.mode, 1, g, pairs, deltas[2].block) <= smax
+
+
+def _aligned(t: Tensor) -> bool:
+    """16-byte aligned. Not checked while ``torch.compile`` traces (fake tensors have no address): ``matrix_moe_any``
+    copies a misaligned x, and the op checks the rest."""
+    return torch.compiler.is_compiling() or t.data_ptr() % 16 == 0
 
 
 @functools.cache
@@ -112,15 +128,16 @@ def _device(index: int) -> tuple[tuple[int, int], int]:
     return (p.major, p.minor), p.shared_memory_per_block_optin
 
 
-def _smem(mode: int, mats: int, g: int, pairs: int, block: int) -> int:
+def _smem(mode: int, mats: int, g: int, pairs: int, block: int, base: bool = True) -> int:
     """Shared memory of the smallest K split, as ``launch`` in ``packed_moe.cu`` computes it (keep the two in step)."""
     kc, warps, nt = 64, 8, next(n for n in (1, 2, 4, 8) if 8 * n >= pairs)
     hdr = ((2 * g + 4 + pairs) * 4 + 15) // 16 * 16
-    if mode == 1:  # W_b ring + DARE pool and step records + row cursors and bitmap words of up to G + 1 groups
+    ring = 4 * mats * 16 * kc * 2 if base else 0  # W_b ring (parameter aggregation only)
+    if mode == 1:  # DARE pool and step records + row cursors and bitmap words of up to G + 1 groups (G: no base)
         words = kc // block // 32 + 2
-        warp = 4 * mats * 16 * kc * 2 + 256 * 16 + 8 * 36 * 4 + mats * min(g + 1, pairs) * 16 * (8 + 4 * words)
-    else:  # W_b ring + BitDelta steps, then the sign table
-        warp, hdr = 4 * mats * 16 * kc * 2 + 8 * mats * (64 * kc // 32 + 128), hdr + 4096
+        warp = ring + 256 * 16 + 8 * 36 * 4 + mats * min(g + base, pairs) * 16 * (8 + 4 * words)
+    else:  # BitDelta steps, then the sign table
+        warp, hdr = ring + 8 * mats * (64 * kc // 32 + 128), hdr + 4096
     return hdr + nt * 8 * (kc + 32) * 2 + warps * warp
 
 
@@ -149,6 +166,99 @@ def moe(x: Tensor, r, base: tuple[Tensor, Tensor, Tensor], deltas) -> Tensor:
     pd, md = extra(dd)
     o = torch.ops.sdm_packed.down(h, r.perm, r.gstart, r.weight, base[2], dd.d, pd, md, dd.mode, dd.block, r.top_k)
     return o if r.top_k == 1 else o.view(r.tokens, r.top_k, -1).sum(1).to(x.dtype)
+
+
+def matrix_moe(x: Tensor, r, base: tuple[Tensor, Tensor, Tensor], deltas) -> Tensor:
+    """Output aggregation (``DeltaMoE.forward_matrix``) after ``route``, rounded as ``_forward_matrix_grouped``:
+    :math:`x W_g^T`, :math:`x W_u^T` for all tokens and :math:`h W_d^T` for all pairs by cuBLAS, the deltas' products
+    by the kernels (gate/up adding them and SiLU * up per pair; down adding them and the routing weight).
+
+    Args:
+        x: (T, H) tokens.
+        r: The sorted routing (``triton_kernels.fused.Routing``).
+        base: (:math:`W_g` (I, H), :math:`W_u` (I, H), :math:`W_d` (H, I)).
+        deltas: (:math:`D_g`, :math:`D_u`, :math:`D_d`) as ``Delta``, mode 1 or 2.
+
+    Returns:
+        (T, H) MoE output in x's dtype.
+    """
+    dg, du, dd = deltas
+    x = x.contiguous()
+
+    def extra(d):
+        return (d.p, d.m) if d.mode == 1 else (d.p, d.d)
+
+    (pg, mg), (pu, mu), (pd, md) = extra(dg), extra(du), extra(dd)
+    g0, u0 = F.linear(x, base[0]), F.linear(x, base[1])
+    h = torch.ops.sdm_packed.matrix_gate_up(x, r.perm, r.gstart, g0, u0, dg.d, du.d, pg, pu, mg, mu, dg.mode, dg.block,
+                                            r.top_k)  # fmt: skip  # (P, I), sorted pairs
+    o = torch.ops.sdm_packed.matrix_down(h, r.perm, r.gstart, r.weight, F.linear(h, base[2]), dd.d, pd, md, dd.mode,
+                                         dd.block, r.top_k)  # fmt: skip  # (P, H) r_i y_i by pair
+    return o if r.top_k == 1 else o.view(r.tokens, r.top_k, -1).sum(1).to(x.dtype)
+
+
+def matrix_moe_any(x: Tensor, idx: Tensor, rw: Tensor, n_delta: int, base: tuple[Tensor, Tensor, Tensor],
+                   deltas) -> Tensor:  # fmt: skip
+    """``route`` then ``matrix_moe``; under ``torch.compile`` one registered op (``matrix_moe_dare`` / ``_bit``).
+
+    Args:
+        x: (T, H) tokens.
+        idx: (T, k) expert per slot; ``idx >= n_delta``: a zero expert.
+        rw: (T, k) routing weight per slot.
+        n_delta: :math:`G`, number of delta experts.
+        base: (:math:`W_g`, :math:`W_u`, :math:`W_d`).
+        deltas: (:math:`D_g`, :math:`D_u`, :math:`D_d`) as ``Delta``, mode 1 or 2, for which ``supports(...,
+            matrix=True)`` holds.
+
+    Returns:
+        (T, H) MoE output in x's dtype.
+    """
+    if not torch.compiler.is_compiling():
+        return _matrix(x, idx, rw, n_delta, base, deltas)
+    if deltas[0].mode == 2:
+        return matrix_moe_bit(x, idx, rw, *base, *(d.d for d in deltas), *(d.p for d in deltas), n_delta,
+                              deltas[0].block, deltas[2].block)  # fmt: skip
+    return matrix_moe_dare(x, idx, rw, *base, *(d.d for d in deltas), *(d.p for d in deltas),
+                           *(d.m for d in deltas), n_delta, deltas[0].block)  # fmt: skip
+
+
+def _matrix(x, idx, rw, n_delta, base, deltas):
+    from ..triton_kernels.fused import route
+
+    x = x.contiguous()
+    if x.data_ptr() % 16:  # (a traced call checked the storage offset only)
+        x = x.clone()
+    return matrix_moe(x, route(idx, rw, n_delta), base, deltas)
+
+
+@torch.library.custom_op("shared_delta_moe::matrix_moe_dare", mutates_args=())
+def matrix_moe_dare(x: Tensor, idx: Tensor, rw: Tensor, wg: Tensor, wu: Tensor, wd: Tensor, vg: Tensor, vu: Tensor,
+                    vd: Tensor, pg: Tensor, pu: Tensor, pd: Tensor, mg: Tensor, mu: Tensor, md: Tensor, n_delta: int,
+                    block: int) -> Tensor:  # fmt: skip
+    from ..triton_kernels import Delta
+
+    deltas = tuple(Delta(1, v, p, m, block) for v, p, m in ((vg, pg, mg), (vu, pu, mu), (vd, pd, md)))
+    return _matrix(x, idx, rw, n_delta, (wg, wu, wd), deltas)
+
+
+@torch.library.custom_op("shared_delta_moe::matrix_moe_bit", mutates_args=())
+def matrix_moe_bit(x: Tensor, idx: Tensor, rw: Tensor, wg: Tensor, wu: Tensor, wd: Tensor, bg: Tensor, bu: Tensor,
+                   bd: Tensor, sg: Tensor, su: Tensor, sd: Tensor, n_delta: int, block_gu: int,
+                   block_d: int) -> Tensor:  # fmt: skip
+    from ..triton_kernels import Delta
+
+    deltas = tuple(Delta(2, b, s, block=k) for b, s, k in ((bg, sg, block_gu), (bu, su, block_gu), (bd, sd, block_d)))
+    return _matrix(x, idx, rw, n_delta, (wg, wu, wd), deltas)
+
+
+@matrix_moe_dare.register_fake
+def _(x, *args, **kwargs):
+    return x.new_empty(x.shape)
+
+
+@matrix_moe_bit.register_fake
+def _(x, *args, **kwargs):
+    return x.new_empty(x.shape)
 
 
 def build(verbose: bool = True) -> Path:

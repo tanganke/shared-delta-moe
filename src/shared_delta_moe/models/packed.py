@@ -11,6 +11,8 @@ gradient needed the materialised path runs.
 import torch
 from torch import Tensor
 
+from ..constants import HAS_TRITON, SORT_ONE_HOT_MAX
+from ..ops import pow2
 from .delta_moe import DeltaMoE
 
 PROJ = ("gate", "up", "down")
@@ -59,6 +61,38 @@ class PackedDeltaMoE(DeltaMoE):
     def d_down(self) -> Tensor:  # type: ignore[override]
         """Dense down deltas of every expert, unpacked on each access: (N, H, I)."""
         return self._delta("down")
+
+    def forward_matrix(self, x: Tensor) -> Tensor:
+        r"""MoE forward by per-matrix output aggregation (``DeltaMoE.forward_matrix``).
+
+        On an H100 / H200 with the prebuilt CUDA library (``cuda_kernels/packed_ops.py``), forward-only and up to
+        ``MATRIX_MAX_PAIRS`` (token, slot) pairs: :math:`W_b` products by cuBLAS, the packed deltas' products by the
+        kernels (no host sync, CUDA-graph capturable). Otherwise the inherited forward on unpacked deltas.
+
+        Args:
+            x: (T, H) tokens.
+
+        Returns:
+            (T, H) MoE output.
+        """
+        if self._matrix_cuda(x):
+            from ..cuda_kernels.packed_ops import matrix_moe_any
+
+            idx, r = self.topk(x)
+            return matrix_moe_any(x, idx, r, self.n_delta, (self.gate, self.up, self.down), self._kernel_deltas())
+        return super().forward_matrix(x)
+
+    def _matrix_cuda(self, x: Tensor) -> bool:
+        if not (HAS_TRITON and x.is_cuda and x.dim() == 2) or self._needs_grad(x):
+            return False
+        if pow2(self.top_k) * pow2(self.n_delta + 2) > SORT_ONE_HOT_MAX:  # the routing sort (Triton)
+            return False
+        from ..cuda_kernels import packed_ops
+
+        if not packed_ops.available():
+            return False
+        return packed_ops.supports(x, x.shape[0] * self.top_k, (self.gate, self.up, self.down), self._kernel_deltas(),
+                                   matrix=True)  # fmt: skip
 
     def _use_triton(self, x: Tensor) -> bool:
         # the fused kernels read packed deltas forward-only (triton_train's backward takes dense deltas): with a
