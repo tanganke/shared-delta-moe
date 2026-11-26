@@ -95,3 +95,14 @@ def test_cuda_graph_and_compile():
             torch._dynamo.reset()
             f = torch.compile(mod.forward_matrix, fullgraph=True)
             assert rel(f(xs), mod._forward_matrix(xs)) < 1e-2
+
+
+def test_autocast_other_dtype():
+    """An fp16 model under bf16 autocast: the cuBLAS products stay fp16 (no dtype mismatch in the kernels)."""
+    m, _, x = make(1, 2, 256, 384, torch.float16, "cuda")
+    for mod in (DareDeltaMoE.from_delta_moe(m, 0.2, 64, seed=1), BitDeltaMoE.from_delta_moe(m, 64)):
+        with torch.no_grad():
+            want = mod._forward_matrix(x[:8])
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                got = mod.forward_matrix(x[:8])
+        assert got.dtype == torch.float16 and rel(got, want) < 1e-2

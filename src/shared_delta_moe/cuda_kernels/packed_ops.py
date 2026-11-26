@@ -110,8 +110,9 @@ def supports(x: Tensor, pairs: int, base: tuple[Tensor, Tensor, Tensor], deltas,
         if dl.mode == 1 and (dl.block < 8 or dl.block & (dl.block - 1)) or dl.mode == 2 and dl.block and dl.block < 32:
             return False
     g = d.p.shape[0]
-    if matrix:  # a few KB of shared memory per CTA
-        return True
+    if matrix:  # the mma kernel: a few KB; DARE's CUDA-core kernel: 8 warps x mats x (K / block) halfwords
+        h, i = x.shape[1], base[0].shape[0]
+        return d.mode == 2 or 8 * 2 * (h // d.block) * 2 <= smax and 8 * (i // deltas[2].block) * 2 <= smax
     return _smem(d.mode, 2, g, pairs, d.block) <= smax and _smem(d.mode, 1, g, pairs, deltas[2].block) <= smax
 
 
@@ -168,6 +169,7 @@ def moe(x: Tensor, r, base: tuple[Tensor, Tensor, Tensor], deltas) -> Tensor:
     return o if r.top_k == 1 else o.view(r.tokens, r.top_k, -1).sum(1).to(x.dtype)
 
 
+@torch.autocast("cuda", enabled=False)  # cuBLAS products in x's dtype, as the kernels check
 def matrix_moe(x: Tensor, r, base: tuple[Tensor, Tensor, Tensor], deltas) -> Tensor:
     """Output aggregation (``DeltaMoE.forward_matrix``) after ``route``, rounded as ``_forward_matrix_grouped``:
     :math:`x W_g^T`, :math:`x W_u^T` for all tokens and :math:`h W_d^T` for all pairs by cuBLAS, the deltas' products
