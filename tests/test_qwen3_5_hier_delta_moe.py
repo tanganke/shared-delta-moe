@@ -152,6 +152,13 @@ def test_vl_layout_and_missing_keys():
         torch.testing.assert_close(out.get("model.visual.blocks.0.mlp.linear_fc1.weight"), base["model.visual.blocks.0.mlp.linear_fc1.weight"] + 1)
         torch.testing.assert_close(out.get("mtp.layers.0.mlp.gate_proj.weight"), base["mtp.layers.0.mlp.gate_proj.weight"])
         assert out.get(f"{p}.router.weight").shape == (4, 4) and torch.equal(out.get("model.ids"), torch.arange(5))
+        # one fine-tune in both groups: an expert in each, counted once in the merge (mean of ft0 + 1 and ft1 + 3)
+        fts[1] = {k: v + 2.0 if v.is_floating_point() else v for k, v in fts[1].items()}
+        shared = Dict(fts[0])
+        convert(Dict(base), {"a": [shared, Dict(fts[1])], "b": [shared]}, Path(d) / "dup", [0, 0], log=lambda s: None)
+        out = Checkpoint(Path(d) / "dup")
+        torch.testing.assert_close(out.get(f"{p}.d_up"), torch.tensor([1.0, 3.0, 1.0])[:, None, None].expand(3, 6, 4))
+        torch.testing.assert_close(out.get("model.visual.blocks.0.mlp.linear_fc1.weight"), base["model.visual.blocks.0.mlp.linear_fc1.weight"] + 2)
 
 
 if __name__ == "__main__":

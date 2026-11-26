@@ -17,6 +17,7 @@ Tensors are streamed one at a time from the safetensors shards and written in sh
 """
 
 import argparse
+import functools
 import json
 import re
 from collections.abc import Callable, Sequence
@@ -44,7 +45,8 @@ def convert(base: Source, groups: dict[str, Sequence[Source]], dst: Path, zeros:
 
     Args:
         base: the dense base checkpoint; its decoder MLP is :math:`W_b`.
-        groups: domain name -> its fine-tunes, one expert each, in order.
+        groups: domain name -> its fine-tunes, one expert each, in order. The same source object may sit in
+            several groups: one expert in each, but one fine-tune in the merge of the other tensors.
         dst: output directory (created if missing).
         zeros: zero experts per group.
         top_k: experts per group.
@@ -61,6 +63,7 @@ def convert(base: Source, groups: dict[str, Sequence[Source]], dst: Path, zeros:
     """
     names = list(groups)
     tuned = [s for n in names for s in groups[n]]
+    uniq = list(dict.fromkeys(tuned))  # a fine-tune in several groups (the same object) is merged once
     assert len(zeros) == len(names) and all(groups[n] for n in names)
     widths = [len(groups[n]) + z for n, z in zip(names, zeros)]
     assert 1 <= top_k <= min(widths), f"top_k {top_k}: groups have {widths} experts + zero experts"
@@ -68,7 +71,7 @@ def convert(base: Source, groups: dict[str, Sequence[Source]], dst: Path, zeros:
     merge_fn, kw = MERGE[merge], merge_args or {}
     keys = base.keys()
     assert any(MLP.fullmatch(k) for k in keys), "no decoder MLP found"
-    have = [set(s.keys()) for s in tuned]
+    have = [set(s.keys()) for s in uniq]
     for k in keys:
         if MLP.fullmatch(k):
             assert all(k in h for h in have), f"{k}: missing in a fine-tune"
@@ -84,7 +87,7 @@ def convert(base: Source, groups: dict[str, Sequence[Source]], dst: Path, zeros:
         m = MLP.fullmatch(k)
         if m is None:
             b = base.get(k)
-            ts = [s.get(k) for s, h in zip(tuned, have) if k in h]
+            ts = [s.get(k) for s, h in zip(uniq, have) if k in h]
             w.add(k, merge_fn({k: b}, [{k: t} for t in ts], **kw)[k] if b.is_floating_point() and ts else b)
             continue
         prefix = m[1]
@@ -128,10 +131,10 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--merge-arg", action="append", default=[], help="KEY=VALUE for the merge method")
     ap.add_argument("--shard-gb", type=float, default=5.0)
     a = ap.parse_args(argv)
-    groups = {}
+    groups, ckpt = {}, functools.cache(lambda d: Checkpoint(Path(d).resolve()))  # one source per directory
     for g in a.group:
         name, dirs = g.split("=", 1)
-        groups.setdefault(name, []).extend(Checkpoint(d) for d in dirs.split(","))  # a repeated name extends
+        groups.setdefault(name, []).extend(ckpt(d) for d in dirs.split(","))  # a repeated name extends
     zeros = [int(z) for z in a.zeros.split(",")]
     zeros = zeros * len(groups) if len(zeros) == 1 else zeros
     merge_args = {k: _value(v) for k, v in (s.split("=", 1) for s in a.merge_arg)}
