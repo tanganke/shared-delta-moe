@@ -7,12 +7,12 @@ one :math:`\Delta_{ij}` per delta expert. Routing:
 - :math:`h = \mathrm{softmax}(R_0 x)` over the :math:`G` groups; dense (every group, weight :math:`h_i`) or
   top-:math:`k_0` renormalised.
 - :math:`p_i` = softmax over group :math:`i`'s :math:`E_i + Z_i` experts; top-:math:`k_1` renormalised within the group
-  (zero experts compete too).
+  to :math:`\tilde p_{ij}` (zero experts compete too).
 - The output:
 
   .. math::
 
-     y = \sum_i h_i \sum_{j \in \text{top-}k_1} p_{ij}\, \mathrm{MLP}(x; W_b + \Delta_{ij}),
+     y = \sum_i h_i \sum_{j \in \text{top-}k_1} \tilde p_{ij}\, \mathrm{MLP}(x; W_b + \Delta_{ij}),
      \qquad \Delta_{ij} = 0 \text{ for a zero expert}
 
 The weights sum to 1, so :math:`y` is the plain two-level ensemble of full experts :math:`\theta_{ij} = W_b +
@@ -20,7 +20,7 @@ The weights sum to 1, so :math:`y` is the plain two-level ensemble of full exper
 are :math:`R_0`, then group by group :math:`E_i` delta rows and :math:`Z_i` zero-expert rows.
 
 The routing is flattened into DeltaMoE slots: per token :math:`S \cdot k_1` slots (:math:`S = G` dense, else
-:math:`k_0`) weighted :math:`h_i p_{ij}`; a picked zero expert is a base slot. Every DeltaMoE forward (materialised,
+:math:`k_0`) weighted :math:`h_i \tilde p_{ij}`; a picked zero expert is a base slot. Every DeltaMoE forward (materialised,
 split, grouped, fused Triton) then computes :math:`y` unchanged.
 """
 
@@ -45,7 +45,7 @@ class HierDeltaMoE(DeltaMoE):
     Args:
         hidden: :math:`H`, the model width.
         inter: :math:`I`, the MLP intermediate width.
-        group_sizes: :math:`E_i`, the number of delta experts in each group (:math:`G` = ``len(group_sizes)`` > 0).
+        group_sizes: :math:`E_i`, the number of delta experts in each group (:math:`G` = ``len(group_sizes)``, :math:`G > 0`).
         group_zeros: :math:`Z_i \ge 0`, the number of zero experts in each group (same length as ``group_sizes``).
         top_k: :math:`k_1`, experts picked per group, :math:`1 \le k_1 \le \min_i (E_i + Z_i)`.
         group_top_k: :math:`k_0`, groups picked per token, :math:`1 \le k_0 \le G`; None = dense (soft) routing over
@@ -136,7 +136,7 @@ class HierDeltaMoE(DeltaMoE):
         r"""Route tokens to the flattened DeltaMoE slots.
 
         Per token :math:`S \cdot k_1` slots (:math:`S = G` if ``group_top_k`` is None, else :math:`k_0`) weighted
-        :math:`h_i p_{ij}`; a picked zero expert is a base slot.
+        :math:`h_i \tilde p_{ij}`; a picked zero expert is a base slot.
 
         Args:
             x: (T, H) tokens.

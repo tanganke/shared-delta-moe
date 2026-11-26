@@ -164,13 +164,13 @@ class DareDeltaMoE(PackedDeltaMoE):
     Args:
         hidden: H, model hidden size.
         inter: I, expert intermediate size.
-        n_delta: N, number of delta experts.
+        n_delta: :math:`N`, number of delta experts.
         keep: Fraction of each delta's blocks kept.
         block: B, entries per :math:`1 \times B` block along the input dimension; must divide each projection's
             columns.
         seed: DARE seed, in :math:`[0, 2^{63})`.
         top_k: Experts per token.
-        num_zero_experts: Z, router rows that route to the base alone.
+        num_zero_experts: :math:`Z`, router rows that route to the base alone.
         device: Device of the parameters and buffers.
         dtype: Dtype of the parameters and packed values.
     """

@@ -19,7 +19,7 @@ from .type_hints import (
 
 
 def pow2(n: int) -> int:
-    """Smallest power of 2 that is at least n (n >= 1)."""
+    r"""Smallest power of 2 that is at least :math:`n` (:math:`n \ge 1`)."""
     return 1 << (n - 1).bit_length()
 
 
@@ -85,14 +85,14 @@ def groups(e: SlotExperts, r: SlotWeights) -> list[Group]:
 
 
 def sort_rows(e: SlotExperts, n: int) -> tuple[Rows, GroupEnds]:
-    """Rows with e >= 0, sorted by e, and the cumulative group sizes that ``grouped_mm`` takes as ``offs``.
+    r"""Rows with :math:`e \ge 0`, sorted by :math:`e`, and the cumulative group sizes that ``grouped_mm`` takes as ``offs``.
 
     Args:
-        e: (T,) int64 group index per row; rows with e < 0 are dropped.
+        e: (T,) int64 group index per row; rows with :math:`e < 0` are dropped.
         n: Number of groups G; e must be < n.
 
     Returns:
-        A tuple (rows, offs): rows (R,) int64 indices of the rows with e >= 0, sorted by e; offs (G,) int32
+        A tuple (rows, offs): rows (R,) int64 indices of the rows with :math:`e \ge 0`, sorted by :math:`e`; offs (G,) int32
         cumulative group sizes.
     """
     rows = (e >= 0).nonzero().squeeze(-1)

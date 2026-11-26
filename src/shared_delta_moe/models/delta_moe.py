@@ -76,9 +76,9 @@ class DeltaMoE(nn.Module):
     Args:
         hidden: H, the model width.
         inter: I, the MLP intermediate width.
-        n_delta: N, the number of routed experts with a delta.
-        top_k: K, experts picked per token; :math:`1 \le` ``top_k`` :math:`\le` ``n_delta + num_zero_experts``.
-        num_zero_experts: :math:`Z \ge 0`, router rows N..N+Z-1 that route to the base MLP itself (no parameters).
+        n_delta: :math:`N`, the number of routed experts with a delta.
+        top_k: :math:`K`, experts picked per token, :math:`1 \le K \le N + Z`.
+        num_zero_experts: :math:`Z \ge 0`, router rows :math:`N, \ldots, N+Z-1` that route to the base MLP itself (no parameters).
         device: Device of the parameters.
         dtype: Dtype of the parameters.
 
@@ -86,7 +86,7 @@ class DeltaMoE(nn.Module):
         triton_train: Train through the fused Triton forward + backward (``triton_kernels/train.py``) instead of
             materialised cuBLAS: holds no :math:`W_b + \Delta_e` and no per-pair activations for the backward, but
             measured slower (README, Training). Default False.
-        router: ``nn.Linear(H, N+Z, bias=False)``; rows N..N+Z-1 are the zero experts.
+        router: ``nn.Linear(H, N+Z, bias=False)``; rows :math:`N, \ldots, N+Z-1` are the zero experts.
         gate: (I, H) base gate weight :math:`W_b`.
         up: (I, H) base up weight :math:`W_b`.
         down: (H, I) base down weight :math:`W_b`.
@@ -169,12 +169,12 @@ class DeltaMoE(nn.Module):
         Args:
             base: The base expert's (gate (I, H), up (I, H), down (H, I)), stored as :math:`W_b`.
             experts: The other N experts' full weights :math:`W_e`, each (gate, up, down) shaped like base.
-            router: (N+Z, H) the MoE's router weight; rows N..N+Z-1 route to the base.
-            top_k: K, experts picked per token.
-            num_zero_experts: Z; 0: the base is only shared, never an expert on its own.
+            router: (N+Z, H) the MoE's router weight; rows :math:`N, \ldots, N+Z-1` route to the base.
+            top_k: :math:`K`, experts picked per token.
+            num_zero_experts: :math:`Z`; 0: the base is only shared, never an expert on its own.
 
         Returns:
-            The DeltaMoE with H, I from base and N = ``len(experts)``.
+            The DeltaMoE with :math:`H`, :math:`I` from ``base`` and :math:`N` = ``len(experts)``.
 
         Raises:
             AssertionError: If ``router.shape[0] != len(experts) + num_zero_experts``.
@@ -244,7 +244,7 @@ class DeltaMoE(nn.Module):
             e: Delta index, or < 0 (-1) for a zero expert.
 
         Returns:
-            (gate (I, H), up (I, H), down (H, I)); materialised sums for e >= 0, the base parameters for e < 0.
+            (gate (I, H), up (I, H), down (H, I)); materialised sums for :math:`e \ge 0`, the base parameters for :math:`e < 0`.
         """
         if e < 0:
             return self.gate, self.up, self.down

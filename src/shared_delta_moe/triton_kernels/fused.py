@@ -101,9 +101,9 @@ def route(idx: Tensor, weight: Tensor, n_delta: int) -> Routing:
     """Sort a routing by group, on the device in one program (a stable counting sort, no host synchronisation).
 
     Args:
-        idx: (T, k) expert per slot; >= n_delta: a zero expert.
+        idx: (T, k) expert per slot; ``idx >= n_delta``: a zero expert.
         weight: (T, k) routing weight of each slot.
-        n_delta: G, number of delta experts.
+        n_delta: :math:`G`, number of delta experts.
 
     Returns:
         The Routing: delta :math:`e` to group :math:`e`, every zero expert to group :math:`G`.
@@ -637,14 +637,14 @@ def fused_moe(x: Tensor, idx: Tensor, rw: Tensor, n_delta: int, base: tuple[Tens
 
     Args:
         x: (T, H) tokens.
-        idx: (T, k) expert per slot; >= n_delta: a zero expert.
+        idx: (T, k) expert per slot; ``idx >= n_delta``: a zero expert.
         rw: (T, k) routing weight per slot.
-        n_delta: G, number of delta experts.
+        n_delta: :math:`G`, number of delta experts.
         base: (:math:`W_g` (I, H), :math:`W_u` (I, H), :math:`W_d` (H, I)).
         deltas: (:math:`D_g`, :math:`D_u`, :math:`D_d`), one Delta per projection, all in the same mode.
 
     Returns:
-        (T, H) MoE output in x's dtype (empty for T = 0).
+        (T, H) MoE output in x's dtype (empty for :math:`T = 0`).
     """
     if x.shape[0] == 0:
         return x.new_empty(x.shape)
@@ -704,9 +704,9 @@ def fused_moe_any(x: Tensor, idx: Tensor, rw: Tensor, n_delta: int, base: tuple[
 
     Args:
         x: (T, H) tokens.
-        idx: (T, k) expert per slot; >= n_delta: a zero expert.
+        idx: (T, k) expert per slot; ``idx >= n_delta``: a zero expert.
         rw: (T, k) routing weight per slot.
-        n_delta: G, number of delta experts.
+        n_delta: :math:`G`, number of delta experts.
         base: (:math:`W_g` (I, H), :math:`W_u` (I, H), :math:`W_d` (H, I)).
         deltas: (:math:`D_g`, :math:`D_u`, :math:`D_d`), one Delta per projection, all in the same mode.
 

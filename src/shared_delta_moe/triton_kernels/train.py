@@ -220,7 +220,7 @@ def fused_moe_autograd(x: Tensor, idx: Tensor, rw: Tensor, base: tuple[Tensor, T
         n_delta: the number of delta experts.
 
     Returns:
-        (T, H) output :math:`y`; empty when T == 0.
+        (T, H) output :math:`y`; empty when :math:`T = 0`.
     """
     if x.shape[0] == 0:
         return torch.empty_like(x)
