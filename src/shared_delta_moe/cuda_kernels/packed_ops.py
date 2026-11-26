@@ -19,7 +19,7 @@ same registered op (``shared_delta_moe::fused_moe_dare`` / ``_bit``), so CUDA gr
 
 ``matrix_moe`` is the output-aggregation form (``forward_matrix`` of ``DareDeltaMoE`` / ``BitDeltaMoE``):
 :math:`x W_g^T`, :math:`x W_u^T` and :math:`h W_d^T` by cuBLAS, and only the deltas' products in the kernels, so
-:math:`W_b` is read once however many groups are routed. See ``docs/forwards.md``.
+:math:`W_b` is read once however many groups are routed. See ``docs/internals/cuda-decode.md``.
 
 Only sm_90 (H100 / H200) is supported: the build is sm_90a only, and the layout needs Hopper's 227 KB of shared memory
 per CTA; ``supports`` sends every other GPU to Triton. Build once per torch version, on a machine with nvcc:

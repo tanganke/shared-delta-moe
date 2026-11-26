@@ -1,49 +1,43 @@
 # shared-delta-moe
 
 A top-k SwiGLU MoE stored as one shared base expert plus a delta per expert, $W_e = W_b + \Delta_e$, with
-dense, seeded-DARE, 1-bit BitDelta and two-level (`HierDeltaMoE`) deltas, a fused Triton forward and backward, and
-Qwen3.5 integration in transformers. Setup and the repo layout are in the
-[README](https://github.com/tanganke/shared-delta-moe#readme).
+dense, seeded-DARE and 1-bit BitDelta deltas, a two-level variant (`HierDeltaMoE`), fused Triton and CUDA kernels,
+Qwen3.5 integration in transformers and a vLLM plugin. Source:
+[github.com/tanganke/shared-delta-moe](https://github.com/tanganke/shared-delta-moe).
 
 ```{toctree}
-:caption: Model
-:maxdepth: 2
+:maxdepth: 1
 
-design
-forwards
-hier
+getting-started
 ```
 
 ```{toctree}
-:caption: Delta formats
+:caption: User guide
 :maxdepth: 2
 
-dare
-bitdelta
+guide/deltamoe
+guide/hier
+guide/delta-formats
+guide/qwen3_5
+guide/vllm
+guide/training
 ```
 
 ```{toctree}
-:caption: Kernels and training
+:caption: Internals
 :maxdepth: 2
 
-fused-kernel
-dense-prefill
-training
+internals/dispatch
+internals/kernels
+internals/benchmarks
 ```
 
 ```{toctree}
-:caption: transformers
-:maxdepth: 2
+:caption: Notes
+:maxdepth: 1
 
-qwen3_5
-transformers-decode
-```
-
-```{toctree}
-:caption: Measurements
-:maxdepth: 2
-
-speed-per-implementation
+internals/transformers-decode
+internals/cuda-dense-kernel
 ```
 
 ```{toctree}

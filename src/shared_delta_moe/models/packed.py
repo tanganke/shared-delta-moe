@@ -27,7 +27,7 @@ class PackedDeltaMoE(DeltaMoE):
     (about 1e-3 relative), so a batch's output depends slightly on its size.
     """
 
-    MATRIX_FORWARD_PAIRS = 0  # set per format from H200 measurements (docs/forwards.md)
+    MATRIX_FORWARD_PAIRS = 0  # set per format from H200 measurements (docs/internals/benchmarks.md)
 
     def _unpack(self, name: str, e: int) -> Tensor:
         """Dense delta of projection ``name`` of expert ``e``: (I, H) for gate / up, (H, I) for down."""

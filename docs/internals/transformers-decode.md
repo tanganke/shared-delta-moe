@@ -1,4 +1,4 @@
-# Why it looked "faster than the original MoE" in transformers
+# Plain MoE decode in transformers (`batched_mm`)
 
 Running the full model with transformers (Qwen3.5-4B MoE, 6 experts, H200), batch-32 decode measured 338 tok/s for the original MoE, while both forms here reached 711 / 860 tok/s. That is **not** because these forms are faster. It's because the original MoE was given a slow path by transformers:
 

@@ -64,7 +64,8 @@ uv run --group docs --extra transformers sphinx-build -W -b html docs docs/_buil
 Published at https://tanganke.github.io/shared-delta-moe/, built by `.github/workflows/docs.yml` on every push to
 main (pull requests build only).
 
-- A new page goes into a toctree in `docs/index.md` (and this list). A new module needs nothing: `docs/api.md` runs
+- A new page goes into a toctree: `docs/index.md`, or a parent page such as `guide/delta-formats.md` or
+  `internals/kernels.md` (and this list). A new module needs nothing: `docs/api.md` runs
   autosummary recursively over the package (one page per module, generated into `docs/_api/`); a new subpackage needs an
   `__init__.py` with a one-line docstring.
 - Public docstrings are Google style (summary line, then `Args:` / `Returns:` / `Raises:`, shapes in each argument),
@@ -75,14 +76,16 @@ main (pull requests build only).
   holds the layout changes over Furo.
 
 
-- [design.md](docs/design.md): the delta form, zero experts, routing, what is and is not equivalent, `from_experts`, dtypes
-- [forwards.md](docs/forwards.md): `forward_param` / `forward_matrix` / `forward_dense` and how an implementation is picked
-- [fused-kernel.md](docs/fused-kernel.md): the fused Triton forward (sort, gate_up, down; CUDA graph, TMA, split-K, rounding) and its speed
-- [dare.md](docs/dare.md): seeded DARE deltas, the mask bitmap, speed
-- [bitdelta.md](docs/bitdelta.md): 1-bit BitDelta deltas (sign bits plus scales), the kernel's mode 2, speed
-- [training.md](docs/training.md): gradients through `forward_param`, the fused Triton backward (`triton_train`), DARE training memory
-- [hier.md](docs/hier.md): the two-level shared delta MoE (`HierDeltaMoE`): groups, dense or top-k group routing, zero experts; serving with vLLM
-- [qwen3_5.md](docs/qwen3_5.md): converting a whole Qwen3.5 model: plain MoE -> DeltaMoE (and BitDelta), dense base + domain fine-tunes -> HierDeltaMoE (merge methods)
-- [speed-per-implementation.md](docs/speed-per-implementation.md): every implementation per layer, H200 and RTX 6000 Ada (previous kernel 5522b23)
-- [transformers-decode.md](docs/transformers-decode.md): why the plain MoE looked slow in transformers' `generate()` (`batched_mm` switch) and the fix
+- [getting-started.md](docs/getting-started.md): install, one MoE layer, a whole model
+- User guide (`docs/guide/`): [deltamoe.md](docs/guide/deltamoe.md) (the delta form, zero experts, storage),
+  [hier.md](docs/guide/hier.md) (two-level routing), [delta-formats.md](docs/guide/delta-formats.md) with
+  [dare.md](docs/guide/dare.md) and [bitdelta.md](docs/guide/bitdelta.md), [qwen3_5.md](docs/guide/qwen3_5.md)
+  (converting Qwen3.5 models), [vllm.md](docs/guide/vllm.md), [training.md](docs/guide/training.md)
+- Internals (`docs/internals/`): [dispatch.md](docs/internals/dispatch.md) (which forward runs when),
+  [kernels.md](docs/internals/kernels.md) with [fused-triton.md](docs/internals/fused-triton.md),
+  [cuda-decode.md](docs/internals/cuda-decode.md) and [dense-prefill.md](docs/internals/dense-prefill.md),
+  [benchmarks.md](docs/internals/benchmarks.md) (every speed table)
+- Notes: [transformers-decode.md](docs/internals/transformers-decode.md) (why the plain MoE looked slow in
+  transformers' `generate()`), [cuda-dense-kernel.md](docs/internals/cuda-dense-kernel.md) (the hand-written dense
+  kernel, not kept)
 - [api.md](docs/api.md): API reference, one page per module in the package layout, generated from the docstrings

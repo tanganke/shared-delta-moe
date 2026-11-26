@@ -1,4 +1,4 @@
-# Qwen3.5: converting a whole model
+# Converting Qwen3.5 models
 
 `modeling.py` defines one MLP block; importing the package patches transformers' decoder layer, so that
 `from_pretrained` builds that block in **every** layer whose text config has the block's field. Converting a whole model

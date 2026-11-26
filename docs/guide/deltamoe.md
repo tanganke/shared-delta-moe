@@ -1,4 +1,4 @@
-# Design: base expert plus deltas
+# DeltaMoE
 
 Each routed expert's weights are $W_e = W_b + \Delta_e$, applied to gate, up and down separately. The router's first n rows are the deltas; its last `num_zero_experts` rows (Z, default 1) are **zero experts**: they have no parameters and each stands for the base MLP itself. Whatever Z is, base + n deltas has exactly as many parameters as the original MoE's n+1 distinct experts. With Z = 0 the base is only a shared component, never chosen on its own; with Z > 1 the original MoE is equivalent to one with Z copies of the base expert (which gives the router more room to send tokens to the base).
 
@@ -49,20 +49,10 @@ flowchart LR
   (row $n$, the zero expert, $Z=1$). The shared expert is dropped (the converter asserts its output is zero).
 - **Not stored.** $Z$ and top-k are in the config (`delta_moe_zero_experts`, `num_experts_per_tok`; `num_experts` =
   $n+Z$).
-- **Compressed deltas** replace `d_<proj>` with their own buffers; see below.
+- **Compressed deltas** replace `d_<proj>` with their own buffers: [Delta formats](delta-formats.md).
 
-The forwards that compute it are in [forwards.md](forwards.md). A $\Delta_e$ can also be stored compressed; the base
-is always dense:
-
-```mermaid
-flowchart LR
-    D["Δ_e dense<br/>(R, C) bf16"] --> DARE["seeded DARE<br/>kept values Δ / keep<br/>+ row starts; mask from the seed"]
-    D --> BIT["BitDelta<br/>sign bits, 32 per int32<br/>+ scales per matrix / row / block"]
-    DARE -->|"unpack: delta(e) or in the fused kernel"| U["Δ_e used in W_b + Δ_e"]
-    BIT -->|"unpack: delta(e) or in the fused kernel"| U
-```
-
-See [dare.md](dare.md) and [bitdelta.md](bitdelta.md).
+The forwards that compute it are in [Forward dispatch](../internals/dispatch.md); compressed deltas in
+[Delta formats](delta-formats.md).
 
 Note two things that would not be equivalent:
 

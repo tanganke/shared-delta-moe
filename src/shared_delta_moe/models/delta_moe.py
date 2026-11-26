@@ -85,7 +85,7 @@ class DeltaMoE(nn.Module):
     Attributes:
         triton_train: Train through the fused Triton forward + backward (``triton_kernels/train.py``) instead of
             materialised cuBLAS: holds no :math:`W_b + \Delta_e` and no per-pair activations for the backward, but
-            measured slower (README, Training). Default False.
+            measured slower (docs/internals/benchmarks.md, Training). Default False.
         router: ``nn.Linear(H, N+Z, bias=False)``; rows :math:`N, \ldots, N+Z-1` are the zero experts.
         gate: (I, H) base gate weight :math:`W_b`.
         up: (I, H) base up weight :math:`W_b`.
@@ -99,7 +99,7 @@ class DeltaMoE(nn.Module):
     """
 
     # train through the fused Triton forward + backward (triton_kernels/train.py) instead of materialised cuBLAS:
-    # holds no W_b + Delta_e and no per-pair activations for the backward, but measured slower (README, Training)
+    # holds no W_b + Delta_e and no per-pair activations for the backward, but measured slower (docs/internals/benchmarks.md, Training)
     triton_train: bool = False
     gate: nn.Parameter  # I H
     up: nn.Parameter  # I H
