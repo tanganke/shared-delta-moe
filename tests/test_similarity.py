@@ -80,6 +80,7 @@ def test_fit_and_report(tmp_path):
 
 
 def test_bf16_ulp():
+    assert S.bf16_ulp(torch.tensor([0.0])).item() == 2.0**-133
     w = torch.tensor([1.0, 0.75, -3.0, 1e-3])
     for x, u in zip(w, S.bf16_ulp(w)):
         b = x.to(torch.bfloat16)
@@ -148,5 +149,7 @@ def test_matching_coefficients():
     same = torch.stack([c, c + 1e-6 * q[:, 1], c + 1e-6 * q[:, 2]])  # nearly identical: any split with sum 1
     assert abs(sum(S.matching_coefficients(gram(same), [0, 1, 2])) - 1) < 1e-3
     shared = torch.stack([c + q[:, 1], c + q[:, 2]])  # one shared unit part, one own part each: theta = c + q1 + q2
+    dup = S.matching_coefficients(gram(torch.stack([c, c, torch.zeros(50, dtype=torch.float64)])), [0, 1, 2])
+    assert abs(dup[0] - 0.5) < 1e-9 and abs(dup[1] - 0.5) < 1e-9 and dup[2] == 0  # singular G: no failure
     a = S.matching_coefficients(gram(shared), [0, 1])
     assert torch.allclose(torch.tensor(a, dtype=torch.float64), torch.tensor([2 / 3, 2 / 3], dtype=torch.float64))

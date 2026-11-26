@@ -21,6 +21,7 @@ Three steps, each a subcommand of ``python -m shared_delta_moe.similarity``:
 
 import argparse
 import json
+import math
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -48,6 +49,7 @@ def tensor_files(path: str | Path) -> dict[str, tuple[str, str]]:
 def bf16_ulp(w: Tensor) -> Tensor:
     """One bf16 ulp at :math:`|w|` (8 significant bits): :math:`2^{e-8}` for :math:`w = m 2^e`, :math:`m \\in [0.5, 1)`."""
     _, e = torch.frexp(w)
+    e = torch.where(w == 0, -125, e).clamp(min=-125)  # 2**-133: the smallest bf16 subnormal (frexp(0) gives e = 0)
     return torch.ldexp(torch.ones_like(w), e - 8)
 
 
@@ -85,7 +87,7 @@ def delta_gram(base: str | Path, fts: Mapping[str, str | Path], shard: int = 0, 
         if t % shards != shard:
             continue
         shape = op(b[name][0]).get_slice(b[name][1]).get_shape()
-        step = max(1, CHUNK // max(1, int(torch.tensor(shape[1:]).prod().item()) if len(shape) > 1 else 1))
+        step = max(1, CHUNK // math.prod(shape[1:]))
         gram = torch.zeros(n + 1, n + 1, dtype=torch.float64, device=device)
         zero = torch.zeros(n, dtype=torch.float64, device=device)
         ulp1 = torch.zeros(n, dtype=torch.float64, device=device)
@@ -180,7 +182,7 @@ def fit(gram: Tensor, target: int, sources: Sequence[int]) -> tuple[list[float],
     fine-tunes from 0). Returns :math:`\beta` and the unexplained fraction of :math:`\|\Delta_t\|^2`."""
     g = gram[1:, 1:]
     s = list(sources)
-    beta = torch.linalg.solve(g[s][:, s], g[s, target])
+    beta = torch.linalg.pinv(g[s][:, s]) @ g[s, target]  # pinv: collinear sources share their weight
     return beta.tolist(), float(1 - g[s, target] @ beta / g[target, target])
 
 
@@ -203,7 +205,7 @@ def matching_coefficients(gram: Tensor, members: Sequence[int]) -> list[float]:
     direction (guide: similarity.md)."""
     m = list(members)
     g = gram[1:, 1:][m][:, m]
-    return torch.linalg.solve(g, g.diagonal()).tolist()
+    return (torch.linalg.pinv(g) @ g.diagonal()).tolist()  # pinv: duplicate or zero members do not fail
 
 
 def neuron_overlap(tensors: Mapping[str, Any], i: int, j: int, top: float = 0.1) -> dict[str, float]:
