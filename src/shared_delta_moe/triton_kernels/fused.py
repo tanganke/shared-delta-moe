@@ -1,23 +1,33 @@
-"""Fused parameter-aggregation MoE in three launches after the routing, with no host synchronisation:
+r"""Fused parameter-aggregation MoE in three launches after the routing, with no host synchronisation:
 
-  sort     one program: a stable counting sort of the (token, slot) pairs by group (delta e -> group e, every zero
-           expert -> group G), for a routing chosen in torch (DeltaMoE.topk: the same choice as every other forward
-           and as the autograd path, ties included). Writes perm (sorted position -> pair) and gstart (G + 2 group
-           starts in sorted order).
-  gate_up  h = SiLU(x (W_g + D_g)^T) * (x (W_u + D_u)^T) for every sorted pair, x rows gathered through perm, the
-           sums W + D formed tile by tile in registers; h is written in sorted order.
-  down     y = h (W_d + D_d)^T, scaled by the routing weight and written to the pair's slot (split-K: atomically
-           added to the token's float32 row, which also sums the top-k slots).
+sort
+    One program: a stable counting sort of the (token, slot) pairs by group (delta :math:`e` to group :math:`e`,
+    every zero expert to group :math:`G`), for a routing chosen in torch (``DeltaMoE.topk``: the same choice as every
+    other forward and as the autograd path, ties included). Writes ``perm`` (sorted position to pair) and ``gstart``
+    (:math:`G + 2` group starts in sorted order).
+gate_up
+    :math:`h = \mathrm{SiLU}(x (W_g + D_g)^\top) \odot (x (W_u + D_u)^\top)` for every sorted pair, the rows of
+    :math:`x` gathered through ``perm``, the sums :math:`W + D` formed tile by tile in registers; :math:`h` is written
+    in sorted order.
+down
+    :math:`y = h (W_d + D_d)^\top`, scaled by the routing weight and written to the pair's slot (split-K: atomically
+    added to the token's float32 row, which also sums the top-k slots).
 
 The GEMM kernels are persistent: each program walks tiles (group, row tile, column tile, K split) with a grouped
 order, so programs running at the same time share weight and activation tiles in L2. The tile list is derived on
-the device from gstart, which is what lets a whole forward run under a CUDA graph.
+the device from ``gstart``, which is what lets a whole forward run under a CUDA graph.
 
-Deltas come in three storage modes (MODE): 0 dense (G, N, K); 1 seeded DARE (models/dare.py), the keep bits
-of each tile read from a 1-bit-per-block mask bitmap and the kept values gathered from the packed storage; 2 BitDelta
-(models/bitdelta.py), sign bits expanded to +-scale per tile, the scales one per row or per block. On Hopper (sm90+) with dense deltas the
-weight tiles are loaded with TMA (tensor descriptors), so that address arithmetic and masking leave the main loop.
-Row offsets (row index times row stride) are int64: h (pairs x inter) passes 2^31 elements in training.
+Deltas come in three storage modes (``MODE``):
+
+- 0: dense, (G, N, K).
+- 1: seeded DARE (``models/dare.py``), the keep bits of each tile read from a 1-bit-per-block mask bitmap and the
+  kept values gathered from the packed storage.
+- 2: BitDelta (``models/bitdelta.py``), sign bits expanded to :math:`\pm` scale per tile, the scales one per row or
+  per block.
+
+On Hopper (sm90+) with dense deltas the weight tiles are loaded with TMA (tensor descriptors), so that address
+arithmetic and masking leave the main loop. Row offsets (row index times row stride) are int64: :math:`h`
+(pairs :math:`\times` inter) passes :math:`2^{31}` elements in training.
 """
 
 import os
@@ -67,15 +77,16 @@ def _sort_kernel(idx_ptr, perm_ptr, gstart_ptr, T, n_delta, TOPK: tl.constexpr, 
 
 
 class Routing(NamedTuple):
-    """A routing sorted by group, as route returns it; P = tokens * top_k pairs, G = n_delta.
+    r"""A routing sorted by group, as ``route`` returns it; :math:`P` = tokens :math:`\cdot` top_k pairs,
+    :math:`G` = ``n_delta``.
 
     Attributes:
         perm: (P,) int32, sorted position -> pair (token * top_k + slot).
-        gstart: (G + 2,) int32, start of each group in sorted order; [G + 1] = P.
+        gstart: (G + 2,) int32, start of each group in sorted order; ``gstart[G + 1]`` = :math:`P`.
         weight: (P,) float32, renormalised routing weight of each pair.
         tokens: T, number of tokens.
         top_k: k, slots per token.
-        n_delta: G, number of delta experts (every zero expert is group G).
+        n_delta: :math:`G`, number of delta experts (every zero expert is group :math:`G`).
     """
 
     perm: Tensor  # (P,) int32, sorted position -> pair (token * top_k + slot)
@@ -95,7 +106,7 @@ def route(idx: Tensor, weight: Tensor, n_delta: int) -> Routing:
         n_delta: G, number of delta experts.
 
     Returns:
-        The Routing: delta e -> group e, every zero expert -> group G.
+        The Routing: delta :math:`e` to group :math:`e`, every zero expert to group :math:`G`.
     """
     T, k = idx.shape
     idx = idx.contiguous()
@@ -420,10 +431,10 @@ def _down_kernel(
 class Delta(NamedTuple):
     """One projection's deltas as the kernels take them, for G delta experts of (N, K) matrices.
 
-    :ivar mode: Storage mode. 0: dense; 1: seeded DARE (models/dare.py); 2: BitDelta (models/bitdelta.py).
+    :ivar mode: Storage mode. 0: dense; 1: seeded DARE (``models/dare.py``); 2: BitDelta (``models/bitdelta.py``).
     :ivar d: Mode 0: (G, N, K) dense deltas. Mode 1: the packed kept values. Mode 2: (G, N, K / 32) int32 sign bits.
     :ivar p: Mode 1: (G, N) each row's start in d. Mode 2: (G, N, cdiv(K, block)) scales. Unused in mode 0.
-    :ivar m: Mode 1: (G, N, words) int32, the keep bit of each DARE block (models/dare.py mask_bits). Unused
+    :ivar m: Mode 1: (G, N, words) int32, the keep bit of each DARE block (``models/dare.py`` ``mask_bits``). Unused
         otherwise.
     :ivar block: Mode 1: the DARE block size. Mode 2: the entries per scale (a power of 2), 0 for one scale per row.
     """
@@ -541,19 +552,24 @@ def _launch_fixed(kernel, grid, config: triton.Config, tiles: int, args: tuple, 
 
 def gate_up(x: Tensor, r: Routing, wg: Tensor, wu: Tensor, dg: Delta, du: Delta,
             config: triton.Config | None = None) -> Tensor:  # fmt: skip
-    """First GEMM: h = SiLU(x (W_g + D_g)^T) * (x (W_u + D_u)^T) for every sorted pair.
+    r"""First GEMM, for every sorted pair:
+
+    .. math::
+
+       h = \mathrm{SiLU}(x (W_g + D_g)^\top) \odot (x (W_u + D_u)^\top).
+
 
     Args:
-        x: (T, H) tokens; each pair's row is gathered through r.perm.
-        r: The sorted routing (route).
-        wg: (I, H) base gate weight W_g.
-        wu: (I, H) base up weight W_u.
-        dg: Gate deltas D_g, (G, I, H) as a Delta.
-        du: Up deltas D_u, same mode as dg.
+        x: (T, H) tokens; each pair's row is gathered through ``r.perm``.
+        r: The sorted routing (``route``).
+        wg: (I, H) base gate weight :math:`W_g`.
+        wu: (I, H) base up weight :math:`W_u`.
+        dg: Gate deltas :math:`D_g`, (G, I, H) as a Delta.
+        du: Up deltas :math:`D_u`, same mode as dg.
         config: One fixed Triton config instead of autotuning.
 
     Returns:
-        h (P, I) in sorted pair order, in x's dtype.
+        :math:`h` (P, I) in sorted pair order, in x's dtype.
 
     Raises:
         ValueError: If config does not fit (shared memory, or a 256-wide TMA box).
@@ -575,22 +591,22 @@ def gate_up(x: Tensor, r: Routing, wg: Tensor, wu: Tensor, dg: Delta, du: Delta,
 
 def down(h: Tensor, r: Routing, w: Tensor, d: Delta, config: triton.Config | None = None,
          split_k: int | None = None) -> Tensor:  # fmt: skip
-    """Second GEMM: y = h (W_d + D_d)^T, scaled by each pair's routing weight and summed over the slots.
+    r"""Second GEMM, :math:`y = h (W_d + D_d)^\top`, scaled by each pair's routing weight and summed over the slots.
 
     Args:
-        h: (P, I) gate_up output, in sorted pair order.
-        r: The sorted routing (route).
-        w: (H, I) base down weight W_d.
-        d: Down deltas D_d, (G, H, I) as a Delta.
+        h: (P, I) ``gate_up`` output, in sorted pair order.
+        r: The sorted routing (``route``).
+        w: (H, I) base down weight :math:`W_d`.
+        d: Down deltas :math:`D_d`, (G, H, I) as a Delta.
         config: One fixed Triton config instead of autotuning.
         split_k: K splits (atomic float32 adds into each token's row); None: chosen from the tile count and the
             SMs (1 for DARE, whose rows are read from their start).
 
     Returns:
-        (T, H) in h's dtype: sum over slots of r_i * h_i (W_d + D_d)^T.
+        (T, H) in h's dtype: :math:`\sum_i r_i\, h_i (W_d + D_d)^\top` over the slots :math:`i`.
 
     Raises:
-        AssertionError: If split_k > 1 with DARE deltas.
+        AssertionError: If ``split_k > 1`` with DARE deltas.
         ValueError: If config does not fit (shared memory, or a 256-wide TMA box).
     """
     P, (N, K), G, T = h.shape[0], w.shape, r.n_delta, r.tokens
@@ -614,15 +630,15 @@ def down(h: Tensor, r: Routing, w: Tensor, d: Delta, config: triton.Config | Non
 
 def fused_moe(x: Tensor, idx: Tensor, rw: Tensor, n_delta: int, base: tuple[Tensor, Tensor, Tensor],
               deltas: tuple[Delta, Delta, Delta]) -> Tensor:  # fmt: skip
-    """Parameter-aggregation MoE forward: route, gate_up, down.
+    """Parameter-aggregation MoE forward: ``route``, ``gate_up``, ``down``.
 
     Args:
         x: (T, H) tokens.
         idx: (T, k) expert per slot; >= n_delta: a zero expert.
         rw: (T, k) routing weight per slot.
         n_delta: G, number of delta experts.
-        base: (W_g (I, H), W_u (I, H), W_d (H, I)).
-        deltas: (D_g, D_u, D_d), one Delta per projection, all in the same mode.
+        base: (:math:`W_g` (I, H), :math:`W_u` (I, H), :math:`W_d` (H, I)).
+        deltas: (:math:`D_g`, :math:`D_u`, :math:`D_d`), one Delta per projection, all in the same mode.
 
     Returns:
         (T, H) MoE output in x's dtype (empty for T = 0).
@@ -678,18 +694,18 @@ def _(x, *args, **kwargs):
 
 def fused_moe_any(x: Tensor, idx: Tensor, rw: Tensor, n_delta: int, base: tuple[Tensor, Tensor, Tensor],
                   deltas: tuple[Delta, Delta, Delta]) -> Tensor:  # fmt: skip
-    """fused_moe, through the registered op while torch.compile traces.
+    """``fused_moe``, through the registered op while ``torch.compile`` traces.
 
-    Eager calls run fused_moe directly (skipping the dispatcher); under torch.compile the forward is one opaque op
-    (fused_moe_dense, fused_moe_dare or fused_moe_bit, by the deltas' mode).
+    Eager calls run ``fused_moe`` directly (skipping the dispatcher); under ``torch.compile`` the forward is one opaque
+    op (``fused_moe_dense``, ``fused_moe_dare`` or ``fused_moe_bit``, by the deltas' mode).
 
     Args:
         x: (T, H) tokens.
         idx: (T, k) expert per slot; >= n_delta: a zero expert.
         rw: (T, k) routing weight per slot.
         n_delta: G, number of delta experts.
-        base: (W_g (I, H), W_u (I, H), W_d (H, I)).
-        deltas: (D_g, D_u, D_d), one Delta per projection, all in the same mode.
+        base: (:math:`W_g` (I, H), :math:`W_u` (I, H), :math:`W_d` (H, I)).
+        deltas: (:math:`D_g`, :math:`D_u`, :math:`D_d`), one Delta per projection, all in the same mode.
 
     Returns:
         (T, H) MoE output in x's dtype.

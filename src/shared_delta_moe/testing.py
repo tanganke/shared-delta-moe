@@ -8,7 +8,7 @@ from .type_hints import MLPWeights
 def random_experts(
     hidden: int, inter: int, n: int, dtype: torch.dtype, device: str
 ) -> list[MLPWeights]:
-    """n random (gate, up, down), scaled 1/sqrt(fan_in) so activations stay O(1).
+    r"""n random (gate, up, down), scaled :math:`1/\sqrt{\mathrm{fan\_in}}` so activations stay :math:`O(1)`.
 
     Args:
         hidden: H, the model width.
@@ -18,7 +18,7 @@ def random_experts(
         device: Device of the weights.
 
     Returns:
-        n tuples (gate (I, H), up (I, H), down (H, I)) of standard normal weights times fan_in ** -0.5.
+        n tuples (gate (I, H), up (I, H), down (H, I)) of standard normal weights times :math:`\mathrm{fan\_in}^{-1/2}`.
     """
 
     def r(*shape: int) -> torch.Tensor:

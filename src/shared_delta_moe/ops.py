@@ -19,7 +19,7 @@ from .type_hints import (
 
 
 def mlp(x: Tokens, gate: InWeight, up: InWeight, down: OutWeight) -> Tokens:
-    """SwiGLU MLP: down(silu(gate x) * up x).
+    r"""SwiGLU MLP: :math:`\mathrm{down}(\mathrm{silu}(\mathrm{gate}\, x) \odot \mathrm{up}\, x)`.
 
     Args:
         x: (T, H) tokens.
@@ -52,7 +52,7 @@ def groups(e: SlotExperts, r: SlotWeights) -> list[Group]:
 
 
 def sort_rows(e: SlotExperts, n: int) -> tuple[Rows, GroupEnds]:
-    """Rows with e >= 0, sorted by e, and the cumulative group sizes that grouped_mm takes as offs.
+    """Rows with e >= 0, sorted by e, and the cumulative group sizes that ``grouped_mm`` takes as ``offs``.
 
     Args:
         e: (T,) int64 group index per row; rows with e < 0 are dropped.
@@ -68,12 +68,13 @@ def sort_rows(e: SlotExperts, n: int) -> tuple[Rows, GroupEnds]:
 
 
 def gmm(a: GroupedRows, w: StackedWeight, offs: GroupEnds) -> GroupedOut:
-    """One grouped GEMM: rows offs[g-1]:offs[g] of a times w[g]^T (CUDA sm80+, or CPU; bf16/fp16/fp32).
+    r"""One grouped GEMM: rows ``offs[g-1]:offs[g]`` of ``a`` times :math:`w[g]^\top` (CUDA sm80+, or CPU;
+    bf16/fp16/fp32).
 
     Args:
         a: (R, in) rows sorted by group.
         w: (G, out, in) one weight per group.
-        offs: (G,) int32 cumulative group sizes, as from sort_rows.
+        offs: (G,) int32 cumulative group sizes, as from ``sort_rows``.
 
     Returns:
         (R, out) row i of a times the transposed weight of its group.

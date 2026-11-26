@@ -1,19 +1,21 @@
-"""Seeded DARE deltas: each Delta_e keeps a random fraction `keep` of its entries (or of its 1 x block blocks along
-the input dimension), rescaled by 1/keep; only the kept values are stored. The mask is not stored: it is a function of
-(seed, expert, projection, position) through Philox4x32-10, pure 32-bit integer arithmetic, so it regenerates
-bit for bit on any device.
+r"""Seeded DARE deltas: each :math:`\Delta_e` keeps a random fraction :math:`\mathrm{keep}` of its entries (or of its
+:math:`1 \times B` blocks along the input dimension), rescaled by :math:`1 / \mathrm{keep}`; only the kept values are
+stored. The mask is not stored: it is a function of (seed, expert, projection, position) through Philox4x32-10, pure
+32-bit integer arithmetic, so it regenerates bit for bit on any device.
 
-Mask spec, for projection j (0 gate, 1 up, 2 down) of delta e, an (R, C) matrix, block size B dividing C::
+Mask spec, for projection :math:`j` (0 gate, 1 up, 2 down) of delta :math:`e`, an (R, C) matrix, block size :math:`B`
+dividing :math:`C`::
 
   unit u = row * (C / B) + col // B,  counter = (u, 3e + j, 0, 0),  key = (seed mod 2^32, seed >> 32)
   kept  <=>  word 0 of Philox4x32-10(counter, key) < round(keep * 2^32)
 
-Kept values are stored row-major, expert by expert, as Delta / keep in the model dtype; p_<proj> (N, R) holds where
-each row starts. The fused kernel and the materialised (training) path read the mask as a bitmap (mask_bits: 1 bit per
-block, built once per model and kept as a non-persistent buffer) rather than running Philox each time: rows x C / B
-bits per delta matrix, e.g. 0.7 MB per Qwen3.5-4B MoE layer at block 64. It is built in __init__ and again after load_state_dict (which also covers a
-model made on the meta device), never inside a forward: there it could land in a CUDA-graph capture or a compiled
-trace. seed, keep and block are fixed at construction.
+Kept values are stored row-major, expert by expert, as :math:`\Delta / \mathrm{keep}` in the model dtype; ``p_<proj>``
+(N, R) holds where each row starts. The fused kernel and the materialised (training) path read the mask as a bitmap
+(``mask_bits``: 1 bit per block, built once per model and kept as a non-persistent buffer) rather than running Philox
+each time: :math:`R \cdot C / B` bits per delta matrix, e.g. 0.7 MB per Qwen3.5-4B MoE layer at block 64. It is built in
+``__init__`` and again after ``load_state_dict`` (which also covers a model made on the meta device), never inside a
+forward: there it could land in a CUDA-graph capture or a compiled trace. ``seed``, ``keep`` and ``block`` are fixed
+at construction.
 """
 
 from typing import Any
@@ -28,7 +30,8 @@ M32 = 0xFFFFFFFF
 
 
 def _mulhilo(a: int, b: Tensor) -> tuple[Tensor, Tensor]:
-    """(a * b) >> 32 and (a * b) mod 2^32 for a < 2^32 and b in [0, 2^32) held in int64, without int64 overflow."""
+    r"""(a * b) >> 32 and :math:`(a b) \bmod 2^{32}` for :math:`a < 2^{32}` and :math:`b \in [0, 2^{32})` held in int64,
+    without int64 overflow."""
     lo, mid = a * (b & 0xFFFF), a * (b >> 16)  # a * b = mid * 2^16 + lo, each < 2^48
     return (mid + (lo >> 16)) >> 16, (((mid & 0xFFFF) << 16) + lo) & M32
 
@@ -36,21 +39,21 @@ def _mulhilo(a: int, b: Tensor) -> tuple[Tensor, Tensor]:
 def philox(
     c0: Tensor, c1: Tensor, c2: Tensor, c3: Tensor, k0: int, k1: int, rounds: int = 10
 ) -> Tensor:
-    """Word 0 of Philox4x32 (Salmon et al. 2011; the constants and round of Random123 and Triton).
+    r"""Word 0 of Philox4x32 (Salmon et al. 2011; the constants and round of Random123 and Triton).
 
     Pure 32-bit integer arithmetic carried in int64, so the result is bit-identical on every device.
 
     Args:
-        c0: Counter word 0, int64 tensor with values in [0, 2^32).
+        c0: Counter word 0, int64 tensor with values in :math:`[0, 2^{32})`.
         c1: Counter word 1, int64, same shape as c0.
         c2: Counter word 2, int64, same shape as c0.
         c3: Counter word 3, int64, same shape as c0.
-        k0: Key word 0, an int in [0, 2^32).
-        k1: Key word 1, an int in [0, 2^32).
+        k0: Key word 0, an int in :math:`[0, 2^{32})`.
+        k1: Key word 1, an int in :math:`[0, 2^{32})`.
         rounds: Number of Philox rounds (10: Philox4x32-10).
 
     Returns:
-        Word 0 of the output, int64 with values in [0, 2^32), the shape of c0.
+        Word 0 of the output, int64 with values in :math:`[0, 2^{32})`, the shape of c0.
     """
     for _ in range(rounds):
         hb, lb = _mulhilo(0xCD9E8D57, c2)
@@ -61,13 +64,13 @@ def philox(
 
 
 def threshold(keep: float) -> int:
-    """Philox threshold of a keep fraction.
+    r"""Philox threshold of a keep fraction.
 
     Args:
         keep: Fraction of units kept, in [0, 1].
 
     Returns:
-        round(keep * 2^32): a unit is kept where Philox word 0 is below it.
+        :math:`\mathrm{round}(\mathrm{keep} \cdot 2^{32})`: a unit is kept where Philox word 0 is below it.
     """
     return round(keep * 2**32)
 
@@ -81,15 +84,15 @@ def keep_mask(
     block: int,
     device: Any = "cpu",
 ) -> Tensor:
-    """Keep mask of one delta matrix (see the module docstring for the spec).
+    r"""Keep mask of one delta matrix (see the module docstring for the spec).
 
     Args:
-        seed: DARE seed, in [0, 2^63).
-        stream: 3 * expert + projection (0 gate, 1 up, 2 down).
+        seed: DARE seed, in :math:`[0, 2^{63})`.
+        stream: :math:`3 e + j` for expert :math:`e` and projection :math:`j` (0 gate, 1 up, 2 down).
         rows: R, rows of the delta matrix.
         cols: C, columns of the delta matrix; a multiple of block.
         keep: Fraction of blocks kept.
-        block: B, entries per 1 x B block along a row.
+        block: B, entries per :math:`1 \times B` block along a row.
         device: Device the mask is computed on.
 
     Returns:
@@ -103,19 +106,20 @@ def keep_mask(
 
 
 def mask_bits(seed: int, stream: int, rows: int, cols: int, keep: float, block: int, device: Any = "cpu") -> Tensor:
-    """keep_mask as a bitmap, 1 bit per block.
+    r"""``keep_mask`` as a bitmap, 1 bit per block.
 
     Args:
         seed: DARE seed.
-        stream: 3 * expert + projection (0 gate, 1 up, 2 down).
+        stream: :math:`3 e + j` for expert :math:`e` and projection :math:`j` (0 gate, 1 up, 2 down).
         rows: R, rows of the delta matrix.
         cols: C, columns of the delta matrix; a multiple of block.
         keep: Fraction of blocks kept.
-        block: B, entries per 1 x B block along a row.
+        block: B, entries per :math:`1 \times B` block along a row.
         device: Device the bitmap is computed on.
 
     Returns:
-        (rows, ceil(cols / block / 32)) int32: block j of a row in bit j % 32 of word j // 32, set where kept.
+        (rows, ceil(cols / block / 32)) int32: block :math:`j` of a row in bit :math:`j \bmod 32` of word
+        :math:`\lfloor j / 32 \rfloor`, set where kept.
     """
     u = torch.arange(rows * (cols // block), device=device)
     z = torch.zeros_like(u)
@@ -129,18 +133,18 @@ def mask_bits(seed: int, stream: int, rows: int, cols: int, keep: float, block: 
 def pack(
     d: Tensor, seed: int, j: int, keep: float, block: int
 ) -> tuple[Tensor, Tensor]:
-    """Pack the deltas of one projection into their kept values.
+    r"""Pack the deltas of one projection into their kept values.
 
     Args:
         d: (N, R, C) deltas of projection j, one per delta expert.
         seed: DARE seed.
         j: Projection index (0 gate, 1 up, 2 down).
         keep: Fraction of blocks kept.
-        block: B, entries per 1 x B block along a row.
+        block: B, entries per :math:`1 \times B` block along a row.
 
     Returns:
-        A pair (v, p): v the kept values / keep, flat, row-major expert by expert, in d's dtype; p (N, R) int64,
-        each row's start in v.
+        A pair (v, p): v the kept values :math:`\Delta / \mathrm{keep}`, flat, row-major expert by expert, in d's
+        dtype; p (N, R) int64, each row's start in v.
     """
     vals, counts = [d.new_empty(0)], [torch.zeros(0, dtype=torch.int64, device=d.device)]  # N = 0: empty
     for e in range(d.shape[0]):
@@ -152,20 +156,22 @@ def pack(
 
 
 class DareDeltaMoE(DeltaMoE):
-    """DeltaMoE whose deltas are seeded DARE (see the module docstring).
+    r"""DeltaMoE whose deltas are seeded DARE (see the module docstring).
 
-    The materialised path (training) unpacks only the routed expert e from the mask bitmap (delta(e)); d_gate / d_up /
-    d_down unpack every expert on access, so the other inherited forwards work too (as references); the fused Triton
-    path reads the packed values directly (triton_kernels/fused.py). Build with from_delta_moe; the constructor leaves
-    the packed buffers empty (load_state_dict sizes them to the checkpoint's).
+    The materialised path (training) unpacks only the routed expert :math:`e` from the mask bitmap (``delta(e)``);
+    ``d_gate`` / ``d_up`` / ``d_down`` unpack every expert on access, so the other inherited forwards work too (as
+    references); the fused Triton path reads the packed values directly (``triton_kernels/fused.py``). Build with
+    ``from_delta_moe``; the constructor leaves the packed buffers empty (``load_state_dict`` sizes them to the
+    checkpoint's).
 
     Args:
         hidden: H, model hidden size.
         inter: I, expert intermediate size.
         n_delta: N, number of delta experts.
         keep: Fraction of each delta's blocks kept.
-        block: B, entries per 1 x B block along the input dimension; must divide each projection's columns.
-        seed: DARE seed, in [0, 2^63).
+        block: B, entries per :math:`1 \times B` block along the input dimension; must divide each projection's
+            columns.
+        seed: DARE seed, in :math:`[0, 2^{63})`.
         top_k: Experts per token.
         num_zero_experts: Z, router rows that route to the base alone.
         device: Device of the parameters and buffers.
@@ -238,15 +244,16 @@ class DareDeltaMoE(DeltaMoE):
     def from_delta_moe(
         cls, m: DeltaMoE, keep: float, block: int = 1, seed: int = 0
     ) -> "DareDeltaMoE":
-        """DARE form of a DeltaMoE, with the same base, router, top-k and zero experts.
+        r"""DARE form of a DeltaMoE, with the same base, router, top-k and zero experts.
 
-        Each delta keeps the fraction `keep` of its 1 x `block` blocks chosen by `seed`, rescaled by 1 / keep.
+        Each delta keeps the fraction ``keep`` of its :math:`1 \times B` blocks (:math:`B` = ``block``) chosen by
+        ``seed``, rescaled by :math:`1 / \mathrm{keep}`.
 
         Args:
             m: The DeltaMoE to convert (not a HierDeltaMoE).
             keep: Fraction of each delta's blocks kept.
-            block: B, entries per 1 x B block along the input dimension.
-            seed: DARE seed, in [0, 2^63).
+            block: B, entries per :math:`1 \times B` block along the input dimension.
+            seed: DARE seed, in :math:`[0, 2^{63})`.
 
         Returns:
             The DareDeltaMoE, on m's device and in m's dtype.
@@ -286,7 +293,7 @@ class DareDeltaMoE(DeltaMoE):
         return m
 
     def _unpack(self, name: str, e: int) -> Tensor:
-        """Dense Delta_e of one projection from the bitmap (no Philox); differentiable in v_<name>."""
+        r"""Dense :math:`\Delta_e` of one projection from the bitmap (no Philox); differentiable in ``v_<name>``."""
         _, R, C = self.shapes[name]
         w = self._bits(name)[e]  # (R, words)
         bits = (w[..., None] >> torch.arange(32, dtype=torch.int32, device=w.device)) & 1
@@ -295,13 +302,14 @@ class DareDeltaMoE(DeltaMoE):
         return v.new_zeros(R, C).masked_scatter(keep, v[int(getattr(self, f"p_{name}")[e, 0]) :])
 
     def delta(self, e: int) -> tuple[Tensor, Tensor, Tensor]:
-        """Dense deltas of one expert, unpacked from the mask bitmap (no Philox); differentiable in v_<proj>.
+        r"""Dense deltas of one expert, unpacked from the mask bitmap (no Philox); differentiable in ``v_<proj>``.
 
         Args:
             e: Delta expert index, in [0, n_delta).
 
         Returns:
-            (Delta_gate (I, H), Delta_up (I, H), Delta_down (H, I)) of expert e.
+            (:math:`\Delta_\mathrm{gate}` (I, H), :math:`\Delta_\mathrm{up}` (I, H), :math:`\Delta_\mathrm{down}`
+            (H, I)) of expert :math:`e`.
 
         Raises:
             RuntimeError: If the mask bitmaps are not built (e.g. made on meta, then to_empty, no load).

@@ -1,27 +1,39 @@
-"""Top-k SwiGLU MoE written as a shared base expert plus per-expert deltas, with two exact forward forms.
+r"""Top-k SwiGLU MoE written as a shared base expert plus per-expert deltas, with two exact forward forms.
 
-Routed expert e has weights W_e = W_b + Delta_e for each of gate, up and down. Router rows 0 .. n-1 are the
-deltas; rows n .. n+Z-1 are zero experts (num_zero_experts = Z, default 1): no parameters, each stands for the base
-MLP itself. Routing is softmax, top-k, renormalised over the k picks (weights r). Both forms below equal the plain MoE
-sum_i r_i MLP(x; W_{e_i})  with experts [W_b + Delta_1, ..., W_b + Delta_n] + [W_b] * Z; they differ only in where
-the addition happens::
+Routed expert :math:`e` has weights :math:`W_e = W_b + \Delta_e` for each of gate, up and down. Router rows
+0 .. n-1 are the deltas; rows n .. n+Z-1 are zero experts (``num_zero_experts`` = Z, default 1): no parameters, each
+stands for the base MLP itself. Routing is softmax, top-k, renormalised over the k picks (weights :math:`r`). Both
+forms below equal the plain MoE
 
-  forward_param   parameter aggregation: per expert, materialise W_b + Delta_e once and run one MLP on the
-                  (token, slot) pairs routed to it, weighted by r (small groups skip the materialisation)
-  forward_matrix  per-matrix output aggregation: gate/up are W_b x (once for all tokens) + Delta_e x per slot; each
-                  slot has its own activation h_i, down is W_b h_i + Delta_e h_i; slots summed with weights r
-  forward_dense   the plain MoE baseline, from stored full experts
+.. math::
 
-Each public forward picks an implementation (_forward_*) by hardware and input, with thresholds in constants.py:
-forward_param uses the fused Triton kernel on CUDA bf16/fp16 for a moderate number of (token, slot) pairs, else
-materialised weights; forward_matrix / forward_dense use grouped GEMM (F.grouped_mm) when available for the dtype and
-device and there is more than one pair, else a loop.
+    \sum_{i=1}^{k} r_i \, \mathrm{MLP}(x; W_{e_i})
 
-Adding r Delta_e x into one shared activation instead (merging weights per token) is not the same function when k > 1,
-because SwiGLU is nonlinear; each slot keeps its own activation here. With k = 1, r = 1 and both reduce to one MLP.
+with experts :math:`[W_b + \Delta_1, \dots, W_b + \Delta_n] + [W_b] \times Z`; they differ only in where the addition
+happens:
 
-Plain PyTorch (F.linear, F.grouped_mm, index_add), plus an optional Triton kernel for parameter aggregation that
-adds W_b + Delta_e tile by tile in registers instead of writing the sum out (triton_kernels/).
+``forward_param``
+    Parameter aggregation: per expert, materialise :math:`W_b + \Delta_e` once and run one MLP on the (token, slot)
+    pairs routed to it, weighted by :math:`r` (small groups skip the materialisation).
+``forward_matrix``
+    Per-matrix output aggregation: gate/up are :math:`W_b x` (once for all tokens) :math:`+ \Delta_e x` per slot;
+    each slot has its own activation :math:`h_i`, down is :math:`W_b h_i + \Delta_e h_i`; slots summed with weights
+    :math:`r`.
+``forward_dense``
+    The plain MoE baseline, from stored full experts.
+
+Each public forward picks an implementation (``_forward_*``) by hardware and input, with thresholds in
+``constants.py``: ``forward_param`` uses the fused Triton kernel on CUDA bf16/fp16 for a moderate number of (token,
+slot) pairs, else materialised weights; ``forward_matrix`` / ``forward_dense`` use grouped GEMM (``F.grouped_mm``)
+when available for the dtype and device and there is more than one pair, else a loop.
+
+Adding :math:`r \Delta_e x` into one shared activation instead (merging weights per token) is not the same function
+when :math:`k > 1`, because SwiGLU is nonlinear; each slot keeps its own activation here. With :math:`k = 1`,
+:math:`r = 1` and both reduce to one MLP.
+
+Plain PyTorch (``F.linear``, ``F.grouped_mm``, ``index_add``), plus an optional Triton kernel for parameter
+aggregation that adds :math:`W_b + \Delta_e` tile by tile in registers instead of writing the sum out
+(``triton_kernels/``).
 """
 
 from collections.abc import Sequence
@@ -61,33 +73,33 @@ def _pow2(n: int) -> int:
 
 
 class DeltaMoE(nn.Module):
-    """Top-k SwiGLU MoE stored as a shared base expert W_b plus per-expert deltas Delta_e.
+    r"""Top-k SwiGLU MoE stored as a shared base expert :math:`W_b` plus per-expert deltas :math:`\Delta_e`.
 
-    The parameters are uninitialised (torch.empty); fill them with from_experts or load_state_dict.
+    The parameters are uninitialised (``torch.empty``); fill them with ``from_experts`` or ``load_state_dict``.
 
     Args:
         hidden: H, the model width.
         inter: I, the MLP intermediate width.
         n_delta: N, the number of routed experts with a delta.
-        top_k: K, experts picked per token; 1 <= top_k <= n_delta + num_zero_experts.
-        num_zero_experts: Z >= 0, router rows N..N+Z-1 that route to the base MLP itself (no parameters).
+        top_k: K, experts picked per token; :math:`1 \le` ``top_k`` :math:`\le` ``n_delta + num_zero_experts``.
+        num_zero_experts: :math:`Z \ge 0`, router rows N..N+Z-1 that route to the base MLP itself (no parameters).
         device: Device of the parameters.
         dtype: Dtype of the parameters.
 
     Attributes:
-        triton_train: Train through the fused Triton forward + backward (triton_kernels/train.py) instead of
-            materialised cuBLAS: holds no W_b + Delta_e and no per-pair activations for the backward, but measured
-            slower (README, Training). Default False.
-        router: nn.Linear(H, N+Z, bias=False); rows N..N+Z-1 are the zero experts.
-        gate: (I, H) base gate weight W_b.
-        up: (I, H) base up weight W_b.
-        down: (H, I) base down weight W_b.
-        d_gate: (N, I, H) gate deltas Delta_e.
-        d_up: (N, I, H) up deltas Delta_e.
-        d_down: (N, H, I) down deltas Delta_e.
+        triton_train: Train through the fused Triton forward + backward (``triton_kernels/train.py``) instead of
+            materialised cuBLAS: holds no :math:`W_b + \Delta_e` and no per-pair activations for the backward, but
+            measured slower (README, Training). Default False.
+        router: ``nn.Linear(H, N+Z, bias=False)``; rows N..N+Z-1 are the zero experts.
+        gate: (I, H) base gate weight :math:`W_b`.
+        up: (I, H) base up weight :math:`W_b`.
+        down: (H, I) base down weight :math:`W_b`.
+        d_gate: (N, I, H) gate deltas :math:`\Delta_e`.
+        d_up: (N, I, H) up deltas :math:`\Delta_e`.
+        d_down: (N, H, I) down deltas :math:`\Delta_e`.
 
     Raises:
-        AssertionError: If num_zero_experts < 0 or top_k is outside 1 .. n_delta + num_zero_experts.
+        AssertionError: If ``num_zero_experts < 0`` or ``top_k`` is outside 1 .. ``n_delta + num_zero_experts``.
     """
 
     # train through the fused Triton forward + backward (triton_kernels/train.py) instead of materialised cuBLAS:
@@ -135,7 +147,8 @@ class DeltaMoE(nn.Module):
     def _init_deltas(
         self, n: int, inter: int, hidden: int, factory: dict[str, Any]
     ) -> None:
-        """Delta storage; a subclass with another format (dare.DareDeltaMoE) overrides this and d_gate/d_up/d_down."""
+        """Delta storage; a subclass with another format (``dare.DareDeltaMoE``) overrides this and
+        ``d_gate``/``d_up``/``d_down``."""
         self.d_gate, self.d_up, self.d_down = (
             nn.Parameter(torch.empty(n, inter, hidden, **factory)),
             nn.Parameter(torch.empty(n, inter, hidden, **factory)),
@@ -152,22 +165,22 @@ class DeltaMoE(nn.Module):
         top_k: int = 1,
         num_zero_experts: int = 1,
     ) -> "DeltaMoE":
-        """Build a DeltaMoE from a plain MoE.
+        r"""Build a DeltaMoE from a plain MoE.
 
-        Stores W_b and Delta_e = W_e - W_b in the inputs' dtype, on the inputs' device.
+        Stores :math:`W_b` and :math:`\Delta_e = W_e - W_b` in the inputs' dtype, on the inputs' device.
 
         Args:
-            base: The base expert's (gate (I, H), up (I, H), down (H, I)), stored as W_b.
-            experts: The other N experts' full weights W_e, each (gate, up, down) shaped like base.
+            base: The base expert's (gate (I, H), up (I, H), down (H, I)), stored as :math:`W_b`.
+            experts: The other N experts' full weights :math:`W_e`, each (gate, up, down) shaped like base.
             router: (N+Z, H) the MoE's router weight; rows N..N+Z-1 route to the base.
             top_k: K, experts picked per token.
             num_zero_experts: Z; 0: the base is only shared, never an expert on its own.
 
         Returns:
-            The DeltaMoE with H, I from base and N = len(experts).
+            The DeltaMoE with H, I from base and N = ``len(experts)``.
 
         Raises:
-            AssertionError: If router.shape[0] != len(experts) + num_zero_experts.
+            AssertionError: If ``router.shape[0] != len(experts) + num_zero_experts``.
         """
         gate, up, down = base
         assert router.shape[0] == len(experts) + num_zero_experts
@@ -197,14 +210,14 @@ class DeltaMoE(nn.Module):
             x: (T, H) tokens.
 
         Returns:
-            A tuple (idx, r): idx (T, K) int64 router index per slot (>= n_delta: a zero expert); r (T, K) float32
+            A tuple (idx, r): idx (T, K) int64 router index per slot (>= ``n_delta``: a zero expert); r (T, K) float32
             routing weights, each row renormalised to sum to 1.
         """
         r, i = self.router(x).softmax(-1, dtype=torch.float).topk(self.top_k, dim=-1)
         return i, r / r.sum(-1, keepdim=True)
 
     def route(self, x: Tokens) -> tuple[Experts, RouteWeights]:
-        """topk with every zero expert as -1 and the weights in the model dtype (used by the PyTorch forwards).
+        """``topk`` with every zero expert as -1 and the weights in the model dtype (used by the PyTorch forwards).
 
         Args:
             x: (T, H) tokens.
@@ -217,10 +230,10 @@ class DeltaMoE(nn.Module):
         return torch.where(i < self.n_delta, i, -1), r.to(x.dtype)
 
     def delta(self, e: int) -> MLPWeights:
-        """Delta_e for gate, up, down; dare.DareDeltaMoE unpacks only expert e here.
+        r""":math:`\Delta_e` for gate, up, down; ``dare.DareDeltaMoE`` unpacks only expert e here.
 
         Args:
-            e: Delta index, 0 <= e < n_delta.
+            e: Delta index, :math:`0 \le e <` ``n_delta``.
 
         Returns:
             (gate delta (I, H), up delta (I, H), down delta (H, I)).
@@ -228,7 +241,7 @@ class DeltaMoE(nn.Module):
         return self.d_gate[e], self.d_up[e], self.d_down[e]
 
     def weights(self, e: int) -> MLPWeights:
-        """Full weights of expert e: W_b + Delta_e, or W_b itself for a zero expert.
+        r"""Full weights of expert e: :math:`W_b + \Delta_e`, or :math:`W_b` itself for a zero expert.
 
         Args:
             e: Delta index, or < 0 (-1) for a zero expert.
@@ -242,11 +255,12 @@ class DeltaMoE(nn.Module):
         return self.gate + dg, self.up + du, self.down + dd
 
     def mlp_split(self, x: Tokens, e: int) -> Tokens:
-        """MLP(x; W_b + Delta_e) without forming the sum: every projection is W_b x + Delta_e x.
+        r""":math:`\mathrm{MLP}(x; W_b + \Delta_e)` without forming the sum: every projection is
+        :math:`W_b x + \Delta_e x`.
 
         Args:
             x: (T, H) tokens.
-            e: Delta index, 0 <= e < n_delta.
+            e: Delta index, :math:`0 \le e <` ``n_delta``.
 
         Returns:
             (T, H) SwiGLU MLP output of expert e.
@@ -258,8 +272,8 @@ class DeltaMoE(nn.Module):
         return F.linear(h, self.down) + F.linear(h, dd)
 
     def _forward_param(self, x: Tokens, min_rows: int = 0) -> Tokens:
-        """min_rows > 0: an expert with fewer routed rows skips materialising W_b + Delta_e and uses mlp_split
-        (reads W_b and Delta_e once, writes no weights: cheaper while memory-bound, twice the FLOPs).
+        r"""``min_rows > 0``: an expert with fewer routed rows skips materialising :math:`W_b + \Delta_e` and uses
+        ``mlp_split`` (reads :math:`W_b` and :math:`\Delta_e` once, writes no weights: cheaper while memory-bound, twice the FLOPs).
         """
         idx, r = self.route(x)
         out = torch.zeros_like(x)
@@ -293,10 +307,10 @@ class DeltaMoE(nn.Module):
         return out
 
     def dense_experts(self) -> DenseExperts:
-        """The equivalent plain MoE's full expert weights, for forward_dense.
+        r"""The equivalent plain MoE's full expert weights, for ``forward_dense``.
 
         Returns:
-            [gate (N+1, I, H), up (N+1, I, H), down (N+1, H, I)], index 0 = base, index e+1 = W_b + Delta_e.
+            [gate (N+1, I, H), up (N+1, I, H), down (N+1, H, I)], index 0 = base, index e+1 = :math:`W_b + \Delta_e`.
         """
         return [
             torch.cat((b[None], b + d))
@@ -321,7 +335,7 @@ class DeltaMoE(nn.Module):
         return out
 
     def _forward_matrix_grouped(self, x: Tokens) -> Tokens:
-        """forward_matrix with the deltas of all (token, slot) pairs done as one grouped GEMM per projection."""
+        """``forward_matrix`` with the deltas of all (token, slot) pairs done as one grouped GEMM per projection."""
         idx, r = self.route(x)
         tok = torch.arange(idx.numel(), device=x.device) // self.top_k  # pair -> token
         rows, offs = sort_rows(idx.flatten(), self.n_delta)  # pairs with a delta
@@ -333,7 +347,7 @@ class DeltaMoE(nn.Module):
         return (o.view(-1, self.top_k, x.shape[-1]) * r[..., None]).sum(1)
 
     def _forward_dense_grouped(self, x: Tokens, experts: DenseExperts) -> Tokens:
-        """Plain top-k MoE, all (token, slot) pairs as one grouped GEMM per projection (like transformers' grouped_mm)."""
+        """Plain top-k MoE, all (token, slot) pairs as one grouped GEMM per projection (like transformers' ``grouped_mm``)."""
         idx, r = self.route(x)
         tok = torch.arange(idx.numel(), device=x.device) // self.top_k
         rows, offs = sort_rows(
@@ -346,8 +360,8 @@ class DeltaMoE(nn.Module):
         return (o.view(-1, self.top_k, x.shape[-1]) * r[..., None]).sum(1)
 
     def _forward_param_triton(self, x: Tokens) -> Tokens:
-        """Parameter aggregation with W_b + Delta_e fused into the GEMMs (triton_kernels/fused.py): the routing
-        (topk) sorted in one kernel, gate/up with SiLU * up in one, down with the routing weights in one; no host
+        r"""Parameter aggregation with :math:`W_b + \Delta_e` fused into the GEMMs (``triton_kernels/fused.py``): the
+        routing (``topk``) sorted in one kernel, gate/up with SiLU * up in one, down with the routing weights in one; no host
         sync, so it can be captured in a CUDA graph. CUDA, bf16/fp16."""
         from ..triton_kernels import fused_moe
 
@@ -355,13 +369,13 @@ class DeltaMoE(nn.Module):
         return fused_moe(x, idx, r, self.n_delta, (self.gate, self.up, self.down), self._kernel_deltas())
 
     def _kernel_deltas(self) -> "tuple[Delta, Delta, Delta]":
-        """The deltas in the form the fused kernels take; dare.DareDeltaMoE overrides it with its packed storage."""
+        """The deltas in the form the fused kernels take; ``dare.DareDeltaMoE`` overrides it with its packed storage."""
         from ..triton_kernels import Delta
 
         return Delta(0, self.d_gate), Delta(0, self.d_up), Delta(0, self.d_down)
 
     def _grouped(self, x: Tokens) -> bool:
-        """Use grouped GEMM? Needs F.grouped_mm with this dtype on this device, and more than one (token, slot) pair
+        """Use grouped GEMM? Needs ``F.grouped_mm`` with this dtype on this device, and more than one (token, slot) pair
         (with one pair the sort and count cost more than the loop saves)."""
         if not hasattr(F, "grouped_mm") or x.dtype not in GROUPED_DTYPES:
             return False
@@ -379,9 +393,9 @@ class DeltaMoE(nn.Module):
         return torch.is_grad_enabled() and (x.requires_grad or any(p.requires_grad for p in self.parameters()))
 
     def _use_triton(self, x: Tokens) -> bool:
-        """Fused Triton kernels? Triton, CUDA, a TRITON_DTYPES dtype, a routing sort that fits; with a gradient
-        needed only when triton_train is set (any pair count), else TRITON_MIN_PAIRS .. TRITON_MAX_PAIRS_* (token,
-        slot) pairs."""
+        """Fused Triton kernels? Triton, CUDA, a ``TRITON_DTYPES`` dtype, a routing sort that fits; with a gradient
+        needed only when ``triton_train`` is set (any pair count), else ``TRITON_MIN_PAIRS`` ..
+        ``TRITON_MAX_PAIRS_*`` (token, slot) pairs."""
         if not (HAS_TRITON and x.is_cuda and x.dtype in TRITON_DTYPES and self.gate.dtype == x.dtype):
             return False  # (weights in another dtype: e.g. an fp32 model under bf16 autocast)
         if _pow2(self.top_k) * _pow2(self.n_delta + 2) > SORT_ONE_HOT_MAX:
@@ -394,17 +408,17 @@ class DeltaMoE(nn.Module):
         return TRITON_MIN_PAIRS <= x.shape[0] * self.top_k <= limit
 
     def forward_param(self, x: Tokens) -> Tokens:
-        """MoE forward by parameter aggregation.
+        r"""MoE forward by parameter aggregation.
 
-        Uses the fused Triton kernels when _use_triton (with the Triton backward when a gradient is needed), else
-        materialised W_b + Delta_e (experts with fewer than PARAM_MIN_ROWS routed rows skip the materialisation;
-        differentiable).
+        Uses the fused Triton kernels when ``_use_triton`` (with the Triton backward when a gradient is needed), else
+        materialised :math:`W_b + \Delta_e` (experts with fewer than ``PARAM_MIN_ROWS`` routed rows skip the
+        materialisation; differentiable).
 
         Args:
             x: (T, H) tokens.
 
         Returns:
-            (T, H) MoE output, sum_i r_i MLP(x; W_{e_i}).
+            (T, H) MoE output, :math:`\sum_{i=1}^{k} r_i \, \mathrm{MLP}(x; W_{e_i})`.
         """
         if self._use_triton(x):
             return self._forward_param_autograd(x) if self._needs_grad(x) else self._forward_param_triton(x)
@@ -412,7 +426,7 @@ class DeltaMoE(nn.Module):
 
     def _forward_param_autograd(self, x: Tokens) -> Tokens:
         """Differentiable fused parameter aggregation: the routing in torch autograd (the router gets its gradient
-        through the routing weights), the MoE in one autograd.Function that saves only its inputs; dense deltas."""
+        through the routing weights), the MoE in one ``autograd.Function`` that saves only its inputs; dense deltas."""
         from ..triton_kernels.train import fused_moe_autograd
 
         idx, r = self.topk(x)
@@ -420,7 +434,7 @@ class DeltaMoE(nn.Module):
                                   (self.d_gate, self.d_up, self.d_down), self.n_delta)  # fmt: skip
 
     def forward_matrix(self, x: Tokens) -> Tokens:
-        """MoE forward by per-matrix output aggregation.
+        r"""MoE forward by per-matrix output aggregation.
 
         Uses grouped GEMM when available and worth it, else the per-expert loop.
 
@@ -428,7 +442,7 @@ class DeltaMoE(nn.Module):
             x: (T, H) tokens.
 
         Returns:
-            (T, H) MoE output, sum_i r_i MLP(x; W_{e_i}).
+            (T, H) MoE output, :math:`\sum_{i=1}^{k} r_i \, \mathrm{MLP}(x; W_{e_i})`.
         """
         return (
             self._forward_matrix_grouped(x)
@@ -443,7 +457,7 @@ class DeltaMoE(nn.Module):
 
         Args:
             x: (T, H) tokens.
-            experts: Full expert weights as returned by dense_experts, index 0 = base.
+            experts: Full expert weights as returned by ``dense_experts``, index 0 = base.
 
         Returns:
             (T, H) MoE output.

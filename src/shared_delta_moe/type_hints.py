@@ -1,5 +1,13 @@
-"""Shape-annotated tensor types shared across the package. The string is the shape, read as
-T tokens, H hidden, I intermediate, N deltas, Z zero experts, K top-k, R rows of one group, G groups.
+"""Shape-annotated tensor types shared across the package. The string is the shape, read as:
+
+- T: tokens
+- H: hidden
+- I: intermediate
+- N: deltas
+- Z: zero experts
+- K: top-k
+- R: rows of one group
+- G: groups
 """
 
 from typing import Annotated, TypeAlias

@@ -1,10 +1,14 @@
-"""Plain Qwen3.5 MoE checkpoint -> the DeltaMoE layout of modeling.py: expert BASE becomes the shared W_b and the one
-zero expert, every other expert e becomes Delta_e = W_e - W_b (subtracted in the stored dtype), router rows reordered
-to [other experts in order, BASE]. The plain MoE's shared expert must have no output (down_proj all zero); it is dropped.
+r"""Plain Qwen3.5 MoE checkpoint -> the DeltaMoE layout of ``modeling.py``: expert BASE becomes the shared
+:math:`W_b` and the one zero expert, every other expert :math:`e` becomes :math:`\Delta_e = W_e - W_b` (subtracted in
+the stored dtype), router rows reordered to [other experts in order, BASE]. The plain MoE's shared expert must have no
+output (``down_proj`` all zero); it is dropped.
+
+::
 
     python -m shared_delta_moe.models.qwen3_5.qwen3_5_delta_moe.convert SRC DST [--base INDEX] [--top-k K]
 
-BASE defaults to the expert named "base" in SRC/upscale_info.json. --top-k sets num_experts_per_tok (default: SRC's).
+BASE defaults to the expert named ``"base"`` in ``SRC/upscale_info.json``. ``--top-k`` sets ``num_experts_per_tok``
+(default: SRC's).
 """
 
 import argparse
@@ -22,7 +26,8 @@ FUSED = re.compile(r"(.+\.mlp)\.experts\.(gate_up_proj|down_proj)")
 
 
 def convert_state(state: dict[str, torch.Tensor], base: int) -> dict[str, torch.Tensor]:
-    """Works on both checkpoint forms: one tensor per expert and projection, or the fused gate_up_proj / down_proj."""
+    """Works on both checkpoint forms: one tensor per expert and projection, or the fused ``gate_up_proj`` /
+    ``down_proj``."""
     # layer prefix -> projection -> fused tensor, or {expert index: tensor}
     experts: dict[str, dict[str, Any]] = {}
     for k in list(state):

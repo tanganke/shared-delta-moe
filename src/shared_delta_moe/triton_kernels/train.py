@@ -1,18 +1,29 @@
-"""Backward of the fused parameter-aggregation MoE, for training through forward_param with DeltaMoE.triton_train
-(dense deltas; any top-k, any pair count; HierDeltaMoE through its flattened slots).
+r"""Backward of the fused parameter-aggregation MoE, for training through ``forward_param`` with
+``DeltaMoE.triton_train`` (dense deltas; any top-k, any pair count; HierDeltaMoE through its flattened slots).
 
-y = sum_i r_i MLP(x; W + D_{e_i}),  MLP(x; W) = (SiLU(x W_g^T) * (x W_u^T)) W_d^T.  Per (token, slot) pair i, with
-g_i, u_i the gate / up pre-activations, h_i = SiLU(g_i) * u_i and dh'_i = dy (W_d + D_d)  (not yet weighted by r_i):
+.. math::
 
-  dL/dr_i = <dy, h_i (W_d + D_d)^T> = <dh'_i, h_i>
-  dL/dg_i = r_i dh'_i * u_i * SiLU'(g_i),   dL/du_i = r_i dh'_i * SiLU(g_i)
-  dL/dx   = sum_i dL/dg_i (W_g + D_g) + dL/du_i (W_u + D_u)
+   y = \sum_i r_i\, \mathrm{MLP}(x; W + D_{e_i}), \qquad
+   \mathrm{MLP}(x; W) = (\mathrm{SiLU}(x W_g^\top) \odot (x W_u^\top))\, W_d^\top
 
-The forward saves only x, the routing (index and weight per slot) and the weights; nothing per pair. The backward
-recomputes g and u inside the kernel that forms dh' (all three GEMMs share the output tile, pairs x inter, and the
-reduction over hidden), so neither g, u nor h is ever written: _bwd_kernel writes dL/dg and dL/du, and dL/dr by
-atomic adds; dL/dx is then the down kernel on [dL/dg | dL/du] against [W_g; W_u] transposed. Weight gradients (only
-when a weight requires grad) use torch grouped GEMMs over the sorted pairs.
+Per (token, slot) pair :math:`i`, with :math:`g_i, u_i` the gate / up pre-activations,
+:math:`h_i = \mathrm{SiLU}(g_i) \odot u_i` and :math:`dh'_i = dy\,(W_d + D_d)` (not yet weighted by :math:`r_i`):
+
+.. math::
+
+   \frac{\partial L}{\partial r_i} &= \langle dy,\ h_i (W_d + D_d)^\top \rangle = \langle dh'_i, h_i \rangle \\
+   \frac{\partial L}{\partial g_i} &= r_i\, dh'_i \odot u_i \odot \mathrm{SiLU}'(g_i), \qquad
+   \frac{\partial L}{\partial u_i} = r_i\, dh'_i \odot \mathrm{SiLU}(g_i) \\
+   \frac{\partial L}{\partial x} &= \sum_i \frac{\partial L}{\partial g_i} (W_g + D_g)
+   + \frac{\partial L}{\partial u_i} (W_u + D_u)
+
+The forward saves only :math:`x`, the routing (index and weight per slot) and the weights; nothing per pair. The
+backward recomputes :math:`g` and :math:`u` inside the kernel that forms :math:`dh'` (all three GEMMs share the output
+tile, pairs :math:`\times` inter, and the reduction over hidden), so neither :math:`g`, :math:`u` nor :math:`h` is ever
+written: ``_bwd_kernel`` writes :math:`\partial L/\partial g` and :math:`\partial L/\partial u`, and
+:math:`\partial L/\partial r` by atomic adds; :math:`\partial L/\partial x` is then the down kernel on
+:math:`[\partial L/\partial g \mid \partial L/\partial u]` against :math:`[W_g; W_u]^\top`. Weight gradients (only when
+a weight requires grad) use torch grouped GEMMs over the sorted pairs.
 """
 
 import torch
@@ -195,21 +206,21 @@ class _FusedMoE(torch.autograd.Function):
 
 def fused_moe_autograd(x: Tensor, idx: Tensor, rw: Tensor, base: tuple[Tensor, Tensor, Tensor],
                        deltas: tuple[Tensor, Tensor, Tensor], n_delta: int) -> Tensor:  # fmt: skip
-    """Differentiable fused forward of the parameter-aggregation MoE, with the Triton backward.
+    r"""Differentiable fused forward of the parameter-aggregation MoE, with the Triton backward.
 
-    y = sum_i rw_i MLP(x; W + D_{idx_i}) over each token's k slots. Gradients flow to x, rw and every weight that
-    requires grad; idx gets none.
+    :math:`y = \sum_i \mathrm{rw}_i\, \mathrm{MLP}(x; W + D_{\mathrm{idx}_i})` over each token's :math:`k` slots.
+    Gradients flow to ``x``, ``rw`` and every weight that requires grad; ``idx`` gets none.
 
     Args:
         x: (T, H) tokens.
-        idx: (T, k) int expert per slot (>= n_delta: a zero expert).
+        idx: (T, k) int expert per slot (>= ``n_delta``: a zero expert).
         rw: (T, k) routing weights (differentiable).
-        base: (W_g (I, H), W_u (I, H), W_d (H, I)), the base weights.
-        deltas: dense deltas (D_g (n_delta, I, H), D_u (n_delta, I, H), D_d (n_delta, H, I)).
+        base: (:math:`W_g` (I, H), :math:`W_u` (I, H), :math:`W_d` (H, I)), the base weights.
+        deltas: dense deltas (:math:`D_g` (n_delta, I, H), :math:`D_u` (n_delta, I, H), :math:`D_d` (n_delta, H, I)).
         n_delta: the number of delta experts.
 
     Returns:
-        (T, H) output y; empty when T == 0.
+        (T, H) output :math:`y`; empty when T == 0.
     """
     if x.shape[0] == 0:
         return torch.empty_like(x)
