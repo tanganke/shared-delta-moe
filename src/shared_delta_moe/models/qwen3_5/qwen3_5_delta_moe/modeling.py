@@ -39,7 +39,7 @@ class Qwen3_5BitDeltaMoeBlock(BitDeltaMoE):
     forward = Qwen3_5DeltaMoeBlock.forward
 
 
-def to_bitdelta(model: Any, scale: str = "matrix") -> Any:
+def to_bitdelta(model: Any, scale: "str | int" = "matrix") -> Any:
     """Replace every Qwen3_5DeltaMoeBlock of a loaded model with its BitDelta form (BitDeltaMoE.from_delta_moe), in
     place; the dense deltas are dropped."""
     for name, mod in list(model.named_modules()):

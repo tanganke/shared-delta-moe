@@ -54,6 +54,8 @@ def main() -> None:
     } | {k: d._forward_param_triton for k, d in dare.items()} | {
         "bitdelta": BitDeltaMoE.from_delta_moe(m, "row")._forward_param_triton,
         "bitdelta graph": BitDeltaMoE.from_delta_moe(m, "row")._forward_param_triton,
+        "bitdelta b32": BitDeltaMoE.from_delta_moe(m, 32)._forward_param_triton,  # one scale per 1 x 32 block
+        "bitdelta b128": BitDeltaMoE.from_delta_moe(m, 128)._forward_param_triton,
     }
     if a.only:
         forms = {k: f for k, f in forms.items() if k in a.only.split(",")}

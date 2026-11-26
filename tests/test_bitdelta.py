@@ -30,19 +30,25 @@ def test_pack_signs_round_trip():
 
 
 def test_scales_and_deltas():
+    """Block 16: 2 scales per gate / up row (C = H = 32), 4 per down row (C = I = 64)."""
     m, _, _ = make(1, 1, H, I)
-    for scale in ("matrix", "row"):
+    for scale in ("matrix", "row", 16):
         b = BitDeltaMoE.from_delta_moe(m, scale)
         for n in PROJ:
             d, s = getattr(m, f"d_{n}"), getattr(b, f"s_{n}")
-            want = d.abs().mean(-1) if scale == "row" else d.abs().mean((1, 2))[:, None].expand_as(s)
-            assert torch.allclose(s, want), (scale, n)
+            N, R, C = d.shape
+            a = d.abs()
+            want = {"row": lambda: a.mean(-1, keepdim=True), "matrix": lambda: a.mean((1, 2))[:, None, None].expand(N, R, 1),
+                    16: lambda: a.view(N, R, C // 16, 16).mean(-1)}[scale]()  # fmt: skip
+            assert s.shape == want.shape and torch.allclose(s, want), (scale, n)
+            per_entry = s.repeat_interleave(C // s.shape[-1], -1)  # every row's scales spread over its entries
             sign = torch.where(d >= 0, 1.0, -1.0)
-            assert torch.equal(getattr(b, f"d_{n}"), s[..., None] * sign), (scale, n)
+            assert torch.equal(getattr(b, f"d_{n}"), per_entry * sign), (scale, n)
+    assert (BitDeltaMoE.from_delta_moe(m, 16).d_down - m.d_down).norm() < (BitDeltaMoE.from_delta_moe(m, "row").d_down - m.d_down).norm()
 
 
 def test_bitdelta_forwards_match_plain_moe():
-    for (z, k), scale in itertools.product(CASES, ("matrix", "row")):
+    for (z, k), scale in itertools.product(CASES, ("matrix", "row", 16)):
         m, _, x = make(z, k, H, I)
         b = BitDeltaMoE.from_delta_moe(m, scale)
         ref = reference(b, x)
@@ -60,10 +66,10 @@ def test_bitdelta_forwards_match_plain_moe():
 def test_state_dict_round_trip():
     """Saved and loaded (also into a model made on meta): sign bits as int32 buffers, scales as parameters."""
     m, _, x = make(2, 2, H, I)
-    b = BitDeltaMoE.from_delta_moe(m, "row")
+    b = BitDeltaMoE.from_delta_moe(m, 16)
     assert {f"b_{n}" for n in PROJ} | {f"s_{n}" for n in PROJ} <= set(b.state_dict())
     for device in ("meta", "cpu"):
-        b2 = BitDeltaMoE(H, I, m.n_delta, 2, 2, device=device).to_empty(device="cpu")
+        b2 = BitDeltaMoE(H, I, m.n_delta, 2, 2, device=device, scale=16).to_empty(device="cpu")
         b2.load_state_dict(b.state_dict())
         assert torch.equal(b2._forward_param(x), b._forward_param(x)), device
     empty = BitDeltaMoE(H, I, 0, 1, 1)  # only the zero expert
@@ -73,9 +79,9 @@ def test_state_dict_round_trip():
 def test_scale_gradients():
     """Scale distillation goes through the materialised forward: dL/ds[e, r] = sum_c dL/dDelta[e, r, c] sign[e, r, c],
     with the dense DeltaMoE holding the same (unpacked) deltas; x's gradient matches too."""
-    for z, k in ((1, 1), (2, 2)):
+    for (z, k), scale in (((1, 1), "row"), ((2, 2), 16)):
         m, _, x = make(z, k, H, I)
-        b = BitDeltaMoE.from_delta_moe(m, "row")
+        b = BitDeltaMoE.from_delta_moe(m, scale)
         dense = DeltaMoE(H, I, m.n_delta, k, z)
         with torch.no_grad():
             dense.router.weight.copy_(b.router.weight)
@@ -91,7 +97,9 @@ def test_scale_gradients():
         assert torch.allclose(gx[0], gx[1], atol=1e-5), (z, k)
         for n in PROJ:
             sign = unpack_signs(getattr(b, f"b_{n}"), torch.float32)
-            want = (getattr(dense, f"d_{n}").grad * sign).sum(-1)
+            s = getattr(b, f"s_{n}")
+            gd = getattr(dense, f"d_{n}").grad * sign
+            want = gd.view(*s.shape, -1).sum(-1)  # summed over each scale's entries
             assert torch.allclose(getattr(b, f"s_{n}").grad, want, atol=1e-5), (z, k, n)
 
 
@@ -104,9 +112,10 @@ def test_triton_matches_materialised():
     if not GPU:
         print("skipped: no CUDA/Triton")
         return
-    # 192 / 320 leave ragged tiles; matrix scales once
+    # 192 / 320 leave ragged tiles; matrix scales once; block 32 (< every BK) and 128 (>= some BK) per row block
     for (z, k), (hidden, inter), scale in (((0, 1), (192, 320), "row"), ((2, 2), (192, 320), "row"),
-                                           ((1, 2), (256, 384), "matrix")):  # fmt: skip
+                                           ((1, 2), (256, 384), "matrix"), ((2, 2), (192, 320), 32),
+                                           ((1, 2), (256, 384), 128)):  # fmt: skip
         b, x = _gpu(z, k, hidden, inter, scale)
         for t in (1, 37, 200):
             with torch.no_grad():
@@ -118,9 +127,13 @@ def test_every_config_and_split_k():
     if not GPU:
         print("skipped: no CUDA/Triton")
         return
+    for scale in ("row", 32, 128):
+        _every_config(*_gpu(2, 2, 256, 384, scale))
+
+
+def _every_config(b, x):
     from shared_delta_moe.triton_kernels import fused as F
 
-    b, x = _gpu(2, 2)
     dg, du, dd = b._kernel_deltas()
     with torch.no_grad():
         for t in (1, 37):
@@ -147,7 +160,7 @@ def test_cuda_graph_and_compile():
     if not GPU:
         print("skipped: no CUDA/Triton")
         return
-    b, x = _gpu(1, 2, 256, 384)
+    b, x = _gpu(1, 2, 256, 384, 64)
     xs = x[:8].clone()
     with torch.no_grad():
         b._forward_param_triton(xs)  # autotune outside the capture

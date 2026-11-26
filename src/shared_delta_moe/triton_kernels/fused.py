@@ -165,16 +165,27 @@ def _dare_delta(v_ptr, run, k0, kk, dmask, m_ptr, mrow, words, KB, B: tl.constex
 
 
 @triton.jit
-def _bit_delta(b_ptr, brow, k0, dmask, scale, MW, BN: tl.constexpr, BK: tl.constexpr):
-    """BitDelta tile, float32: entry c of a row is +scale if bit c % 32 of its word c // 32 is set, else -scale (MW
-    words per row from brow; BK a multiple of 32)."""
+def _bit_delta(b_ptr, s_ptr, s_row, row, k0, K, dmask, MW, SB: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    """BitDelta tile, float32: entry c of a row is +s if bit c % 32 of its word c // 32 is set, else -s, s the row's
+    scale c // SB (row (BN, 1): the rows' index in (G, N); MW sign words, cdiv(K, SB) scales per row; BK a multiple
+    of 32, SB a power of 2). SB = 0: one scale per row, s_row (BN,), loaded once before the K loop."""
     W: tl.constexpr = BK // 32
     wj = k0 // 32 + tl.arange(0, W)[None, :]
     rm = tl.max(dmask.to(tl.int32), axis=1)[:, None] > 0  # rows with a delta
-    w = tl.load(b_ptr + brow + wj, mask=rm & (wj < MW), other=0)  # (BN, W)
+    w = tl.load(b_ptr + row * MW + wj, mask=rm & (wj < MW), other=0)  # (BN, W)
     bit = (w[:, :, None] >> tl.arange(0, 32)[None, None, :]) & 1
     sign = (tl.reshape(bit, (BN, BK)) * 2 - 1).to(tl.float32)
-    return tl.where(dmask, sign * scale[:, None], 0.0)
+    if SB == 0:
+        s = s_row[:, None]
+    elif SB >= BK:  # one scale per row for the whole tile
+        s = tl.load(s_ptr + row * tl.cdiv(K, SB) + k0 // SB, mask=rm, other=0.0).to(tl.float32)  # (BN, 1)
+    else:  # BK / SB scales per row, each repeated over its block
+        J: tl.constexpr = BK // SB
+        NB = tl.cdiv(K, SB)
+        j = k0 // SB + tl.arange(0, J)[None, :]
+        s = tl.load(s_ptr + row * NB + j, mask=rm & (j < NB), other=0.0).to(tl.float32)  # (BN, J)
+        s = tl.reshape(tl.broadcast_to(s[:, :, None], (BN, J, SB)), (BN, BK))
+    return tl.where(dmask, sign * s, 0.0)
 
 
 # ------------------------------------------------------------------------------------------------ GEMM kernels
@@ -231,7 +242,7 @@ def _pruner(tiles: int):
         a = {**named_args, **kwargs}
         pb, b, limit = a["P_BUCKET"], a["B"], _smem_limit(a["gstart_ptr"])
         out = [_fit(c, tiles, limit, tma=a["TMA"]) for c in configs
-               if c.kwargs["BM"] <= max(16, pb) and (c.kwargs["BK"] % b == 0 or b % c.kwargs["BK"] == 0)]  # fmt: skip
+               if c.kwargs["BM"] <= max(16, pb) and (b == 0 or c.kwargs["BK"] % b == 0 or b % c.kwargs["BK"] == 0)]  # fmt: skip
         out = [c for c in out if c is not None]
         assert out, "no config fits"
         return out[: None if AUTOTUNE else 1]
@@ -267,15 +278,16 @@ def _gate_up_kernel(
         dcols = cmask & (g < G)  # zero expert: delta loads masked off, not branched (keeps the loop pipelined)
         rg = tl.zeros((BN,), tl.int64)
         ru = tl.zeros((BN,), tl.int64)
-        sg = tl.zeros((BN,), tl.float32)
-        su = tl.zeros((BN,), tl.float32)
         if MODE == 1:
             rg = tl.load(pg_ptr + g * N + cols, mask=dcols, other=0)
             ru = tl.load(pu_ptr + g * N + cols, mask=dcols, other=0)
-        if MODE == 2:  # p: the BitDelta row scales
+        sg = tl.zeros((BN,), tl.float32)
+        su = tl.zeros((BN,), tl.float32)
+        if MODE == 2 and B == 0:  # BitDelta, one scale per row
             sg = tl.load(pg_ptr + g * N + cols, mask=dcols, other=0.0).to(tl.float32)
             su = tl.load(pu_ptr + g * N + cols, mask=dcols, other=0.0).to(tl.float32)
-        mrow = (g * N + cols).to(tl.int64)[:, None] * MW  # mask words (DARE) / sign words (BitDelta) of each row
+        brow = (g * N + cols).to(tl.int64)[:, None]  # BitDelta: rows of the sign words and scales (p)
+        mrow = (g * N + cols).to(tl.int64)[:, None] * MW  # DARE: mask words of each row
         wg_bits = _mask_words(mg_ptr, mrow, dcols, MW, MWP)
         wu_bits = _mask_words(mu_ptr, mrow, dcols, MW, MWP)
         acc_g = tl.zeros((BN, BM), tl.float32)  # y^T: the summed weight is operand A
@@ -302,8 +314,8 @@ def _gate_up_kernel(
                 dg, rg = _dare_delta(dg_ptr, rg, k0, kk, dmask, mg_ptr, mrow, wg_bits, K // B, B, BN, BK, MWP)
                 du, ru = _dare_delta(du_ptr, ru, k0, kk, dmask, mu_ptr, mrow, wu_bits, K // B, B, BN, BK, MWP)
             else:  # +-scale is exact in the model dtype, so W_b + delta rounds as in the materialised forward
-                dg = _bit_delta(dg_ptr, mrow, k0, dmask, sg, MW, BN, BK).to(wg.dtype)
-                du = _bit_delta(du_ptr, mrow, k0, dmask, su, MW, BN, BK).to(wu.dtype)
+                dg = _bit_delta(dg_ptr, pg_ptr, sg, brow, k0, K, dmask, MW, B, BN, BK).to(wg.dtype)
+                du = _bit_delta(du_ptr, pu_ptr, su, brow, k0, K, dmask, MW, B, BN, BK).to(wu.dtype)
             at = tl.trans(a)
             acc_g = tl.dot(wg + dg, at, acc_g)
             acc_u = tl.dot(wu + du, at, acc_u)
@@ -341,11 +353,12 @@ def _down_kernel(
         cmask = cols < N
         dcols = cmask & (g < G)
         run = tl.zeros((BN,), tl.int64)
-        sc = tl.zeros((BN,), tl.float32)
         if MODE == 1:
             run = tl.load(p_ptr + g * N + cols, mask=dcols, other=0)
-        if MODE == 2:
+        sc = tl.zeros((BN,), tl.float32)
+        if MODE == 2 and B == 0:
             sc = tl.load(p_ptr + g * N + cols, mask=dcols, other=0.0).to(tl.float32)
+        brow = (g * N + cols).to(tl.int64)[:, None]
         mrow = (g * N + cols).to(tl.int64)[:, None] * MW
         bits = _mask_words(m_ptr, mrow, dcols, MW, MWP)
         acc = tl.zeros((BN, BM), tl.float32)
@@ -366,7 +379,7 @@ def _down_kernel(
             elif MODE == 1:
                 dw, run = _dare_delta(d_ptr, run, k0, kk, dmask, m_ptr, mrow, bits, K // B, B, BN, BK, MWP)
             else:
-                dw = _bit_delta(d_ptr, mrow, k0, dmask, sc, MW, BN, BK).to(w.dtype)
+                dw = _bit_delta(d_ptr, p_ptr, sc, brow, k0, K, dmask, MW, B, BN, BK).to(w.dtype)
             acc = tl.dot(w + dw, tl.trans(a), acc)
         pair = tl.load(perm_ptr + rows, mask=rmask, other=0)
         rw = tl.load(rw_ptr + pair, mask=rmask, other=0.0)
@@ -386,8 +399,8 @@ def _down_kernel(
 class Delta(NamedTuple):
     """One projection's deltas as the kernels take them. mode 0: dense (G, N, K) in d; mode 1: seeded DARE, d the
     packed kept values, p (G, N) each row's start in d, m (G, N, words) int32 the keep bit of each DARE block
-    (models/dare.py mask_bits); mode 2: BitDelta, d (G, N, K / 32) int32 sign bits, p (G, N) row scales, block 32
-    (models/bitdelta.py)."""
+    (models/dare.py mask_bits); mode 2: BitDelta, d (G, N, K / 32) int32 sign bits, p (G, N, cdiv(K, block))
+    scales, block (a power of 2) the entries per scale, 0 for one scale per row (models/bitdelta.py)."""
 
     mode: int
     d: Tensor
@@ -557,8 +570,9 @@ def fused_moe_dare(x: Tensor, idx: Tensor, rw: Tensor, wg: Tensor, wu: Tensor, w
 
 @torch.library.custom_op("shared_delta_moe::fused_moe_bit", mutates_args=())
 def fused_moe_bit(x: Tensor, idx: Tensor, rw: Tensor, wg: Tensor, wu: Tensor, wd: Tensor, bg: Tensor, bu: Tensor,
-                  bd: Tensor, sg: Tensor, su: Tensor, sd: Tensor, n_delta: int) -> Tensor:  # fmt: skip
-    deltas = tuple(Delta(2, b, s, block=32) for b, s in ((bg, sg), (bu, su), (bd, sd)))
+                  bd: Tensor, sg: Tensor, su: Tensor, sd: Tensor, n_delta: int, block_gu: int,
+                  block_d: int) -> Tensor:  # fmt: skip
+    deltas = tuple(Delta(2, b, s, block=k) for b, s, k in ((bg, sg, block_gu), (bu, su, block_gu), (bd, sd, block_d)))
     return fused_moe(x, idx, rw, n_delta, (wg, wu, wd), deltas)  # type: ignore[arg-type]
 
 
@@ -586,7 +600,8 @@ def fused_moe_any(x: Tensor, idx: Tensor, rw: Tensor, n_delta: int, base: tuple[
     if deltas[0].mode == 0:
         return fused_moe_dense(x, idx, rw, *base, *(d.d for d in deltas), n_delta)
     if deltas[0].mode == 2:
-        return fused_moe_bit(x, idx, rw, *base, *(d.d for d in deltas), *(d.p for d in deltas), n_delta)  # type: ignore[misc]
+        return fused_moe_bit(x, idx, rw, *base, *(d.d for d in deltas), *(d.p for d in deltas), n_delta,  # type: ignore[misc]
+                             deltas[0].block, deltas[2].block)  # fmt: skip
     d0 = deltas[0]
     return fused_moe_dare(x, idx, rw, *base, *(d.d for d in deltas), *(d.p for d in deltas),  # type: ignore[misc]
                           *(d.m for d in deltas), n_delta, d0.block)  # fmt: skip
