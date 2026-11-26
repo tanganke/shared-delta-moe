@@ -11,7 +11,7 @@ from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
 )
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM
 
-from shared_delta_moe.models.qwen3_5.qwen3_5_delta_moe import Qwen3_5DeltaMoeBlock
+from shared_delta_moe.models.qwen3_5.qwen3_5_delta_moe import Qwen3_5BitDeltaMoeBlock, Qwen3_5DeltaMoeBlock, to_bitdelta
 from shared_delta_moe.models.qwen3_5.qwen3_5_delta_moe.convert import (
     main as convert_main,
 )
@@ -64,6 +64,34 @@ def test_converted_matches_stock_moe():
             ).any(), "hits the base expert and others"
 
 
+def test_to_bitdelta():
+    """to_bitdelta swaps every block for its BitDelta form: logits equal the DeltaMoE model whose deltas are set to
+    diag(s) sign(Delta)."""
+    import copy
+
+    torch.manual_seed(0)
+    cfg = Qwen3_5MoeTextConfig(
+        vocab_size=128, hidden_size=32, num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+        head_dim=8, num_experts=4, num_experts_per_tok=2, moe_intermediate_size=64, shared_expert_intermediate_size=0,
+        linear_num_key_heads=2, linear_num_value_heads=2, linear_key_head_dim=8, linear_value_head_dim=8,
+        layer_types=["linear_attention", "full_attention"], delta_moe_zero_experts=1,
+    )  # fmt: skip
+    delta = Qwen3_5MoeForCausalLM(cfg).eval()
+    with torch.no_grad():
+        for layer in delta.model.layers:
+            for p in layer.mlp.parameters():
+                p.normal_(std=0.3)
+    bit = to_bitdelta(copy.deepcopy(delta), "row")
+    with torch.no_grad():
+        for d, b in zip(delta.model.layers, bit.model.layers):
+            assert type(b.mlp) is Qwen3_5BitDeltaMoeBlock and b.mlp.top_k == 2
+            for n in ("gate", "up", "down"):
+                getattr(d.mlp, f"d_{n}").copy_(getattr(b.mlp, f"d_{n}"))
+        x = torch.randint(0, 128, (2, 24))
+        assert torch.allclose(bit(x).logits, delta(x).logits, atol=1e-5)
+
+
 if __name__ == "__main__":
     test_converted_matches_stock_moe()
+    test_to_bitdelta()
     print("ok")

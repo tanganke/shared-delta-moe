@@ -11,3 +11,11 @@ model = AutoModelForImageTextToText.from_pretrained(OUT, num_experts_per_tok=2) 
 
 The plain MoE's expert BASE becomes $W_b$ and the zero expert; the others become $\Delta_e$. Its shared expert must
 have no output. `num_experts_per_tok` is the top-k at load time (= `num_experts` for soft routing over all experts).
+
+`to_bitdelta(model, scale="matrix")` replaces every DeltaMoE block of a loaded model with its BitDelta form
+([bitdelta.md](bitdelta.md)), in place:
+
+```python
+from shared_delta_moe.models.qwen3_5.qwen3_5_delta_moe import to_bitdelta
+model = to_bitdelta(AutoModelForImageTextToText.from_pretrained(OUT), scale="row")
+```
