@@ -108,3 +108,25 @@ def test_one_ulp_counted(tmp_path):
         save_file({"model.language_model.layers.0.mlp.up_proj.weight": t}, tmp_path / n / "model.safetensors")
     r = S.delta_gram(tmp_path / "base", {"ft": tmp_path / "ft"}, device="cpu")["tensors"]["layers.0.mlp.up_proj.weight"]
     assert r["ulp1"].tolist() == [64.0] and r["zero"].tolist() == [0.0]
+
+
+class _Tok:
+    """Chat template: every message is [role id, content tokens..., 0]; the generation prompt appends [9]."""
+
+    def apply_chat_template(self, msgs, tokenize=True, add_generation_prompt=False):
+        ids = [t for m in msgs for t in [1 if m["role"] == "user" else 9] + [int(c) for c in m["content"]] + [0]]
+        return {"input_ids": ids + ([9] if add_generation_prompt else [])}
+
+    def __call__(self, text, add_special_tokens=False):
+        return type("E", (), {"input_ids": [int(c) for c in text]})()
+
+
+def test_read_docs(tmp_path):
+    import json
+
+    f = tmp_path / "d.jsonl"
+    rows = [{"messages": [{"role": "user", "content": "34"}, {"role": "assistant", "content": "56"}]}, {"text": "12"},
+            {"text": "1234"}]  # fmt: skip
+    f.write_text("\n".join(json.dumps(r) for r in rows))
+    out = S.read_docs(_Tok(), f, docs=5, max_length=10, min_tokens=3)
+    assert out == [([1, 3, 4, 0, 9, 5, 6, 0], 5), ([1, 2, 3, 4], 1)]  # reply scored from its first token; short text dropped

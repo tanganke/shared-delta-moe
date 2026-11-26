@@ -304,15 +304,29 @@ def parse_spec(spec: str) -> tuple[str, dict[str, dict[str, float]]]:
     return label, out
 
 
-def read_docs(tok: Any, path: str | Path, docs: int, max_length: int, min_tokens: int = 256) -> list[list[int]]:
-    """The first ``docs`` documents of a jsonl (``text`` field) with at least ``min_tokens`` tokens, cut to their
-    first ``max_length``."""
+def _ids(x: Any) -> list[int]:
+    return list(x["input_ids"] if isinstance(x, Mapping) or hasattr(x, "keys") else x)
+
+
+def read_docs(tok: Any, path: str | Path, docs: int, max_length: int, min_tokens: int = 256) -> list[tuple[list[int], int]]:
+    """The first ``docs`` rows of a jsonl as ``(token ids, first scored position)``. A ``text`` row (raw text) needs
+    at least ``min_tokens`` tokens, is cut to its first ``max_length`` and is scored on every token; a ``messages``
+    row (chat) is rendered with the tokenizer's chat template and scored on the last turn only: the tokens after the
+    longest common prefix of the conversation and its prompt (all but the last turn, plus the generation prompt)."""
     out = []
     with open(path) as f:
         for line in f:
-            ids = tok(json.loads(line)["text"], add_special_tokens=False).input_ids
-            if len(ids) >= min_tokens:
-                out.append(ids[:max_length])
+            row = json.loads(line)
+            if "messages" in row:
+                full = _ids(tok.apply_chat_template(row["messages"], tokenize=True))
+                prompt = _ids(tok.apply_chat_template(row["messages"][:-1], tokenize=True, add_generation_prompt=True))
+                start = next((i for i, (a, b) in enumerate(zip(full, prompt)) if a != b), min(len(full), len(prompt)))
+                out.append((full[:max_length], max(1, start)))
+            else:
+                ids = tok(row["text"], add_special_tokens=False).input_ids
+                if len(ids) < min_tokens:
+                    continue
+                out.append((ids[:max_length], 1))
             if len(out) >= docs:
                 break
     return out
@@ -348,17 +362,21 @@ def delta_loss(base: str | Path, fts: Mapping[str, str | Path], data: Mapping[st
             p.copy_(v.to(p.dtype))
 
     @torch.no_grad()
-    def nll(rows_all: list[list[int]]) -> list[float]:
+    def nll(rows_all: list[tuple[list[int], int]]) -> list[float]:
         res = []
         for i in range(0, len(rows_all), batch):
             rows = rows_all[i : i + batch]
-            width = max(map(len, rows))
-            ids = torch.tensor([r + [tok.pad_token_id] * (width - len(r)) for r in rows], device="cuda")
-            mask = torch.tensor([[1] * len(r) + [0] * (width - len(r)) for r in rows], device="cuda")
-            logits = model(input_ids=ids, attention_mask=mask).logits[:, :-1].float()
-            x = torch.nn.functional.cross_entropy(logits.transpose(1, 2), ids[:, 1:], reduction="none")
-            m = mask[:, 1:].float()
-            res += ((x * m).sum(1) / m.sum(1)).tolist()
+            width = max(len(r) for r, _ in rows)
+            ids = torch.tensor([r + [tok.pad_token_id] * (width - len(r)) for r, _ in rows], device="cuda")
+            mask = torch.tensor([[1] * len(r) + [0] * (width - len(r)) for r, _ in rows], device="cuda")
+            hidden = model.model(input_ids=ids, attention_mask=mask).last_hidden_state
+            pos = torch.arange(width, device="cuda")
+            scored = torch.stack([(pos >= s) & (pos < len(r)) for r, s in rows])  # target positions
+            b, t = scored[:, 1:].nonzero(as_tuple=True)
+            logits = model.lm_head(hidden[b, t]).float()
+            x = torch.nn.functional.cross_entropy(logits, ids[b, t + 1], reduction="none")
+            tot = torch.zeros(len(rows), device="cuda").index_add_(0, b, x)
+            res += (tot / scored[:, 1:].sum(1)).tolist()
         return res
 
     res: dict[str, Any] = {"base": str(base), "fts": {k: str(v) for k, v in fts.items()}, "data": {k: str(v) for k, v in data.items()},
