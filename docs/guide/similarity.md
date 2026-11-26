@@ -130,6 +130,14 @@ Loss of SFT experts (4B, answer-letter NLL on 100 validation items per domain):
   finance into one MLP expert costs 4 points on history, as the converted HierDeltaMoE under oracle routing did
   ($-4.6$). Use accuracy to compare layouts, loss only alongside it.
 - Averaging seeds is as good as the best seed and steadier than any one.
+- On 100 items the proxy ranks MLP-expert merges, not shared-parameter merges: medical's NLI4CT accuracy on
+  validation was 9 points higher with the shared tensors left at the base, while on the test set the converted
+  HierDeltaMoE's oracle was the same for the base and for 5-, 8- and 11-way averages (all about 3 below the medical
+  expert, which is the cost of dropping its own non-MLP delta).
+- A flat layout with one seed-averaged expert per domain beat grouping by Gram clusters on the test sets; the
+  group router was too soft. Weight neighbours are not functional neighbours: law is closer to CS (MLP cosine 0.43)
+  than to the law-exam MCQ expert (0.31), merging law with CS costs neither, and the history expert is as good as
+  the law expert on law. Which misroutes matter follows from the accuracy matrix, not from the cosine.
 - Forced routing with the shared tensors averaged over five experts keeps the experts' own-domain gains; the dense
   average of the same five loses 14 points on medical dialogue. The MLP delta alone keeps the full gain as well.
   Summing experts hurts almost everywhere.
@@ -162,7 +170,8 @@ Loss along and across deltas (4B CPT):
 3. Build the loss matrix (every expert on every domain's validation set, scored on the answer, `--score last` for
    MCQ; compare top-1 accuracy, not only NLL) and group experts whose rows are alike; a group's members should each beat the others on their own
    domain, otherwise one expert or a merge serves the group.
-4. Merge the shared tensors (a plain average of the SFT experts was enough at 4B; `matching_coefficients` when the
+4. Merge the shared tensors (a plain average of the SFT experts was enough at 4B, and the choice did not change the
+   test-set oracle; `matching_coefficients` when the
    deltas are near-orthogonal, as CPT on different sources) and check the forced-routing models on the loss matrix:
    each should match its expert on its domain.
 5. Seeds of one domain are merged (their $\alpha$ is close to $1/(1 + 2\rho)$, i.e. about 0.5 for three seeds), not
