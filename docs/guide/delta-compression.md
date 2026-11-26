@@ -64,6 +64,17 @@ stored as $b$-bit codes plus $s$ and $z$ in fp16: $b + 32/g$ bits per entry (2 b
 error is at most $s/2$ per entry, about $s^2/12$ in mean square; a smaller group fits the grid to a narrower range at
 more overhead. No data is needed, and decoding is a multiply-add per entry on a regular layout.
 
+The grid need not have $2^b$ levels (`levels`): $L$ levels, $s = (\max_k w_k - \min_k w_k)/(L-1)$, cost
+$\log_2 L$ bits per code (ternary, $L = 3$: 1.58; five ternary codes fit a byte, 1.6). Two more options matter below 2
+bits:
+
+- **Symmetric** (`symmetric=True`): the grid spans $[-a, a]$, $a = \max_k |w_k|$, so a group stores only $s$, not
+  $z$: $\log_2 L + 16/g$ bits. A ternary symmetric grid is $\{-a, 0, a\}$; a 2-level one, $\{-a, a\}$, is a sign
+  with one scale per group.
+- **Clipping** (`clip=True`): with few levels the extreme entries stretch the grid over values that are rare. The
+  span is shrunk towards 0 by the factor $f \in \{1, 0.95, \dots, 0.1\}$ (`CLIP`) of least rounding error per group,
+  $\min_f \|\hat w(f z, f s) - w\|^2$; entries outside the shrunk span are clamped to its ends.
+
 ### GPTQ (`gptq`)
 
 GPTQ (Frantar et al., 2023) quantises on the same grid but minimises $\mathcal{E}$ rather than the weight error. Per
@@ -221,6 +232,31 @@ version before the block-optimal score now in `compress.py`.)
 - **Importance DARE** lowers DARE's KL by 15–20% at the same storage (rank-1 probabilities); per-entry probabilities
   would nearly halve it but need the probabilities stored. Still well behind 2-bit quantisation.
 
+Below 2 bits (`rtn` / `gptq` with `levels`, `symmetric`, `clip`), same screen:
+
+| method | bits / entry | KL, mean | KL, medical |
+|---|---:|---:|---:|
+| GPTQ, 2 levels, group 128, clipped | 1.25 | 0.014 | 0.043 |
+| RTN, 2 levels, group 64, clipped | 1.50 | 0.096 | 0.174 |
+| GPTQ, 2 levels, group 64, clipped | 1.50 | 0.013 | 0.042 |
+| GPTQ, 2 levels, group 32, symmetric, clipped | 1.50 | 0.013 | 0.039 |
+| RTN ternary, group 128, symmetric, clipped | 1.71 | 0.036 | 0.078 |
+| **GPTQ ternary, group 128, symmetric, clipped** | 1.71 | **0.0055** | **0.018** |
+| GPTQ ternary, group 64, symmetric, clipped | 1.83 | 0.0061 | 0.019 |
+| GPTQ ternary, group 128, clipped | 1.83 | 0.0060 | 0.018 |
+| RTN 2 bit, group 256 | 2.12 | 0.0047 | 0.013 |
+| GPTQ 2 bit, group 256 | 2.12 | 0.0049 | 0.012 |
+| RTN 2 bit, group 128, symmetric, clipped | 2.12 | 0.021 | 0.043 |
+| RTN 2 bit, group 128, clipped | 2.25 | 0.021 | 0.043 |
+| GPTQ 2 bit, group 128, clipped | 2.25 | 0.0047 | 0.014 |
+
+- **Calibration matters below 2 bits**: at 1.5–1.71 bits GPTQ has a sixth to a seventh of RTN's mean KL (a quarter
+  on medical); at 2 bits they were equal.
+- **Clipping hurts RTN**: at 2 bits it raises the KL fourfold (0.021 vs 0.0054). It minimises the weight error by
+  clamping the largest entries of each group, and the large entries of a delta matter for the output. GPTQ with
+  clipping is unaffected (its error feedback repairs the clamped entries).
+- **Group size and symmetry barely matter** for GPTQ here; group 256 is as good as 128 at 2 bits.
+
 ### Accuracy
 
 Accuracy in % (4 samples per question, 500 questions per set), against the dense-delta model; in parentheses the paired
@@ -235,6 +271,10 @@ samples coincide and the intervals are narrow.
 | **RTN 2 bit, group 128** | 2.25 | 73.6 (+0.1 [−0.1, +0.5]) | 75.2 (−0.3 [−0.6, +0.0]) | 68.3 (−0.1 [−0.5, +0.3]) | 79.0 (−0.1 [−0.6, +0.6]) |
 | **GPTQ 2 bit, group 128** | 2.25 | 73.8 (+0.4 [+0.0, +0.8]) | 75.5 (+0.1 [−0.2, +0.5]) | 68.6 (+0.2 [−0.2, +0.6]) | 79.0 (−0.1 [−0.7, +0.4]) |
 | GPTQ 3 bit, group 128 | 3.25 | 73.5 (+0.1 [−0.1, +0.3]) | 75.5 (+0.1 [−0.1, +0.3]) | 68.2 (−0.1 [−0.6, +0.3]) | 79.0 (−0.1 [−0.5, +0.4]) |
+| **RTN 2 bit, group 256** | 2.12 | 73.8 (+0.4 [+0.1, +0.8]) | 75.2 (−0.2 [−0.8, +0.3]) | 68.3 (−0.1 [−0.5, +0.4]) | 79.2 (+0.1 [−0.3, +0.7]) |
+| **GPTQ ternary, group 128, symmetric, clipped** | 1.71 | 73.6 (+0.1 [−0.2, +0.6]) | 75.2 (−0.3 [−0.8, +0.1]) | 67.9 (−0.5 [−1.1, +0.0]) | 78.7 (−0.3 [−0.9, +0.2]) |
+| RTN ternary, group 128, symmetric, clipped | 1.71 | 73.6 (+0.1 [−0.4, +0.7]) | 74.8 (−0.7 [−1.4, +0.1]) | 67.8 (−0.6 [−1.2, −0.1]) | 77.6 (−1.4 [−2.4, −0.6]) |
+| GPTQ 2 levels, group 128, clipped | 1.25 | 73.6 (+0.1 [−0.3, +0.7]) | 74.8 (−0.7 [−1.2, −0.1]) | 67.9 (−0.5 [−1.1, +0.1]) | 78.0 (−1.1 [−1.9, −0.3]) |
 
 For comparison (log [35], other runs): DARE 0.2 with 1 x 64 blocks (3.2 bits) is within the intervals on three sets
 and about −1.5 on NLI4CT.
@@ -245,5 +285,10 @@ and about −1.5 on NLI4CT.
 - **Sign planes lose what the grids keep**: two sign planes (2 bits) still lose 1.8 on NLI4CT; a sign plane spends
   its bit on the sign and fits magnitudes with one scale per row, while a 4-level grid per 128 entries follows the
   local range.
-- Below 2 bits (ternary grids, 1 bit with an offset per small group) is where calibration should start to matter;
-  not measured yet.
+- **2 bits need no more than group 256** (2.12 bits, 1/7.5 of dense): as good as group 128.
+- **Below 2 bits calibration is what keeps the accuracy.** Ternary GPTQ (1.71 bits, 1/9.4 of dense) is within the
+  intervals on every set (law −0.5, its interval touching 0); ternary RTN on the same grid loses 1.4 on NLI4CT and
+  0.6 on law. The KL screen showed the same gap (0.0055 vs 0.036 mean).
+- **About 1 bit**: GPTQ on a 2-level grid per 128 entries (1.25 bits) loses 1.1 on NLI4CT and 0.7 on history, a third
+  of BitDelta's NLI4CT drop at a quarter more storage.
+

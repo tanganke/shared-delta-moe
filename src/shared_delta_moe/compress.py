@@ -9,6 +9,7 @@ dimension last; ``gram`` is :math:`X^\top X` (C, C) of that projection's inputs 
 others. ``compress_deltas`` applies a method to every delta of a ``DeltaMoE`` or ``HierDeltaMoE`` in place.
 """
 
+import math
 from collections.abc import Callable, Sequence
 
 import torch
@@ -31,14 +32,39 @@ def _cholesky_inverse(delta: Tensor, gram: Tensor, damp: float) -> tuple[Tensor,
     return w, torch.linalg.cholesky(torch.cholesky_inverse(torch.linalg.cholesky(h)), upper=True)
 
 
-def _minmax(x: Tensor, bits: int) -> tuple[Tensor, Tensor]:
-    """Asymmetric min-max grid over the last dim: (offset, step)."""
-    lo, hi = x.amin(-1, keepdim=True), x.amax(-1, keepdim=True)
-    return lo, (hi - lo).clamp_min(1e-12) / (2**bits - 1)
+CLIP = torch.linspace(1.0, 0.1, 19).tolist()  # range shrink factors tried by ``clip=True``
 
 
-def _snap(x: Tensor, lo: Tensor, step: Tensor, bits: int) -> Tensor:
-    return ((x - lo) / step).round().clamp(0, 2**bits - 1) * step + lo
+def _grid(x: Tensor, levels: int, symmetric: bool, clip: bool) -> tuple[Tensor, Tensor]:
+    """A grid of ``levels`` evenly spaced values per row of the last dim: (lowest level, step). Asymmetric: spans
+    [min, max]; symmetric: [-max|x|, max|x|]. With ``clip``, the span is shrunk towards 0 by the factor in ``CLIP``
+    with the least squared rounding error, per group."""
+    if symmetric:
+        a = x.abs().amax(-1, keepdim=True)
+        lo, hi = -a, a
+    else:
+        lo, hi = x.amin(-1, keepdim=True), x.amax(-1, keepdim=True)
+    best = None
+    for f in CLIP if clip else (1.0,):
+        l, step = lo * f, ((hi - lo) * f).clamp_min(1e-12) / (levels - 1)
+        if not clip:
+            return l, step
+        err = (_snap(x, l, step, levels) - x).square().sum(-1, keepdim=True)
+        if best is None:
+            best = (err, l, step)
+        else:
+            better = err < best[0]
+            best = (torch.where(better, err, best[0]), torch.where(better, l, best[1]), torch.where(better, step, best[2]))
+    return best[1], best[2]
+
+
+def _snap(x: Tensor, lo: Tensor, step: Tensor, levels: int) -> Tensor:
+    return ((x - lo) / step).round().clamp(0, levels - 1) * step + lo
+
+
+def _grid_bits(levels: int, group: int, symmetric: bool) -> float:
+    """Code bits (log2 levels, e.g. ternary 1.58: 5 values per byte would be 1.6) plus fp16 scale (and offset)."""
+    return math.log2(levels) + (16 if symmetric else 32) / group
 
 
 def svd(rank: int) -> Method:
@@ -59,40 +85,52 @@ def svd(rank: int) -> Method:
     return f
 
 
-def rtn(bits: int, group: int = 128) -> Method:
-    """Round to nearest on an asymmetric min-max grid per group of ``group`` entries along the input dim, scale and
-    offset in fp16.
+def rtn(bits: int = 2, group: int = 128, levels: int | None = None, symmetric: bool = False,
+        clip: bool = False) -> Method:  # fmt: skip
+    r"""Round to nearest on a grid of ``levels`` values per group of ``group`` entries along the input dim, its scale
+    (and offset) in fp16.
 
     Args:
-        bits: Bits per value.
+        bits: Bits per value: ``levels`` defaults to ``2 ** bits``.
         group: Group size; divides C.
+        levels: Grid values, e.g. 3 for ternary.
+        symmetric: Grid symmetric about 0 (one scale per group, no offset) instead of spanning [min, max].
+        clip: Shrink each group's span to the factor in ``CLIP`` with the least rounding error.
 
     Returns:
-        The method; bits per entry ``bits + 32 / group``.
+        The method; bits per entry :math:`\log_2` ``levels`` plus 32 / ``group`` (16 / ``group`` symmetric).
     """
+    n = 2**bits if levels is None else levels
+    assert n >= 2, f"a grid needs at least 2 levels, got {n}"
 
     def f(delta: Tensor, gram: Tensor | None) -> tuple[Tensor, float]:
         r, c = delta.shape
         x = delta.reshape(r, c // group, group)
-        return _snap(x, *_minmax(x, bits), bits).reshape(r, c), bits + 32 / group
+        return _snap(x, *_grid(x, n, symmetric, clip), n).reshape(r, c), _grid_bits(n, group, symmetric)
 
     return f
 
 
-def gptq(bits: int, group: int = 128, damp: float = 0.01, block: int = 128) -> Method:
+def gptq(bits: int = 2, group: int = 128, levels: int | None = None, symmetric: bool = False, clip: bool = False,
+         damp: float = 0.01, block: int = 128) -> Method:  # fmt: skip
     r"""GPTQ (Frantar et al., 2023) on the delta: columns quantised in order on ``rtn``'s grid (each group's grid
     fixed when its first column is reached), each one's error, weighted by the inverse Gram, pushed onto the columns
     not yet quantised. Minimises :math:`\|X(\hat\Delta - \Delta)^\top\|_F` greedily.
 
     Args:
-        bits: Bits per value.
+        bits: Bits per value: ``levels`` defaults to ``2 ** bits``.
         group: Group size; divides C.
+        levels: Grid values, e.g. 3 for ternary.
+        symmetric: Symmetric grid, as ``rtn``.
+        clip: Clipped span, as ``rtn``.
         damp: Diagonal damping, a fraction of the Gram's mean diagonal.
         block: Columns per lazy-update block.
 
     Returns:
-        The method (needs ``gram``); bits per entry ``bits + 32 / group``.
+        The method (needs ``gram``); bits per entry as ``rtn``.
     """
+    n = 2**bits if levels is None else levels
+    assert n >= 2, f"a grid needs at least 2 levels, got {n}"
 
     def f(delta: Tensor, gram: Tensor | None) -> tuple[Tensor, float]:
         assert gram is not None, "gptq needs the inputs' Gram"
@@ -106,15 +144,15 @@ def gptq(bits: int, group: int = 128, damp: float = 0.01, block: int = 128) -> M
             for j in range(i2 - i1):
                 k = i1 + j
                 if k % group == 0:  # this group's grid, from its current (error-updated) values
-                    lo, step = _minmax(torch.cat([w1[:, j:j + group], w[:, i2:k + group]], 1), bits)
+                    lo, step = _grid(torch.cat([w1[:, j:j + group], w[:, i2:k + group]], 1), n, symmetric, clip)
                 col = w1[:, j:j + 1]
-                qc = _snap(col, lo, step, bits)
+                qc = _snap(col, lo, step, n)
                 q[:, k:k + 1] = qc
                 e = (col - qc) / hi[j, j]
                 w1[:, j:] -= e @ hi[j:j + 1, j:]
                 err[:, j:j + 1] = e
             w[:, i2:] -= err @ hinv[i1:i2, i2:]
-        return q, bits + 32 / group
+        return q, _grid_bits(n, group, symmetric)
 
     return f
 

@@ -1,5 +1,7 @@
 """compress.py: each method's storage and its basic property, and compress_deltas on DeltaMoE and HierDeltaMoE."""
 
+import math
+
 import pytest
 import torch
 
@@ -114,3 +116,18 @@ def test_gptq_on_grid():
     d, x = data()
     q = C.gptq(2, 64)(d, x.T @ x)[0]
     assert max(len(g.unique()) for g in q.reshape(-1, 64)) <= 4
+
+
+def test_low_bit_grids():
+    """Ternary and 2-level grids: right level count and bits; clipping lowers the error; symmetric saves the offset."""
+    d, x = data()
+    h = x.T @ x
+    for m, levels, bits in ((C.rtn(levels=3, group=64), 3, math.log2(3) + 0.5),
+                            (C.rtn(levels=3, group=64, symmetric=True), 3, math.log2(3) + 0.25),
+                            (C.gptq(levels=2, group=32, clip=True), 2, 2.0)):  # fmt: skip
+        a, b = m(d, h)
+        assert b == pytest.approx(bits)
+        assert max(len(g.unique()) for g in a.reshape(-1, 64 if levels == 3 else 32)) <= levels
+    for kw in (dict(levels=2), dict(levels=3, symmetric=True)):
+        plain, clipped = C.rtn(group=64, **kw)(d, h)[0], C.rtn(group=64, clip=True, **kw)(d, h)[0]
+        assert (clipped - d).norm() < (plain - d).norm()
