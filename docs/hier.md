@@ -37,6 +37,48 @@ flowchart LR
     sum --> y([y])
 ```
 
+**Storage.** The diagram above is the computation: every routed expert runs as $W_b+\Delta_{ij}$. What a layer stores
+is one base and one delta per delta expert, all groups in one stack; a zero expert stores nothing but its router row.
+State dict of one layer (Qwen3.5 checkpoints: under `model.layers.{l}.mlp.`), $N=\sum_i E_i$:
+
+| key | shape | holds |
+|---|---|---|
+| `gate`, `up`, `down` | $(I, H)$, $(I, H)$, $(H, I)$ | $W_b$, once |
+| `d_gate`, `d_up`, `d_down` | $(N, I, H)$, $(N, I, H)$, $(N, H, I)$ | $\Delta_{ij}$, group 1's $E_1$ deltas, then group 2's, ... |
+| `router.weight` | $(G+\sum_i(E_i+Z_i),\ H)$ | $R_0$ ($G$ rows), then per group its $E_i$ delta rows and $Z_i$ zero-expert rows |
+
+```mermaid
+flowchart LR
+    subgraph S ["stored"]
+        Wb[("W_b")]
+        d11[("Δ_11")]
+        d12[("Δ_12")]
+        d21[("Δ_21")]
+    end
+    subgraph G1 ["group 1"]
+        e11["W_b + Δ_11"]
+        e12["W_b + Δ_12"]
+        z1["zero expert"]
+    end
+    subgraph G2 ["group 2"]
+        e21["W_b + Δ_21"]
+    end
+    Wb --> e11 & e12 & z1 & e21
+    d11 --> e11
+    d12 --> e12
+    d21 --> e21
+```
+
+
+- **Size.** $(1+N)$ MLPs of weights plus the router: the same as the $N$ full experts and the base stored separately;
+  a zero expert costs one router row. In bf16 at hidden 2560, inter 9216, $W_b$ and each $\Delta_{ij}$ are 141.6 MB.
+- **Dtype.** The deltas are in the model dtype; the converter subtracts in fp32 and rounds once
+  ($\Delta_{ij}=\theta_{ij}-W_b$), so $W_b+\Delta_{ij}$ may differ from $\theta_{ij}$ in the last bit.
+- **Not stored.** Group sizes and zero counts are in the config (`hier_delta_moe`: `group_sizes`, `group_zeros`,
+  `top_k`, `group_top_k`); the tables that map a group's experts to router columns and delta indices are built from
+  them on first use.
+- Deltas are dense only: DARE and BitDelta (`PackedDeltaMoE`) take flat `DeltaMoE`s.
+
 **Usage.**
 
 ```python
