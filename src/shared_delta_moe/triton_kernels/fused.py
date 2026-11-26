@@ -164,6 +164,19 @@ def _dare_delta(v_ptr, run, k0, kk, dmask, m_ptr, mrow, words, KB, B: tl.constex
     return dw, run + tl.sum(mi, axis=1)
 
 
+@triton.jit
+def _bit_delta(b_ptr, brow, k0, dmask, scale, MW, BN: tl.constexpr, BK: tl.constexpr):
+    """BitDelta tile, float32: entry c of a row is +scale if bit c % 32 of its word c // 32 is set, else -scale (MW
+    words per row from brow; BK a multiple of 32)."""
+    W: tl.constexpr = BK // 32
+    wj = k0 // 32 + tl.arange(0, W)[None, :]
+    rm = tl.max(dmask.to(tl.int32), axis=1)[:, None] > 0  # rows with a delta
+    w = tl.load(b_ptr + brow + wj, mask=rm & (wj < MW), other=0)  # (BN, W)
+    bit = (w[:, :, None] >> tl.arange(0, 32)[None, None, :]) & 1
+    sign = (tl.reshape(bit, (BN, BK)) * 2 - 1).to(tl.float32)
+    return tl.where(dmask, sign * scale[:, None], 0.0)
+
+
 # ------------------------------------------------------------------------------------------------ GEMM kernels
 
 
@@ -254,10 +267,15 @@ def _gate_up_kernel(
         dcols = cmask & (g < G)  # zero expert: delta loads masked off, not branched (keeps the loop pipelined)
         rg = tl.zeros((BN,), tl.int64)
         ru = tl.zeros((BN,), tl.int64)
+        sg = tl.zeros((BN,), tl.float32)
+        su = tl.zeros((BN,), tl.float32)
         if MODE == 1:
             rg = tl.load(pg_ptr + g * N + cols, mask=dcols, other=0)
             ru = tl.load(pu_ptr + g * N + cols, mask=dcols, other=0)
-        mrow = (g * N + cols).to(tl.int64)[:, None] * MW  # mask words of each row (DARE)
+        if MODE == 2:  # p: the BitDelta row scales
+            sg = tl.load(pg_ptr + g * N + cols, mask=dcols, other=0.0).to(tl.float32)
+            su = tl.load(pu_ptr + g * N + cols, mask=dcols, other=0.0).to(tl.float32)
+        mrow = (g * N + cols).to(tl.int64)[:, None] * MW  # mask words (DARE) / sign words (BitDelta) of each row
         wg_bits = _mask_words(mg_ptr, mrow, dcols, MW, MWP)
         wu_bits = _mask_words(mu_ptr, mrow, dcols, MW, MWP)
         acc_g = tl.zeros((BN, BM), tl.float32)  # y^T: the summed weight is operand A
@@ -280,9 +298,12 @@ def _gate_up_kernel(
             elif MODE == 0:
                 dg = _dense_delta(dg_ptr, g, cols, kk, dmask, sdg, sdn, sdk)
                 du = _dense_delta(du_ptr, g, cols, kk, dmask, seg, sen, sek)
-            else:
+            elif MODE == 1:
                 dg, rg = _dare_delta(dg_ptr, rg, k0, kk, dmask, mg_ptr, mrow, wg_bits, K // B, B, BN, BK, MWP)
                 du, ru = _dare_delta(du_ptr, ru, k0, kk, dmask, mu_ptr, mrow, wu_bits, K // B, B, BN, BK, MWP)
+            else:  # +-scale is exact in the model dtype, so W_b + delta rounds as in the materialised forward
+                dg = _bit_delta(dg_ptr, mrow, k0, dmask, sg, MW, BN, BK).to(wg.dtype)
+                du = _bit_delta(du_ptr, mrow, k0, dmask, su, MW, BN, BK).to(wu.dtype)
             at = tl.trans(a)
             acc_g = tl.dot(wg + dg, at, acc_g)
             acc_u = tl.dot(wu + du, at, acc_u)
@@ -320,8 +341,11 @@ def _down_kernel(
         cmask = cols < N
         dcols = cmask & (g < G)
         run = tl.zeros((BN,), tl.int64)
+        sc = tl.zeros((BN,), tl.float32)
         if MODE == 1:
             run = tl.load(p_ptr + g * N + cols, mask=dcols, other=0)
+        if MODE == 2:
+            sc = tl.load(p_ptr + g * N + cols, mask=dcols, other=0.0).to(tl.float32)
         mrow = (g * N + cols).to(tl.int64)[:, None] * MW
         bits = _mask_words(m_ptr, mrow, dcols, MW, MWP)
         acc = tl.zeros((BN, BM), tl.float32)
@@ -339,8 +363,10 @@ def _down_kernel(
                 dw = d_desc.load([g, ni * BN, k0]).reshape(BN, BK)
             elif MODE == 0:
                 dw = _dense_delta(d_ptr, g, cols, kk, dmask, sdg, sdn, sdk)
-            else:
+            elif MODE == 1:
                 dw, run = _dare_delta(d_ptr, run, k0, kk, dmask, m_ptr, mrow, bits, K // B, B, BN, BK, MWP)
+            else:
+                dw = _bit_delta(d_ptr, mrow, k0, dmask, sc, MW, BN, BK).to(w.dtype)
             acc = tl.dot(w + dw, tl.trans(a), acc)
         pair = tl.load(perm_ptr + rows, mask=rmask, other=0)
         rw = tl.load(rw_ptr + pair, mask=rmask, other=0.0)
@@ -360,7 +386,8 @@ def _down_kernel(
 class Delta(NamedTuple):
     """One projection's deltas as the kernels take them. mode 0: dense (G, N, K) in d; mode 1: seeded DARE, d the
     packed kept values, p (G, N) each row's start in d, m (G, N, words) int32 the keep bit of each DARE block
-    (models/dare.py mask_bits)."""
+    (models/dare.py mask_bits); mode 2: BitDelta, d (G, N, K / 32) int32 sign bits, p (G, N) row scales, block 32
+    (models/bitdelta.py)."""
 
     mode: int
     d: Tensor
@@ -370,12 +397,16 @@ class Delta(NamedTuple):
 
     def ptrs(self) -> tuple[Tensor, Tensor, int]:
         """(p, m, mask words per row); dense mode: placeholders the kernel never reads."""
-        return (self.d, self.d, 0) if self.mode == 0 else (self.p, self.m, self.m.shape[-1])  # type: ignore[return-value]
+        if self.mode == 0:
+            return self.d, self.d, 0
+        if self.mode == 1:
+            return self.p, self.m, self.m.shape[-1]  # type: ignore[return-value]
+        return self.p, self.d, self.d.shape[-1]  # type: ignore[return-value]
 
     def mwp(self) -> int:
         """Mask words per row padded to a power of 2 when at most 8 (kept in registers), else 0 (read per tile)."""
         mw = self.ptrs()[2]
-        return triton.next_power_of_2(mw) if 0 < mw <= 8 else 0
+        return triton.next_power_of_2(mw) if self.mode == 1 and 0 < mw <= 8 else 0
 
     def strides(self) -> tuple[int, int, int]:
         return tuple(self.d.stride()) if self.mode == 0 else (0, 0, 0)  # type: ignore[return-value]
@@ -401,8 +432,9 @@ def _grid(dev: torch.device, P: int, G: int, N: int, S: int):
 
 
 def _split_k(P: int, G: int, N: int, K: int, sms: int, d: Delta) -> int:
-    """Split K when there are too few output tiles to occupy the SMs (decode with one or two tokens); dense only."""
-    if d.mode != 0:
+    """Split K when there are too few output tiles to occupy the SMs (decode with one or two tokens); not for DARE
+    (its rows are read from their start)."""
+    if d.mode == 1:
         return 1
     tiles, s = min(P, G + 1 + triton.cdiv(P, 64)) * triton.cdiv(N, 64), 1  # row tiles (64 rows) x column tiles
     while s < 8 and tiles * s < sms and K // (2 * s) >= 1024:
@@ -476,7 +508,7 @@ def down(h: Tensor, r: Routing, w: Tensor, d: Delta, config: triton.Config | Non
     """(T, H): sum over slots of r_i * h_i (W_d + D_d)^T."""
     P, (N, K), G, T = h.shape[0], w.shape, r.n_delta, r.tokens
     S = split_k or _split_k(P, G, N, K, _sms(h.device), d)
-    assert S == 1 or d.mode == 0, "DARE rows are read from their start: no split-K"
+    assert S == 1 or d.mode != 1, "DARE rows are read from their start: no split-K"
     grid, _ = _grid(h.device, P, G, N, S)
     o = torch.empty(P, N, dtype=h.dtype, device=h.device) if S == 1 else torch.zeros(T, N, dtype=torch.float32, device=h.device)
     tma = d.mode == 0 and _tma(P, h, w, d.d)
@@ -523,12 +555,24 @@ def fused_moe_dare(x: Tensor, idx: Tensor, rw: Tensor, wg: Tensor, wu: Tensor, w
     return fused_moe(x, idx, rw, n_delta, (wg, wu, wd), deltas)  # type: ignore[arg-type]
 
 
+@torch.library.custom_op("shared_delta_moe::fused_moe_bit", mutates_args=())
+def fused_moe_bit(x: Tensor, idx: Tensor, rw: Tensor, wg: Tensor, wu: Tensor, wd: Tensor, bg: Tensor, bu: Tensor,
+                  bd: Tensor, sg: Tensor, su: Tensor, sd: Tensor, n_delta: int) -> Tensor:  # fmt: skip
+    deltas = tuple(Delta(2, b, s, block=32) for b, s in ((bg, sg), (bu, su), (bd, sd)))
+    return fused_moe(x, idx, rw, n_delta, (wg, wu, wd), deltas)  # type: ignore[arg-type]
+
+
 @fused_moe_dense.register_fake
 def _(x, *args, **kwargs):
     return x.new_empty(x.shape)  # contiguous, as the op returns (empty_like would keep x's strides)
 
 
 @fused_moe_dare.register_fake
+def _(x, *args, **kwargs):
+    return x.new_empty(x.shape)
+
+
+@fused_moe_bit.register_fake
 def _(x, *args, **kwargs):
     return x.new_empty(x.shape)
 
@@ -541,6 +585,8 @@ def fused_moe_any(x: Tensor, idx: Tensor, rw: Tensor, n_delta: int, base: tuple[
     x = x.contiguous()  # Inductor may hand the op another layout of x than the one it traced
     if deltas[0].mode == 0:
         return fused_moe_dense(x, idx, rw, *base, *(d.d for d in deltas), n_delta)
+    if deltas[0].mode == 2:
+        return fused_moe_bit(x, idx, rw, *base, *(d.d for d in deltas), *(d.p for d in deltas), n_delta)  # type: ignore[misc]
     d0 = deltas[0]
     return fused_moe_dare(x, idx, rw, *base, *(d.d for d in deltas), *(d.p for d in deltas),  # type: ignore[misc]
                           *(d.m for d in deltas), n_delta, d0.block)  # fmt: skip

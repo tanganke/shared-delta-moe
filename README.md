@@ -10,6 +10,7 @@ src/shared_delta_moe/triton_kernels/      fused.py: the fused parameter-aggregat
                                           its backward for training (dense deltas, triton_train)
 src/shared_delta_moe/models/hier.py       HierDeltaMoE: groups of deltas + zero experts, two-level routing
 src/shared_delta_moe/models/dare.py       seeded DARE: Philox mask, its bitmap, pack, DareDeltaMoE
+src/shared_delta_moe/models/bitdelta.py   BitDelta: 1-bit sign deltas with per-matrix or per-row scales, BitDeltaMoE
 src/shared_delta_moe/models/qwen3_5/qwen3_5_delta_moe/
                                           transformers' Qwen3.5 MoE with DeltaMoE blocks (forward_param): modeling.py
                                           (patches the decoder layer for configs with delta_moe_zero_experts), convert.py
@@ -21,6 +22,7 @@ tests/test_delta_moe.py                   every forward == plain MoE, token by t
 tests/test_dare.py                        Philox known-answer, CPU == CUDA masks, bitmap == mask, DARE forwards and gradients
 tests/test_hier.py                        HierDeltaMoE forwards and gradients == the two-level ensemble, token by token
 tests/test_train.py                       the Triton backward == the materialised path (x, router, every weight; Hier)
+tests/test_bitdelta.py                    sign packing, BitDelta scales, forwards == plain MoE, scale gradients, Triton mode 2
 tests/test_qwen3_5_delta_moe.py           tiny Qwen3.5 MoE: converted == stock MoE at top-1, top-2, soft routing
 tests/test_fused.py                       the fused kernels: sort, every autotune config, split-K, int64 offsets,
                                           CUDA graph, torch.compile
@@ -48,6 +50,7 @@ Details live in `docs/`, one topic per file; this README keeps only the layout, 
 - [forwards.md](docs/forwards.md): `forward_param` / `forward_matrix` / `forward_dense` and how an implementation is picked
 - [fused-kernel.md](docs/fused-kernel.md): the fused Triton forward (sort, gate_up, down; CUDA graph, TMA, split-K, rounding) and its speed
 - [dare.md](docs/dare.md): seeded DARE deltas, the mask bitmap, speed
+- [bitdelta.md](docs/bitdelta.md): 1-bit BitDelta deltas (sign bits plus scales), the kernel's mode 2, speed
 - [training.md](docs/training.md): gradients through `forward_param`, the fused Triton backward (`triton_train`), DARE training memory
 - [hier.md](docs/hier.md): the two-level shared delta MoE (`HierDeltaMoE`): groups, dense or top-k group routing, zero experts
 - [qwen3_5.md](docs/qwen3_5.md): Qwen3.5 MoE in transformers with DeltaMoE blocks, checkpoint converter

@@ -9,7 +9,7 @@ from collections.abc import Callable
 
 import torch
 
-from shared_delta_moe import DareDeltaMoE, DeltaMoE, random_experts
+from shared_delta_moe import BitDeltaMoE, DareDeltaMoE, DeltaMoE, random_experts
 
 
 @torch.no_grad()
@@ -51,7 +51,10 @@ def main() -> None:
         "matrix loop": m._forward_matrix,
         "matrix grouped": m._forward_matrix_grouped,
         "param triton graph": m._forward_param_triton,  # replayed from a CUDA graph (needs no host sync)
-    } | {k: d._forward_param_triton for k, d in dare.items()}
+    } | {k: d._forward_param_triton for k, d in dare.items()} | {
+        "bitdelta": BitDeltaMoE.from_delta_moe(m, "row")._forward_param_triton,
+        "bitdelta graph": BitDeltaMoE.from_delta_moe(m, "row")._forward_param_triton,
+    }
     if a.only:
         forms = {k: f for k, f in forms.items() if k in a.only.split(",")}
     print(
