@@ -408,8 +408,10 @@ def delta_loss(base: str | Path, fts: Mapping[str, str | Path], data: Mapping[st
             p.copy_(v.to(p.dtype))
 
     @torch.no_grad()
-    def nll(rows_all: list[tuple[list[int], int, int]]) -> list[float]:
-        res = []
+    def nll(rows_all: list[tuple[list[int], int, int]]) -> tuple[list[float], list[float]]:
+        """Per row: mean NLL of the scored tokens and the fraction of them that are the argmax (greedy decoding's
+        choice; with ``score="last"`` on an answer-only MCQ reply, whether the option letter is right)."""
+        res, acc = [], []
         for i in range(0, len(rows_all), batch):
             rows = rows_all[i : i + batch]
             width = max(len(r) for r, _, _ in rows)
@@ -421,17 +423,21 @@ def delta_loss(base: str | Path, fts: Mapping[str, str | Path], data: Mapping[st
             b, t = scored[:, 1:].nonzero(as_tuple=True)
             logits = model.lm_head(hidden[b, t]).float()
             x = torch.nn.functional.cross_entropy(logits, ids[b, t + 1], reduction="none")
-            tot = torch.zeros(len(rows), device="cuda").index_add_(0, b, x)
-            res += (tot / scored[:, 1:].sum(1)).tolist()
-        return res
+            hit = (logits.argmax(-1) == ids[b, t + 1]).float()
+            n = scored[:, 1:].sum(1)
+            res += (torch.zeros(len(rows), device="cuda").index_add_(0, b, x) / n).tolist()
+            acc += (torch.zeros(len(rows), device="cuda").index_add_(0, b, hit) / n).tolist()
+        return res, acc
 
     res: dict[str, Any] = {"base": str(base), "fts": {k: str(v) for k, v in fts.items()}, "data": {k: str(v) for k, v in data.items()},
                            "docs": docs, "max_length": max_length, "score": score, "results": {}}  # fmt: skip
     for label, g in parsed:
         t = time.time()
         build(g)
-        r = {n: nll(d) for n, d in sets.items()}
-        res["results"][label] = {"spec": g, "doc_loss": r, "loss": {n: sum(v) / len(v) for n, v in r.items()}}
+        la = {n: nll(d) for n, d in sets.items()}
+        r, a = {n: v[0] for n, v in la.items()}, {n: v[1] for n, v in la.items()}
+        res["results"][label] = {"spec": g, "doc_loss": r, "loss": {n: sum(v) / len(v) for n, v in r.items()},
+                                 "doc_acc": a, "acc": {n: sum(v) / len(v) for n, v in a.items()}}  # fmt: skip
         print(label, f"{time.time() - t:.0f}s", json.dumps({n: round(v, 4) for n, v in res["results"][label]["loss"].items()}), flush=True)  # fmt: skip
         if out:
             Path(out).write_text(json.dumps(res))
