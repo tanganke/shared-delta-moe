@@ -292,6 +292,34 @@ Block-wise QAT on top of GPTQ (`qat_deltas`, 400 Adam steps of 1024 tokens per e
   outweighs what it fits. GPTQ already minimises each layer's output error on the same inputs. Giving the medical
   expert the ternary grid (1.34 bits on average) does as well (KL 0.0104).
 
+### Qwen3.8-27B experts
+
+The same compressions on three full continued-pretraining fine-tunes of Qwen3.8-27B (hidden 5120, inter 17408, 64
+layers; medical literature, textbook and guideline text, drug labels; ntu-projects moe-indomain-acc log [62]). The
+teacher is the expert; the student is the expert with the chosen weights replaced by base + compressed delta. KL is
+next-token KL(teacher || student) on 16 x 1024 tokens of the expert's own held-out text. "Rest" is every 2-D weight
+outside the MLPs: attention, linear attention, embedding, lm_head (9.8 B of the 27 B parameters).
+
+| student | bits / entry | literature | textbook | drugs |
+|---|---:|---:|---:|---:|
+| MLP delta dropped (scale) | 0 | 0.032 | 0.089 | 0.430 |
+| MLP dense, rest from the base | 16 | 0.0044 | 0.0232 | 0.077 |
+| MLP dense, rest the mean of the three experts | 16 | 0.0028 | 0.0118 | 0.038 |
+| MLP RTN 2 bit, group 128 | 2.25 | 0.0005 | 0.0008 | 0.0015 |
+| MLP GPTQ ternary | 1.71 | 0.0005 | 0.0012 | 0.0092 |
+| MLP GPTQ 2 levels | 1.25 | 0.0036 | 0.0056 | 0.085 |
+| **every delta RTN 2 bit, group 128** | 2.25 | **0.0005** | **0.0008** | **0.0015** |
+
+Adding the uncompressed deltas back gives KL 0.0000: the numbers are compression error, not numerical noise.
+
+- **2-bit round to nearest of every delta loses about 1% of the MLP delta's effect or less**, without data. The
+  data-free weight error (0.6-1.0 relative) does not predict this.
+- **Lower bits fail on the most trained expert** (drugs, 20 epochs): ternary is six times worse than 2 bits, 1 bit
+  loses a fifth of the delta's effect.
+- **The non-MLP deltas cannot be shared**: the base loses 14-26% of the MLP delta's effect, the experts' mean
+  9-13%. Each expert keeps its own, at 2 bits.
+- Clipping still hurts round to nearest (textbook 0.0017), and a Hadamard rotation does not help (0.0007).
+
 ### Accuracy
 
 Accuracy in % (4 samples per question, 500 questions per set), against the dense-delta model; in parentheses the paired
