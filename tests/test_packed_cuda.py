@@ -8,7 +8,7 @@ import pytest
 import torch
 from test_delta_moe import make
 
-from shared_delta_moe import BitDeltaMoE, DareDeltaMoE
+from shared_delta_moe import BitDeltaMoE, DareDeltaMoE, DeltaMoE, random_experts
 from shared_delta_moe.cuda_kernels import packed_ops
 
 pytestmark = pytest.mark.skipif(not (torch.cuda.is_available() and packed_ops.available()), reason="not built")
@@ -58,6 +58,32 @@ def test_fp16_and_falls_back():
     d = DareDeltaMoE.from_delta_moe(m, 0.3, 4, seed=5)  # block < 8: Triton
     assert not packed_ops.supports(x[:4], 8, (d.gate, d.up, d.down), d._kernel_deltas())
     assert rel(d._forward_param_triton(x[:4]), d._forward_param(x[:4])) < 2e-2
+
+
+def test_many_deltas():  # 16 deltas: DARE gate/up stores row state per group, past 13 groups it no longer fits
+    torch.manual_seed(0)
+    full = random_experts(256, 384, 17, torch.bfloat16, "cuda")
+    m = DeltaMoE.from_experts(full[0], full[1:], torch.randn(17, 256, dtype=torch.bfloat16, device="cuda"), top_k=2,
+                              num_zero_experts=1)  # fmt: skip
+    x = torch.randn(64, 256, dtype=torch.bfloat16, device="cuda")
+    for mod in (DareDeltaMoE.from_delta_moe(m, 0.3, 8, seed=3), BitDeltaMoE.from_delta_moe(m, 32)):
+        check(mod, x, ts=(1, 3, 6))
+        args = (x[:8], 16, (mod.gate, mod.up, mod.down), mod._kernel_deltas())
+        assert packed_ops.supports(*args) == isinstance(mod, BitDeltaMoE)  # DARE: Triton at 16 pairs
+        with torch.no_grad():
+            assert rel(mod._forward_param_triton(x[:8]), mod._forward_param(x[:8])) < 2e-2
+
+
+def test_other_gpus_fall_back(monkeypatch):
+    m, _, x = make(1, 2, 256, 384, torch.bfloat16, "cuda")
+    d = BitDeltaMoE.from_delta_moe(m, "row")
+    args = (x[:4], 8, (d.gate, d.up, d.down), d._kernel_deltas())
+    assert packed_ops.supports(*args)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (8, 0))
+    assert not packed_ops.supports(*args)
+    d.gate.data = d.gate.data.t().contiguous().t()  # not contiguous
+    monkeypatch.undo()
+    assert not packed_ops.supports(*args)
 
 
 def test_cuda_graph_and_compile():

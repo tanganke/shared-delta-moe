@@ -90,7 +90,7 @@ node, other GPUs running the tests.
   | 8192 | 3.447 | 4.691 | 6.136 | 5.966 |
 
   12–30% slower than row scales from 8 tokens up.
-- **CUDA kernels at decode.** Up to 16 (token, slot) pairs, prebuilt CUDA kernels take over
+- **CUDA kernels at decode.** Up to 16 (token, slot) pairs on sm_90 (H100 / H200 only), prebuilt CUDA kernels take over
   (`cuda_kernels/packed_moe.cu`; build and design in [dare.md](dare.md#cuda-kernels-at-decode)). A byte of sign
   bits indexes a 256-entry table of sign-flip masks, so $W_b \pm s$ costs one XOR and one bf16x2 add per two
   entries. They cover one scale per row or matrix, or blocks of 32 or more. Matrix scales, µs per layer, top-1 / top-2

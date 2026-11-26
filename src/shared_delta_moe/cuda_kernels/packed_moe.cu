@@ -371,8 +371,8 @@ __global__ void __launch_bounds__(WARPS * 32) packed_kernel(const Params p) {
         }
       }
     }
+    if (MODE == 1) tail += rec[sl * L::REC + 32];  // read before the refill below can reuse the slot
     __syncwarp();
-    if (MODE == 1) tail += rec[sl * L::REC + 32];
     if (++gi == ng) gi = 0, c++;
     while (issued < nsteps && issued - s - 1 < MAXLEAD && try_issue(c)) {
     }
@@ -393,6 +393,7 @@ __global__ void __launch_bounds__(WARPS * 32) packed_kernel(const Params p) {
         ws[(((long long)(strip * p.S + split) * MATS + mat) * NT + j) * 32 + lane] =
             make_float4(acc[mat][j][0], acc[mat][j][1], acc[mat][j][2], acc[mat][j][3]);
     __threadfence();
+    __syncwarp();  // every lane's partial is published before lane 0 counts the warp in
     int old = 0;
     if (lane == 0) old = atomicAdd(p.counter + strip, 1);
     old = __shfl_sync(0xFFFFFFFFu, old, 0);
@@ -436,6 +437,7 @@ void launch(Params& p, const at::Tensor& like, at::Tensor& ws_keep, at::Tensor& 
   const int hdr = ((2 * p.G + 4 + p.P) * 4 + 15) / 16 * 16, nchunks = p.K / KC, strips = (p.N + 15) / 16;
   const int sgroups = (strips + WARPS - 1) / WARPS, dev = like.get_device();
   const int sms = at::cuda::getDeviceProperties(dev)->multiProcessorCount;
+  const int smax = (int)at::cuda::getDeviceProperties(dev)->sharedMemPerBlockOptin;
   auto nw_of = [&](int cps) { return MODE == 1 ? ((cps * KC) >> p.bs >> 5) + 2 : 0; };
   auto smem_of = [&](int cps) {
     return hdr + (MODE == 2 ? TAB : 0) + NT * 8 * (cps * KC + XPAD) * 2 + WARPS * (L::fixed + dare_extra(MODE, MATS, p.ngmax, nw_of(cps)));
@@ -445,7 +447,7 @@ void launch(Params& p, const at::Tensor& like, at::Tensor& ws_keep, at::Tensor& 
     auto key = std::make_pair(dev, smem);
     auto it = occ.find(key);
     if (it != occ.end()) return it->second;
-    C10_CUDA_CHECK(cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, 227 * 1024));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, smax));
     int n = 0;
     C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, k, WARPS * 32, smem));
     return occ[key] = n;
@@ -458,7 +460,7 @@ void launch(Params& p, const at::Tensor& like, at::Tensor& ws_keep, at::Tensor& 
     int c = (nchunks + S - 1) / S;
     if (cps && c == cps) continue;
     int smem = smem_of(c);
-    if (NT * 8 * (c * KC + XPAD) * 2 > XMAX || smem > 227 * 1024) continue;
+    if (NT * 8 * (c * KC + XPAD) * 2 > XMAX || smem > smax) continue;
     long long ctas = (long long)sgroups * ((nchunks + c - 1) / c), slots = (long long)max(1, per_sm(smem)) * sms;
     double eff = (double)ctas / (double)(((ctas + slots - 1) / slots) * slots);
     if (eff > best + 0.05) best = eff, cps = c;

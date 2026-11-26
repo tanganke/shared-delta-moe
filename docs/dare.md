@@ -36,19 +36,21 @@ ntu-projects `moe-indomain-acc` log [35] (blocks 4 to 256 at 20% match element-w
 
 At up to 16 (token, slot) pairs, `forward_param` runs prebuilt CUDA kernels instead of the Triton ones
 (`cuda_kernels/packed_moe.cu`, `packed_ops.py`). They cover DARE blocks of 8 or more and BitDelta, with hidden and inter
-multiples of 64. A warp owns 16 weight rows over a K range and reads $W_b$ once per 64-wide K step. For each routed
+multiples of 64, on sm_90 (H100 / H200) only: the build targets sm_90a and the layout needs Hopper's 227 KB of
+shared memory per CTA, so on any other GPU, and for shapes or tensors they do not cover, the forward runs on Triton.
+A warp owns 16 weight rows over a K range and reads $W_b$ once per 64-wide K step. For each routed
 group it adds the kept values in registers and multiplies with that group's pairs on the tensor cores. Popcounts over
 the keep bitmap place the values, which stream through a per-warp `cp.async` pool that holds only what is kept.
 Rounding is the same as in the Triton kernels; split-K sums run in a fixed order.
 
 Build once per torch version on a node with nvcc (here a 2B compute node, `module load cuda/13.0`), writing
-`sdm_packed-<torch>.so` into a directory the runtime also sees, e.g. on /data for the vLLM image:
+`sdm_packed-<torch>-<source hash>.so` (an edited `packed_moe.cu` is never matched with an old build) into a directory the runtime also sees, e.g. on /data for the vLLM image:
 
 ```bash
 SHARED_DELTA_MOE_CUDA_DIR=/data/projects/11620001/anketang/sdm-cuda python -m shared_delta_moe.cuda_kernels.packed_ops
 ```
 
-The runtime loads the file by path, with the same variable and no nvcc. Without the library, or with
+The runtime loads the file by path, with the same variable and no nvcc. Without the library, if it fails to load, or with
 `SHARED_DELTA_MOE_CUDA=0`, everything runs on Triton. Under `torch.compile` the kernels run inside the same op
 (`shared_delta_moe::fused_moe_dare`), so CUDA graphs work as before. `tests/test_packed_cuda.py` checks them against
 the materialised forward: blocks 8 to 128, zero experts, top-2, split-K, fp16, a CUDA graph and `torch.compile`.

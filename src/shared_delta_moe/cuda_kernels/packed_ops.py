@@ -17,17 +17,20 @@ materialised forward.
 blocks below 8, BitDelta scale blocks below 32, or the library not built. Under ``torch.compile`` they run inside the
 same registered op (``shared_delta_moe::fused_moe_dare`` / ``_bit``), so CUDA graphs work as before.
 
-Build once per torch version, on a machine with nvcc (sm_90a; sm_89 and sm_80 also compiled, not tuned):
+Only sm_90 (H100 / H200) is supported: the build is sm_90a only, and the layout needs Hopper's 227 KB of shared memory
+per CTA; ``supports`` sends every other GPU to Triton. Build once per torch version, on a machine with nvcc:
 
 .. code-block:: bash
 
    SHARED_DELTA_MOE_CUDA_DIR=/data/.../sdm-cuda python -m shared_delta_moe.cuda_kernels.packed_ops
 
-This writes ``$SHARED_DELTA_MOE_CUDA_DIR/sdm_packed-<torch version>.so`` (default directory
+This writes ``$SHARED_DELTA_MOE_CUDA_DIR/sdm_packed-<torch version>-<source hash>.so`` (default directory
 ``~/.cache/shared_delta_moe/cuda``). At runtime the library is loaded by that path, with the same variable and no
-nvcc needed; without it, or with ``SHARED_DELTA_MOE_CUDA=0``, everything runs on Triton.
+nvcc needed; without it (or after an edit of ``packed_moe.cu``, until rebuilt), if it fails to load, or with
+``SHARED_DELTA_MOE_CUDA=0``, everything runs on Triton.
 """
 
+import hashlib
 import os
 from pathlib import Path
 
@@ -37,9 +40,10 @@ from torch import Tensor
 MAX_PAIRS = 16  # H200, hidden 2560, inter 9216, 5 deltas: CUDA wins up to 16 (token, slot) pairs, Triton from 24
 ENABLED = os.environ.get("SHARED_DELTA_MOE_CUDA", "1") != "0"
 DIR = Path(os.environ.get("SHARED_DELTA_MOE_CUDA_DIR", Path.home() / ".cache" / "shared_delta_moe" / "cuda"))
-LIB = DIR / f"sdm_packed-{torch.__version__}.so"
 SRC = Path(__file__).with_name("packed_moe.cu")
-ARCHS = ("90a", "89", "80")
+HASH = hashlib.sha256(SRC.read_bytes()).hexdigest()[:12]
+LIB = DIR / f"sdm_packed-{torch.__version__}-{HASH}.so"  # never a stale build
+ARCHS = ("90a",)  # sm_90 only: the layout wants Hopper's 227 KB of shared memory per CTA
 
 _loaded: bool | None = None
 
@@ -54,8 +58,11 @@ def available() -> bool:
     if _loaded is None:
         _loaded = False
         if ENABLED and torch.cuda.is_available() and LIB.exists():
-            torch.ops.load_library(str(LIB))
-            _loaded = True
+            try:
+                torch.ops.load_library(str(LIB))
+                _loaded = True
+            except (OSError, RuntimeError):  # a broken or mismatched build: Triton
+                pass
     return _loaded
 
 
@@ -69,21 +76,43 @@ def supports(x: Tensor, pairs: int, base: tuple[Tensor, Tensor, Tensor], deltas)
         deltas: The three ``Delta`` of the projections (mode 1 DARE or 2 BitDelta).
 
     Returns:
-        True for 1 .. ``MAX_PAIRS`` pairs of bf16/fp16 on CUDA, hidden and inter multiples of 64, DARE blocks of at
-        least 8 (a power of 2) with 16-byte aligned values, BitDelta with one scale per row or blocks of at least 32,
-        and the library loaded.
+        True on sm_90 for 1 .. ``MAX_PAIRS`` pairs of bf16/fp16, hidden and inter multiples of 64, DARE blocks of at
+        least 8 (a power of 2), BitDelta with one scale per row or blocks of at least 32, every tensor contiguous and
+        16-byte aligned, the layout within the device's shared memory, and the library loaded.
     """
     d = deltas[0]
     if not (d.mode in (1, 2) and 0 < pairs <= MAX_PAIRS and x.is_cuda and x.dtype in (torch.bfloat16, torch.float16)):
         return False
-    if x.shape[1] % 64 or base[0].shape[0] % 64 or deltas[0].d.numel() == 0 or any(w.dtype != x.dtype for w in base):
+    if torch.cuda.get_device_capability(x.device) != (9, 0) or x.shape[1] % 64 or base[0].shape[0] % 64:
+        return False
+    extra = (torch.int64, torch.int32) if d.mode == 1 else (x.dtype, torch.int32)  # (p, m) or (scales, sign words)
+    if any(dl.mode != d.mode or dl.d.numel() == 0 for dl in deltas) or deltas[1].block != d.block:  # one gate/up block
+        return False
+    ts = [(w, x.dtype) for w in base] + [t for dl in deltas for t in zip((dl.p, dl.m if d.mode == 1 else dl.d), extra)]
+    if any(t is None or t.dtype != dt or not t.is_contiguous() or t.data_ptr() % 16 for t, dt in ts):
+        return False
+    dd = x.dtype if d.mode == 1 else torch.int32  # kept values or sign words
+    if any(dl.d.dtype != dd or not dl.d.is_contiguous() or dl.d.data_ptr() % 16 for dl in deltas):
         return False
     for dl in deltas:
-        if dl.mode == 1 and (dl.block < 8 or dl.block & (dl.block - 1) or dl.d.data_ptr() % 16):
+        if dl.mode == 1 and (dl.block < 8 or dl.block & (dl.block - 1)) or dl.mode == 2 and dl.block and dl.block < 32:
             return False
-        if dl.mode == 2 and dl.block and dl.block < 32:
-            return False
-    return available()
+    smax = torch.cuda.get_device_properties(x.device).shared_memory_per_block_optin
+    g = d.p.shape[0]
+    fits = _smem(d.mode, 2, g, pairs, d.block) <= smax and _smem(d.mode, 1, g, pairs, deltas[2].block) <= smax
+    return fits and available()
+
+
+def _smem(mode: int, mats: int, g: int, pairs: int, block: int) -> int:
+    """Shared memory of the smallest K split, as ``launch`` in ``packed_moe.cu`` computes it (keep the two in step)."""
+    kc, warps, nt = 64, 8, next(n for n in (1, 2, 4, 8) if 8 * n >= pairs)
+    hdr = ((2 * g + 4 + pairs) * 4 + 15) // 16 * 16
+    if mode == 1:  # W_b ring + DARE pool and step records + row cursors and bitmap words of up to G + 1 groups
+        words = kc // block // 32 + 2
+        warp = 4 * mats * 16 * kc * 2 + 256 * 16 + 8 * 36 * 4 + mats * min(g + 1, pairs) * 16 * (8 + 4 * words)
+    else:  # W_b ring + BitDelta steps, then the sign table
+        warp, hdr = 4 * mats * 16 * kc * 2 + 8 * mats * (64 * kc // 32 + 128), hdr + 4096
+    return hdr + nt * 8 * (kc + 32) * 2 + warps * warp
 
 
 def moe(x: Tensor, r, base: tuple[Tensor, Tensor, Tensor], deltas) -> Tensor:
