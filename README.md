@@ -40,6 +40,7 @@ benchmarks/bench_train.py                 training step: Triton backward vs mate
 ```
 
 ```bash
+git clone https://github.com/tanganke/fusion_bench ../fusion_bench   # uv uses it editable (merging.py, tests)
 uv sync                                  # or: pip install -e .   (Triton ships with torch on Linux + CUDA)
 uv run pytest                            # or: python tests/test_delta_moe.py
 uv run python benchmarks/bench.py --top-k 2 --tokens 1,32,512,8192

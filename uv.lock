@@ -1700,7 +1700,7 @@ wheels = [
 [[package]]
 name = "fusion-bench"
 version = "0.2.33"
-source = { registry = "https://pypi.org/simple" }
+source = { editable = "../fusion_bench" }
 dependencies = [
     { name = "bidict", version = "0.23.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "bidict", version = "0.24.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
@@ -1725,10 +1725,35 @@ dependencies = [
     { name = "tqdm" },
     { name = "transformers" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/8e/2b/2e1ddfd51f1592ca8debda08952f9bb24cdcaf4d595f577a8615fedf6169/fusion_bench-0.2.33.tar.gz", hash = "sha256:2dd939c7389c36098364faae5dd3e721b8ce85978cdc81653ea49e4492ddb7f1", size = 730455, upload-time = "2026-06-11T07:49:28.296Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/1b/32/68e6a6413c9a6a8da6239c4ce7a0ae197646f7f760775cb87fd43eb04aba/fusion_bench-0.2.33-py3-none-any.whl", hash = "sha256:cf34d2d969073eea0ac49a85d0c2429ceeff12781a71fc5e639844db5412253d", size = 1178484, upload-time = "2026-06-11T07:49:26.725Z" },
+
+[package.metadata]
+requires-dist = [
+    { name = "bidict" },
+    { name = "datasets" },
+    { name = "h5py" },
+    { name = "huggingface-hub" },
+    { name = "hydra-core" },
+    { name = "immutabledict", marker = "extra == 'lm-eval-harness'" },
+    { name = "joblib" },
+    { name = "langdetect", marker = "extra == 'lm-eval-harness'" },
+    { name = "lightning" },
+    { name = "lm-eval", marker = "extra == 'lm-eval-harness'" },
+    { name = "matplotlib" },
+    { name = "mkdocs", marker = "extra == 'docs'" },
+    { name = "mkdocs-material", marker = "extra == 'docs'" },
+    { name = "mkdocstrings", extras = ["python"], marker = "extra == 'docs'" },
+    { name = "peft" },
+    { name = "pillow", specifier = "!=11.2.1" },
+    { name = "pytest" },
+    { name = "rich" },
+    { name = "rich-run", marker = "extra == 'lm-eval-harness'" },
+    { name = "scipy" },
+    { name = "tensorboard" },
+    { name = "tqdm" },
+    { name = "transformers" },
+    { name = "transformers", specifier = "!=4.49" },
 ]
+provides-extras = ["lm-eval-harness", "docs"]
 
 [[package]]
 name = "grpcio"
@@ -5811,7 +5836,7 @@ docs = [
 
 [package.metadata]
 requires-dist = [
-    { name = "fusion-bench", marker = "extra == 'merging'", specifier = ">=0.2.33" },
+    { name = "fusion-bench", marker = "extra == 'merging'", editable = "../fusion_bench" },
     { name = "torch" },
     { name = "transformers", marker = "extra == 'transformers'", specifier = ">=5.13" },
     { name = "triton", marker = "extra == 'triton'" },
@@ -5821,7 +5846,7 @@ provides-extras = ["triton", "transformers", "merging"]
 [package.metadata.requires-dev]
 dev = [
     { name = "black" },
-    { name = "fusion-bench", specifier = ">=0.2.33" },
+    { name = "fusion-bench", editable = "../fusion_bench" },
     { name = "mypy" },
     { name = "pytest" },
     { name = "transformers", specifier = "==5.16.1" },

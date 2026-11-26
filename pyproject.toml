@@ -30,3 +30,8 @@ build-backend = "hatchling.build"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.uv.sources]
+# development: an editable clone of fusion_bench next to this repo (git clone https://github.com/tanganke/fusion_bench
+# ../fusion_bench), so its fixes apply before a release; pip ignores this and installs fusion-bench from PyPI
+fusion-bench = { path = "../fusion_bench", editable = true }
