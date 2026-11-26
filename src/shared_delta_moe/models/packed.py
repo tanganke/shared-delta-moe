@@ -118,12 +118,12 @@ class PackedDeltaMoE(DeltaMoE):
         """Copy m's router and base weights, which the packed form keeps as they are.
 
         Raises:
-            TypeError: If m is a HierDeltaMoE (a packed DeltaMoE has a flat router).
+            TypeError: If one of m and this module is a HierDeltaMoE and the other is not (flat vs two-level router).
         """
         from .hier import HierDeltaMoE
 
-        if isinstance(m, HierDeltaMoE):
-            raise TypeError(f"{type(self).__name__} has a flat router; a HierDeltaMoE cannot be converted")
+        if isinstance(m, HierDeltaMoE) != isinstance(self, HierDeltaMoE):
+            raise TypeError(f"{type(self).__name__} and {type(m).__name__} route differently (flat vs two-level)")
         self.router.weight.copy_(m.router.weight)
         for n in PROJ:
             getattr(self, n).copy_(getattr(m, n))

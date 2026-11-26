@@ -131,3 +131,33 @@ def test_low_bit_grids():
     for kw in (dict(levels=2), dict(levels=3, symmetric=True)):
         plain, clipped = C.rtn(group=64, **kw)(d, h)[0], C.rtn(group=64, clip=True, **kw)(d, h)[0]
         assert (clipped - d).norm() < (plain - d).norm()
+
+
+def test_rotation():
+    """R is orthogonal; rotation leaves a lossless method exact and lowers RTN's error on a delta with outliers."""
+    r = C.hadamard_rotation(256, 64, seed=3)
+    assert torch.allclose(r @ r.T, torch.eye(256), atol=1e-5)
+    d, x = data()
+    h = x.T @ x
+    assert torch.allclose(C.rotated(C.svd(K), 64)(d, h)[0], d, atol=1e-3)
+    d[:, ::37] *= 30  # a few large entries per row
+    plain, rot = C.rtn(levels=3, group=64)(d, h)[0], C.rotated(C.rtn(levels=3, group=64), 64)(d, h)[0]
+    assert out_err(rot, d, x) < out_err(plain, d, x)
+
+
+@pytest.mark.parametrize("hier", [False, True])
+def test_qat_deltas(hier):
+    """QAT lowers the held-out loss of its GPTQ start and leaves every group on a 2-level grid."""
+    torch.manual_seed(0)
+    H, I = 64, 128
+    full = random_experts(H, I, 4, torch.float32, "cpu")
+    if hier:
+        m = HierDeltaMoE.from_experts(full[0], [full[1:3], full[3:4]], torch.randn(2 + 4, H), [0, 1], top_k=1)
+    else:
+        m = DeltaMoE.from_experts(full[0], full[1:], torch.randn(4, H), top_k=1, num_zero_experts=1)
+    x = [torch.randn(2048, H) for _ in range(m.n_delta)]
+    res = C.qat_deltas(m, x, levels=2, group=32, steps=100, lr=0.01, generator=torch.Generator().manual_seed(0))
+    assert all(after < before for before, after in res), res
+    for d in (m.d_gate[0], m.d_down[0]):
+        g = d.reshape(d.shape[0], -1, 32)
+        assert ((g != g.amin(-1, keepdim=True)) & (g != g.amax(-1, keepdim=True))).sum() == 0

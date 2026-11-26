@@ -94,6 +94,25 @@ lazily in blocks of 128 columns; $\mathbf{H}$ is damped by $1\%$ of its mean dia
 grid is fixed when its first column is reached, from the values updated so far (a plain min-max grid; the reference
 implementation also widens it to include 0 and rounds the offset to a level). Storage is that of `rtn`.
 
+### Quantisation-aware training, block by block (`qat_deltas`)
+
+Starting from GPTQ, each delta expert's MLP is trained to reproduce its dense MLP on the expert's own inputs (EfficientQAT's
+Block-AP). A delta entry is a latent weight $w$ rounded onto its group's grid,
+
+$$
+\hat\delta = \ell + s\,\mathrm{clamp}\!\left(\left\lfloor \frac{w - \ell}{s} \right\rceil,\, 0,\, L - 1\right),
+$$
+
+with the rounding passing gradients straight through (STE), so $w$ can move entries to other levels and $\ell, s$
+are fitted too. Gate, up and down are trained jointly on the relative error of the delta's effect on the MLP output,
+
+$$
+\frac{\| f(X; W_b + \hat\Delta) - f(X; W_b + \Delta) \|^2}{\| f(X; W_b) - f(X; W_b + \Delta) \|^2},
+$$
+
+by Adam; each expert keeps the GPTQ start when training does not lower the loss on held-out tokens. The result is
+stored like GPTQ's.
+
 ### Residual binarisation (`residual_sign`)
 
 BitDelta is one sign plane with a scale: for a fixed sign pattern $\mathrm{sign}(\delta)$, the scale minimising
@@ -256,6 +275,22 @@ Below 2 bits (`rtn` / `gptq` with `levels`, `symmetric`, `clip`), same screen:
   clamping the largest entries of each group, and the large entries of a delta matter for the output. GPTQ with
   clipping is unaffected (its error feedback repairs the clamped entries).
 - **Group size and symmetry barely matter** for GPTQ here; group 256 is as good as 128 at 2 bits.
+
+Block-wise QAT on top of GPTQ (`qat_deltas`, 400 Adam steps of 1024 tokens per expert and layer), same screen:
+
+| method | bits / entry | KL, mean | KL, medical |
+|---|---:|---:|---:|
+| GPTQ, 2 levels, group 128, clipped | 1.25 | 0.014 | 0.043 |
+| + QAT, lr 3e-4 | 1.25 | 0.017 | 0.050 |
+| + QAT, lr 1e-3 | 1.25 | 0.015 | 0.047 |
+| + QAT, lr 3e-3 | 1.25 | 0.011 | 0.035 |
+| GPTQ ternary, group 128, symmetric, clipped | 1.71 | 0.0055 | 0.018 |
+| + QAT, lr 1e-3 | 1.71 | 0.0081 | 0.023 |
+
+- **Block-wise QAT adds little to GPTQ.** The best setting lowers the 1-bit KL by a fifth, far from the ternary
+  grid's, and it makes ternary worse; even at the smallest step size the held-out block loss rises, so the STE's noise
+  outweighs what it fits. GPTQ already minimises each layer's output error on the same inputs. Giving the medical
+  expert the ternary grid (1.34 bits on average) does as well (KL 0.0104).
 
 ### Accuracy
 

@@ -85,10 +85,67 @@ def svd(rank: int) -> Method:
     return f
 
 
+def quantize(delta: Tensor, gram: Tensor | None, levels: int, group: int = 128, symmetric: bool = False,
+             clip: bool = False, damp: float = 0.01, block: int = 128) -> tuple[Tensor, Tensor, Tensor]:  # fmt: skip
+    r"""Group grid quantisation of one delta: codes :math:`q \in \{0, \dots, L - 1\}` and per group of ``group``
+    entries along the input dim a lowest level :math:`\ell` and step :math:`s`, :math:`\hat\delta = \ell + s q`.
+    Round to nearest without ``gram`` (``rtn``), GPTQ with it (``gptq``).
+
+    Args:
+        delta: (R, C) delta.
+        gram: (C, C) input Gram for GPTQ, or None for round to nearest.
+        levels: :math:`L`, grid values.
+        group: Group size; divides C.
+        symmetric: Grids centred on 0, :math:`\ell = -s (L - 1) / 2`.
+        clip: Shrink each group's span to the factor in ``CLIP`` with the least rounding error.
+        damp: GPTQ diagonal damping, a fraction of the Gram's mean diagonal.
+        block: GPTQ columns per lazy-update block.
+
+    Returns:
+        (codes (R, C) uint8, :math:`\ell` (R, C / group), :math:`s` (R, C / group)), float32 grids.
+    """
+    assert levels >= 2, f"a grid needs at least 2 levels, got {levels}"
+    delta = delta.float()  # GPTQ's updates in float32 whatever the model dtype
+    r, c = delta.shape
+    assert c % group == 0, f"group {group} does not divide {c}"
+    if gram is None:
+        x = delta.reshape(r, c // group, group)
+        lo, step = _grid(x, levels, symmetric, clip)
+        q = ((x - lo) / step).round().clamp(0, levels - 1)
+        return q.reshape(r, c).to(torch.uint8), lo[..., 0], step[..., 0]
+    w, hinv = _cholesky_inverse(delta, gram, damp)
+    q = torch.zeros(r, c, dtype=torch.uint8, device=w.device)
+    los, steps = w.new_empty(r, c // group), w.new_empty(r, c // group)
+    lo = step = None
+    for i1 in range(0, c, block):
+        i2 = min(i1 + block, c)
+        w1, err, hi = w[:, i1:i2].clone(), torch.zeros(r, i2 - i1, device=w.device), hinv[i1:i2, i1:i2]
+        for j in range(i2 - i1):
+            k = i1 + j
+            if k % group == 0:  # this group's grid, from its current (error-updated) values
+                lo, step = _grid(torch.cat([w1[:, j:j + group], w[:, i2:k + group]], 1), levels, symmetric, clip)
+                los[:, k // group], steps[:, k // group] = lo[:, 0], step[:, 0]
+            col = w1[:, j:j + 1]
+            code = ((col - lo) / step).round().clamp(0, levels - 1)
+            q[:, k:k + 1] = code.to(torch.uint8)
+            e = (col - (code * step + lo)) / hi[j, j]
+            w1[:, j:] -= e @ hi[j:j + 1, j:]
+            err[:, j:j + 1] = e
+        w[:, i2:] -= err @ hinv[i1:i2, i2:]
+    return q, los, steps
+
+
+def dequantize(codes: Tensor, lo: Tensor, step: Tensor) -> Tensor:
+    """``quantize``'s approximation: :math:`\\ell + s q` per group, float32 (R, C)."""
+    r, c = codes.shape
+    g = c // lo.shape[1]
+    return (codes.view(r, -1, g).float() * step[..., None] + lo[..., None]).view(r, c)
+
+
 def rtn(bits: int = 2, group: int = 128, levels: int | None = None, symmetric: bool = False,
         clip: bool = False) -> Method:  # fmt: skip
     r"""Round to nearest on a grid of ``levels`` values per group of ``group`` entries along the input dim, its scale
-    (and offset) in fp16.
+    (and offset) in fp16 (``quantize`` without a Gram).
 
     Args:
         bits: Bits per value: ``levels`` defaults to ``2 ** bits``.
@@ -104,9 +161,7 @@ def rtn(bits: int = 2, group: int = 128, levels: int | None = None, symmetric: b
     assert n >= 2, f"a grid needs at least 2 levels, got {n}"
 
     def f(delta: Tensor, gram: Tensor | None) -> tuple[Tensor, float]:
-        r, c = delta.shape
-        x = delta.reshape(r, c // group, group)
-        return _snap(x, *_grid(x, n, symmetric, clip), n).reshape(r, c), _grid_bits(n, group, symmetric)
+        return dequantize(*quantize(delta, None, n, group, symmetric, clip)), _grid_bits(n, group, symmetric)
 
     return f
 
@@ -115,7 +170,7 @@ def gptq(bits: int = 2, group: int = 128, levels: int | None = None, symmetric: 
          damp: float = 0.01, block: int = 128) -> Method:  # fmt: skip
     r"""GPTQ (Frantar et al., 2023) on the delta: columns quantised in order on ``rtn``'s grid (each group's grid
     fixed when its first column is reached), each one's error, weighted by the inverse Gram, pushed onto the columns
-    not yet quantised. Minimises :math:`\|X(\hat\Delta - \Delta)^\top\|_F` greedily.
+    not yet quantised (``quantize`` with a Gram). Minimises :math:`\|X(\hat\Delta - \Delta)^\top\|_F` greedily.
 
     Args:
         bits: Bits per value: ``levels`` defaults to ``2 ** bits``.
@@ -134,25 +189,55 @@ def gptq(bits: int = 2, group: int = 128, levels: int | None = None, symmetric: 
 
     def f(delta: Tensor, gram: Tensor | None) -> tuple[Tensor, float]:
         assert gram is not None, "gptq needs the inputs' Gram"
-        w, hinv = _cholesky_inverse(delta, gram, damp)
-        r, c = w.shape
-        q = torch.zeros_like(w)
-        lo = step = None
-        for i1 in range(0, c, block):
-            i2 = min(i1 + block, c)
-            w1, err, hi = w[:, i1:i2].clone(), torch.zeros(r, i2 - i1, device=w.device), hinv[i1:i2, i1:i2]
-            for j in range(i2 - i1):
-                k = i1 + j
-                if k % group == 0:  # this group's grid, from its current (error-updated) values
-                    lo, step = _grid(torch.cat([w1[:, j:j + group], w[:, i2:k + group]], 1), n, symmetric, clip)
-                col = w1[:, j:j + 1]
-                qc = _snap(col, lo, step, n)
-                q[:, k:k + 1] = qc
-                e = (col - qc) / hi[j, j]
-                w1[:, j:] -= e @ hi[j:j + 1, j:]
-                err[:, j:j + 1] = e
-            w[:, i2:] -= err @ hinv[i1:i2, i2:]
-        return q, _grid_bits(n, group, symmetric)
+        return dequantize(*quantize(delta, gram, n, group, symmetric, clip, damp, block)), _grid_bits(n, group, symmetric)
+
+    return f
+
+
+def hadamard_rotation(c: int, block: int = 512, seed: int = 0, device: torch.device | str | None = None,
+                      dtype: torch.dtype = torch.float32) -> Tensor:  # fmt: skip
+    r"""A random orthogonal (C, C) matrix :math:`R = \mathrm{diag}(\sigma)\, \mathrm{blockdiag}(H_B, \dots, H_B)`:
+    random signs :math:`\sigma` (seeded) times Sylvester-Hadamard blocks :math:`H_B / \sqrt{B}`. :math:`x R` costs
+    :math:`O(C \log B)` per token with a fast Hadamard transform.
+
+    Args:
+        c: Size; a multiple of ``block``.
+        block: Hadamard block size, a power of 2.
+        seed: Seed of the signs.
+        device: Device of the result.
+        dtype: Dtype of the result.
+
+    Returns:
+        :math:`R`, with :math:`R R^\top = I`.
+    """
+    assert block & (block - 1) == 0 and c % block == 0, f"size {c} is not a multiple of the power of 2 {block}"
+    h = torch.ones(1, 1, dtype=dtype, device=device)
+    while h.shape[0] < block:
+        h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
+    sign = torch.randint(0, 2, (c,), generator=torch.Generator().manual_seed(seed)).to(device=device, dtype=dtype) * 2 - 1
+    return sign[:, None] * torch.block_diag(*[h / block**0.5] * (c // block))
+
+
+def rotated(method: Method, block: int = 512, seed: int = 0) -> Method:
+    r"""Incoherence processing (QuIP, Chee et al., 2023): compress :math:`\Delta R` with the Gram
+    :math:`R^\top \mathbf{H} R` of the rotated inputs :math:`X R`, and restore :math:`\hat\Delta = \widehat{\Delta R}\,
+    R^\top`. The output :math:`X \Delta^\top = (XR)(\Delta R)^\top` is unchanged; the rotation spreads each row's
+    large entries over the block, so a coarse grid fits it better. A kernel stores :math:`\widehat{\Delta R}` and
+    rotates the input (``hadamard_rotation``); the seed is the only extra storage.
+
+    Args:
+        method: The compression of the rotated delta.
+        block: Hadamard block size; divides C.
+        seed: Seed of the random signs.
+
+    Returns:
+        The method; bits per entry as ``method``.
+    """
+
+    def f(delta: Tensor, gram: Tensor | None) -> tuple[Tensor, float]:
+        r = hadamard_rotation(delta.shape[1], block, seed, delta.device, delta.dtype)
+        approx, bits = method(delta @ r, None if gram is None else r.T @ gram @ r)
+        return approx @ r.T, bits
 
     return f
 
@@ -389,3 +474,117 @@ def compress_deltas(moe: DeltaMoE, method: Method, grams: Sequence[tuple[Tensor,
             d[e] = approx.to(d.dtype)
             total, bits = total + d[e].numel(), bits + b * d[e].numel()
     return bits / total
+
+
+def _fake_quant(w: Tensor, lo: Tensor, step: Tensor, levels: int, group: int) -> Tensor:
+    """``_snap`` per group with a straight-through round: the gradient passes the rounding unchanged to ``w`` (inside
+    the grid's span) and reaches ``lo`` and ``step``."""
+    r, c = w.shape
+    v = (w.view(r, c // group, group) - lo) / step
+    v = v + (v.round() - v).detach()
+    return (v.clamp(0, levels - 1) * step + lo).view(r, c)
+
+
+def qat_deltas(moe: DeltaMoE, x: Sequence[Tensor], levels: int = 2, group: int = 128, symmetric: bool = False,
+               clip: bool = True, steps: int = 200, batch: int = 1024, lr: float = 1e-3, scale_lr: float = 0.1, val: float = 0.1,
+               damp: float = 0.01, generator: torch.Generator | None = None) -> list[tuple[float, float]]:  # fmt: skip
+    r"""Quantisation-aware training of every delta expert's MLP, block by block (EfficientQAT's Block-AP), in place.
+
+    Each delta expert :math:`e` starts from ``gptq(levels=levels, group=group, ...)`` and is trained to reproduce its
+    dense MLP on its own inputs :math:`X_e`. A delta entry is :math:`\hat\delta = \ell + s\,\mathrm{clamp}(
+    \lfloor (w - \ell) / s \rceil, 0, L - 1)` with a latent weight :math:`w` and per group a lowest level
+    :math:`\ell` and step :math:`s` (symmetric: :math:`\ell = -s (L - 1) / 2`); the rounding passes gradients
+    straight through (STE), so :math:`w` can move entries to other levels and :math:`\ell, s` are fitted too. The
+    loss is the relative error of the delta's effect on the MLP output,
+
+    .. math::
+
+        \frac{\| f(X; W_b + \hat\Delta) - f(X; W_b + \Delta) \|^2}{\| f(X; W_b) - f(X; W_b + \Delta) \|^2},
+
+    with :math:`f` the SwiGLU MLP and gate, up and down trained jointly, by Adam with a cosine schedule. Adam's step
+    for :math:`w` is ``lr`` times the matrix's mean grid step (``lr`` = 0.001 moves an entry by about a thousandth
+    of a level per step), for :math:`\ell, s` ``scale_lr`` times that. Each expert keeps whichever of the GPTQ
+    start and the trained deltas has the lower held-out loss. The result is on a grid: same storage as GPTQ,
+    ``_grid_bits(levels, group, symmetric)`` bits per entry.
+
+    Args:
+        moe: A ``DeltaMoE`` or ``HierDeltaMoE`` with dense deltas; replaced by the trained quantised ones.
+        x: Per delta expert, its (T_e, H) MLP inputs; a ``val`` share is held out.
+        levels: :math:`L`, grid levels.
+        group: Entries per grid along the input dimension; divides it.
+        symmetric: Grids centred on 0 (only :math:`s` stored).
+        clip: Clipped grids for the GPTQ start.
+        steps: Adam steps per delta expert.
+        batch: Tokens per step.
+        lr: Relative step size of the latent weights (see above).
+        scale_lr: Step size of the grids relative to ``lr``.
+        val: Held-out share of each :math:`X_e`.
+        damp: GPTQ damping.
+        generator: For the held-out split and batches.
+
+    Returns:
+        Per delta expert, the held-out loss of the GPTQ start and after training (the kept one is the lower).
+    """
+    assert len(x) == moe.n_delta, f"{len(x)} input sets for {moe.n_delta} delta experts"
+    start = gptq(levels=levels, group=group, symmetric=symmetric, clip=clip, damp=damp)
+    grams = calibration_grams(moe, x)
+    W = [moe.gate.detach().float(), moe.up.detach().float(), moe.down.detach().float()]
+
+    def mlp(xb: Tensor, d: Sequence[Tensor]) -> Tensor:
+        return F.linear(F.silu(F.linear(xb, W[0] + d[0])) * F.linear(xb, W[1] + d[1]), W[2] + d[2])
+
+    out = []
+    for e, xe in enumerate(x):
+        xe = xe.float()
+        perm = torch.randperm(len(xe), generator=generator).to(xe.device)
+        nv = max(1, int(len(xe) * val))
+        xv, xt = xe[perm[:nv]], xe[perm[nv:]]
+        names = ("d_gate", "d_up", "d_down")
+        dense = [getattr(moe, n)[e].detach().float() for n in names]
+        with torch.no_grad():
+            init = [start(d, grams[e][p // 2])[0] for p, d in enumerate(dense)]
+            yv, ybv = mlp(xv, dense), mlp(xv, [torch.zeros_like(d) for d in dense])
+        params, groups = [], []
+        for a in init:
+            r, c = a.shape
+            lo, step = _grid(a.view(r, c // group, group), levels, symmetric, False)
+            p = {"w": a.clone(), "step": step.clone()} | ({} if symmetric else {"lo": lo.clone()})
+            for t in p.values():
+                t.requires_grad_(True)
+            params.append(p)
+            base_lr = lr * step.mean().item()
+            groups += [{"params": [p["w"]], "lr": base_lr},
+                       {"params": [t for k, t in p.items() if k != "w"], "lr": base_lr * scale_lr}]
+
+        def quant(i: int) -> Tensor:
+            p = params[i]
+            lo = -p["step"] * (levels - 1) / 2 if symmetric else p["lo"]
+            return _fake_quant(p["w"], lo, p["step"], levels, group)
+
+        def loss(xb: Tensor, y: Tensor, yb: Tensor) -> Tensor:
+            return (mlp(xb, [quant(i) for i in range(3)]) - y).square().sum() / (yb - y).square().sum()
+
+        with torch.no_grad():
+            before = loss(xv, yv, ybv).item()
+        opt = torch.optim.Adam([g for g in groups])
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, steps)
+        with torch.enable_grad():
+            for _ in range(steps):
+                idx = torch.randint(0, len(xt), (min(batch, len(xt)),), generator=generator).to(xt.device)
+                xb = xt[idx]
+                with torch.no_grad():
+                    y, yb = mlp(xb, dense), mlp(xb, [torch.zeros_like(d) for d in dense])
+                opt.zero_grad(set_to_none=True)
+                loss(xb, y, yb).backward()
+                opt.step()
+                sched.step()
+                with torch.no_grad():
+                    for p in params:
+                        p["step"].clamp_(min=1e-12)
+        with torch.no_grad():
+            after = loss(xv, yv, ybv).item()
+            for i, n in enumerate(names):
+                getattr(moe, n)[e] = (quant(i) if after < before else init[i]).to(getattr(moe, n).dtype)
+        out.append((before, after))
+    return out
+
