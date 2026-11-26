@@ -43,6 +43,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from .. import constants
 from ..constants import (
     GROUPED_DTYPES,
     GROUPED_MIN_PAIRS,
@@ -401,8 +402,18 @@ class DeltaMoE(nn.Module):
             # weight gradients use F.grouped_mm: 16-byte aligned rows (hidden and inter multiples of 8 in bf16/fp16)
             return self.triton_train and hasattr(F, "grouped_mm") and self.gate.shape[0] % 8 == self.gate.shape[1] % 8 == 0
         hopper = torch.cuda.get_device_capability(x.device) >= (9, 0)
+        P = x.shape[0] * self.top_k
+        if hopper and P >= constants.DENSE_PREFILL_PAIRS_PER_GROUP * (self.n_delta + 1) and self._dense_prefill(x):
+            return True  # the fused forward takes its grouped-GEMM path here (cuda_kernels/dense_moe.py): no limit
         limit = TRITON_MAX_PAIRS_HOPPER if hopper else TRITON_MAX_PAIRS_OLDER
-        return TRITON_MIN_PAIRS <= x.shape[0] * self.top_k <= limit
+        return TRITON_MIN_PAIRS <= P <= limit
+
+    def _dense_prefill(self, x: Tokens) -> bool:
+        """Dense deltas that the fused forward's prefill path (``cuda_kernels/dense_moe.py``) takes."""
+        from ..cuda_kernels import dense_moe
+
+        ds = self._kernel_deltas()
+        return ds[0].mode == 0 and dense_moe.supports(x, (self.gate, self.up, self.down), tuple(d.d for d in ds))
 
     def forward_param(self, x: Tokens) -> Tokens:
         r"""MoE forward by parameter aggregation.

@@ -51,6 +51,13 @@ Generated from the docstrings.
    :members: available, supports, moe, build
 ```
 
+## Dense prefill
+
+```{eval-rst}
+.. automodule:: shared_delta_moe.cuda_kernels.dense_moe
+   :members: materialise, grouped_moe, unsort, supports
+```
+
 ## Qwen3.5 in transformers
 
 ```{eval-rst}
