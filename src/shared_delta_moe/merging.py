@@ -71,8 +71,8 @@ def ties_merging(base: StateDict, tuned: Sequence[StateDict], scaling_factor: fl
         base: the base state dict :math:`\theta_0`.
         tuned: the fine-tuned state dicts, keyed and shaped like ``base``.
         scaling_factor: :math:`\lambda`, scale of the merged task vector.
-        threshold: share of entries kept per task vector: a fraction if :math:`\le 1`, else a percentage; below 100%
-            (``fusion_bench`` fails when nothing is trimmed).
+        threshold: share of entries kept per task vector: a fraction if :math:`\le 1`, else a percentage. 1 (or 100)
+            keeps every entry; ``fusion_bench`` 0.2.33 fails on it, fixed on its main (tanganke/fusion_bench#219).
         merge_func: ``"sum"``, ``"mean"`` or ``"max"``, as ``fusion_bench``.
 
     Returns:
