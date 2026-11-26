@@ -1,12 +1,12 @@
 """The materialised training path recomputes W_b + Delta_e in the backward instead of keeping it
-(DeltaMoE._mlp_remat): outputs and every gradient equal those of the plain path, for DeltaMoE, HierDeltaMoE, DARE and
-BitDelta deltas and each set of trained weights (router only, base, deltas, all); the swap really happens (each
+(DeltaMoE._mlp_remat): outputs and every gradient equal those of the plain path, for DeltaMoE, HierDeltaMoE, DARE,
+BitDelta and grid deltas (flat and Hier) and each set of trained weights (router only, base, deltas, all); the swap really happens (each
 materialised weight is unpacked once per backward); under activation checkpointing the plain path runs. CPU, fp32."""
 
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from shared_delta_moe import BitDeltaMoE, DareDeltaMoE, DeltaMoE, HierDeltaMoE, random_experts
+from shared_delta_moe import BitDeltaMoE, DareDeltaMoE, DeltaMoE, GridDeltaMoE, HierDeltaMoE, random_experts
 
 H, I = 64, 96
 
@@ -17,7 +17,9 @@ def models():
     flat = DeltaMoE.from_experts(full[0], full[1:], torch.randn(7, H) * 0.3, top_k=2, num_zero_experts=1)
     hier = HierDeltaMoE.from_experts(full[0], [full[1:4], full[4:7]], torch.randn(2 + 4 + 4, H) * 0.3, [1, 1], top_k=2)
     return {"flat": flat, "hier": hier, "dare": DareDeltaMoE.from_delta_moe(flat, keep=0.5, block=8, seed=0),
-            "bitdelta": BitDeltaMoE.from_delta_moe(flat, scale="row")}
+            "bitdelta": BitDeltaMoE.from_delta_moe(flat, scale="row"),
+            "grid": GridDeltaMoE.from_delta_moe(flat, levels=4, group=32),
+            "grid-hier": GridDeltaMoE.from_delta_moe(hier, levels=4, group=32)}
 
 
 def run(m, x, plain):
