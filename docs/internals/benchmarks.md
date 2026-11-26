@@ -221,6 +221,8 @@ Whole Qwen3.5-4B text model, full-parameter training, batch 2 x 2048, bf16 weigh
 
 The "none" column predates `DeltaMoE._mlp_remat`. With it (the materialised weights recomputed in the backward; same H200, 2026-11-27), without checkpointing: DARE frozen top-1 92.9 → 71.7 GiB (0.6 → 0.8 s/step), DARE trained 111.8 → 90.7 GiB (0.8 → 0.9 s/step); dense deltas trained still out of memory; with checkpointing unchanged (118.7 GiB).
 
+Compressed experts trained (kept DARE values or BitDelta row scales) with the routers, base frozen, checkpointing, top-2, same model and batch: peak 32.7 GiB (DARE) and 21.3 GiB (BitDelta). Unpacking dominated the step (DARE's `masked_scatter` scan over the dense matrix; BitDelta's `repeat_interleave` of the scales plus several elementwise passes); block scatter and a one-pass sign select (2026-11-27) cut it: DARE trained 1.1 → 0.8 s/step, DARE frozen 0.9 → 0.7, BitDelta 1.1 → 0.9 (top-1 1.0 → 0.8); peaks unchanged.
+
 ## Per implementation, previous kernel (single MoE layer, bf16, eager, ms)
 
 The per-implementation tables below were measured with the previous kernel (5522b23; one launch per projection). Its "param Triton" column is superseded by the section above.

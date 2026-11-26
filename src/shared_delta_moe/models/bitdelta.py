@@ -161,8 +161,13 @@ class BitDeltaMoE(PackedDeltaMoE):
     def _unpack(self, name: str, e: int) -> Tensor:
         r"""Dense :math:`\mathrm{diag}(s_e)\,\mathrm{sign}(\Delta_e)` of one projection; differentiable in the
         scales."""
-        s, C = getattr(self, f"s_{name}"), self.shapes[name][2]
-        return s[e].repeat_interleave(self.sblock[name], 1)[:, :C] * unpack_signs(getattr(self, f"b_{name}")[e], s.dtype)
+        s, (_, R, C) = getattr(self, f"s_{name}"), self.shapes[name]
+        w = getattr(self, f"b_{name}")[e]
+        pos = ((w[..., None] & (1 << torch.arange(32, dtype=torch.int32, device=w.device))) != 0).flatten(-2)  # (R, C) bool, one pass
+        if s.shape[-1] == 1:  # one scale per row: broadcast, no (R, C) copy of the scales or signs
+            return torch.where(pos, s[e], -s[e])
+        se = s[e][..., None]  # block scales (B divides C)
+        return torch.where(pos.view(R, -1, self.sblock[name]), se, -se).view(R, C)
 
     def _kernel_deltas(self) -> "tuple[Delta, Delta, Delta]":
         from ..triton_kernels import Delta

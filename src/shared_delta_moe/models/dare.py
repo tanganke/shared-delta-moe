@@ -286,9 +286,14 @@ class DareDeltaMoE(PackedDeltaMoE):
     def _unpack(self, name: str, e: int) -> Tensor:
         r"""Dense :math:`\Delta_e` of one projection from the bitmap (no Philox); differentiable in ``v_<name>``."""
         _, R, C = self.shapes[name]
-        keep = unpack_bits(self._bits(name)[e])[:, : C // self.block].bool().repeat_interleave(self.block, 1)
+        B = self.block
+        # kept blocks are stored in row-major order: scatter whole blocks (the index runs over R * C / B blocks, not
+        # R * C entries, so no scan over the dense matrix; the backward is a gather of the kept blocks)
+        kept = unpack_bits(self._bits(name)[e])[:, : C // B].flatten().nonzero().squeeze(1)
         v = getattr(self, f"v_{name}")
-        return v.new_zeros(R, C).masked_scatter(keep, v[int(getattr(self, f"p_{name}")[e, 0]) :])
+        p0 = int(getattr(self, f"p_{name}")[e, 0])
+        vals = v[p0 : p0 + kept.numel() * B].view(-1, B)
+        return v.new_zeros(R * C // B, B).index_put((kept,), vals).view(R, C)
 
     def _use_triton(self, x: Tensor) -> bool:
         # the kernel's K tile and the block must divide one another; tiles are powers of 2
