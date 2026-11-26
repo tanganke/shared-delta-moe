@@ -28,6 +28,8 @@ import triton.language as tl
 from torch import Tensor
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from ..constants import SORT_ONE_HOT
+
 AUTOTUNE = os.environ.get("SHARED_DELTA_MOE_AUTOTUNE", "1") != "0"  # "0": first fitting config only (tests)
 
 # ----------------------------------------------------------------------------------------------------------- sort
@@ -78,10 +80,10 @@ def route(idx: Tensor, weight: Tensor, n_delta: int) -> Routing:
     idx = idx.contiguous()
     perm = torch.empty(T * k, dtype=torch.int32, device=idx.device)
     gstart = torch.empty(n_delta + 2, dtype=torch.int32, device=idx.device)
-    KP = triton.next_power_of_2(k)
+    KP, GP = triton.next_power_of_2(k), triton.next_power_of_2(n_delta + 2)
+    BT = max(1, min(512 // KP, SORT_ONE_HOT // (KP * GP)))  # the (BT * KP, GP) one-hot fits in shared memory
     with torch.cuda.device(idx.device):
-        _sort_kernel[(1,)](idx, perm, gstart, T, n_delta, TOPK=k, KP=KP, GP=triton.next_power_of_2(n_delta + 2),
-                           BT=max(16, 512 // KP), num_warps=4)  # fmt: skip
+        _sort_kernel[(1,)](idx, perm, gstart, T, n_delta, TOPK=k, KP=KP, GP=GP, BT=BT, num_warps=4)  # fmt: skip
     return Routing(perm, gstart, weight.float().reshape(-1).contiguous(), T, k, n_delta)
 
 
@@ -194,15 +196,15 @@ def _smem_limit(t: Tensor) -> int:
     return torch.cuda.get_device_properties(t.device).shared_memory_per_block_optin
 
 
-def _fit(c: triton.Config, tiles: int, limit: int, tma: bool = False) -> triton.Config | None:
-    """c with fewer pipeline stages if its (stages - 1) * (BM + tiles * BN) * BK bf16 buffers exceed the shared
-    memory limit (tiles: weight tiles per K step); None if even 2 stages do not fit, or
+def _fit(c: triton.Config, tiles: int, limit: int, tma: bool = False, rows: int = 1) -> triton.Config | None:
+    """c with fewer pipeline stages if its (stages - 1) * (rows * BM + tiles * BN) * BK bf16 buffers exceed the shared
+    memory limit (tiles: weight tiles, rows: activation tiles per K step); None if even 2 stages do not fit, or
     if c's weight box is 256 wide under TMA."""
     # ponytail: Triton 3.7.1 on H200 gives wrong results with a 256-row TMA box (down, BN 256: rel err 0.3, pointer
     # loads fine); those configs are left out under TMA until a Triton release fixes it
     if tma and c.kwargs["BN"] > 128:
         return None
-    per = (c.kwargs["BM"] + tiles * c.kwargs["BN"]) * c.kwargs["BK"] * 2
+    per = (rows * c.kwargs["BM"] + tiles * c.kwargs["BN"]) * c.kwargs["BK"] * 2
     st = min(c.num_stages, limit // per + 1)
     if st < 2:
         return None
@@ -441,9 +443,9 @@ def _launch(kernel, grid, config: triton.Config | None, *args, **kw):
     return _launch_fixed(kernel, grid, config, 4 if kernel is _gate_up_kernel else 2, args, kw)
 
 
-def _launch_fixed(kernel, grid, config: triton.Config, tiles: int, args: tuple, kw: dict):
-    """One config, its pipeline depth fitted to shared memory (tiles: see _fit)."""
-    fitted = _fit(config, tiles, _smem_limit(args[0]), kw.get("TMA", False))
+def _launch_fixed(kernel, grid, config: triton.Config, tiles: int, args: tuple, kw: dict, rows: int = 1):
+    """One config, its pipeline depth fitted to shared memory (tiles, rows: see _fit)."""
+    fitted = _fit(config, tiles, _smem_limit(args[0]), kw.get("TMA", False), rows)
     if fitted is None:
         raise ValueError(f"config does not fit (shared memory, or a 256-wide TMA box): {config}")
     meta = fitted.all_kwargs()
@@ -488,7 +490,7 @@ def down(h: Tensor, r: Routing, w: Tensor, d: Delta, config: triton.Config | Non
         )  # fmt: skip
     if S > 1:
         return o.to(h.dtype)
-    return o if r.top_k == 1 else o.view(T, r.top_k, N).sum(1)
+    return o if r.top_k == 1 else o.view(T, r.top_k, N).sum(1).to(h.dtype)  # (autocast would make the sum fp32)
 
 
 def fused_moe(x: Tensor, idx: Tensor, rw: Tensor, n_delta: int, base: tuple[Tensor, Tensor, Tensor],

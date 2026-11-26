@@ -36,6 +36,7 @@ from ..constants import (
     GROUPED_MIN_PAIRS,
     HAS_TRITON,
     PARAM_MIN_ROWS,
+    SORT_ONE_HOT_MAX,
     TRITON_DTYPES,
     TRITON_MAX_PAIRS_HOPPER,
     TRITON_MAX_PAIRS_OLDER,
@@ -55,7 +56,14 @@ from ..type_hints import (
 )
 
 
+def _pow2(n: int) -> int:
+    return 1 << (n - 1).bit_length()
+
+
 class DeltaMoE(nn.Module):
+    # train through the fused Triton forward + backward (triton_kernels/train.py) instead of materialised cuBLAS:
+    # holds no W_b + Delta_e and no per-pair activations for the backward, but measured slower (README, Training)
+    triton_train: bool = False
     gate: nn.Parameter  # I H
     up: nn.Parameter  # I H
     down: nn.Parameter  # H I
@@ -181,7 +189,7 @@ class DeltaMoE(nn.Module):
                 y = self.mlp_split(x[rows], e)
             else:
                 y = mlp(x[rows], *self.weights(e))
-            out = out.index_add(0, rows, r[rows, slots, None] * y)
+            out = out.index_add(0, rows, (r[rows, slots, None] * y).to(out.dtype))  # (autocast: y in another dtype)
         return out
 
     def _forward_matrix(self, x: Tokens) -> Tokens:
@@ -282,24 +290,40 @@ class DeltaMoE(nn.Module):
             and x.shape[0] * self.top_k >= GROUPED_MIN_PAIRS
         )
 
+    def _needs_grad(self, x: Tokens) -> bool:
+        return torch.is_grad_enabled() and (x.requires_grad or any(p.requires_grad for p in self.parameters()))
+
     def _use_triton(self, x: Tokens) -> bool:
-        """Fused Triton forward? Triton, CUDA, a TRITON_DTYPES dtype, no gradient needed (it is forward-only; the
-        materialised path is the faster one to train through anyway) and TRITON_MIN_PAIRS .. TRITON_MAX_PAIRS_*
-        (token, slot) pairs."""
+        """Fused Triton kernels? Triton, CUDA, a TRITON_DTYPES dtype, a routing sort that fits; with a gradient
+        needed only when triton_train is set (any pair count), else TRITON_MIN_PAIRS .. TRITON_MAX_PAIRS_* (token,
+        slot) pairs."""
         if not (HAS_TRITON and x.is_cuda and x.dtype in TRITON_DTYPES and self.gate.dtype == x.dtype):
             return False  # (weights in another dtype: e.g. an fp32 model under bf16 autocast)
-        if torch.is_grad_enabled() and (x.requires_grad or any(p.requires_grad for p in self.parameters())):
-            return False
+        if _pow2(self.top_k) * _pow2(self.n_delta + 2) > SORT_ONE_HOT_MAX:
+            return False  # the routing sort's one-hot, even one token at a time
+        if self._needs_grad(x):
+            # weight gradients use F.grouped_mm: 16-byte aligned rows (hidden and inter multiples of 8 in bf16/fp16)
+            return self.triton_train and hasattr(F, "grouped_mm") and self.gate.shape[0] % 8 == self.gate.shape[1] % 8 == 0
         hopper = torch.cuda.get_device_capability(x.device) >= (9, 0)
         limit = TRITON_MAX_PAIRS_HOPPER if hopper else TRITON_MAX_PAIRS_OLDER
         return TRITON_MIN_PAIRS <= x.shape[0] * self.top_k <= limit
 
     def forward_param(self, x: Tokens) -> Tokens:
-        """Parameter aggregation: the fused Triton forward when _use_triton, else materialised W_b + Delta_e
-        (experts with fewer than PARAM_MIN_ROWS routed rows skip the materialisation; differentiable)."""
+        """Parameter aggregation: the fused Triton kernels when _use_triton (with the Triton backward when a gradient
+        is needed), else materialised W_b + Delta_e (experts with fewer than PARAM_MIN_ROWS routed rows skip the
+        materialisation; differentiable)."""
         if self._use_triton(x):
-            return self._forward_param_triton(x)
+            return self._forward_param_autograd(x) if self._needs_grad(x) else self._forward_param_triton(x)
         return self._forward_param(x, min_rows=PARAM_MIN_ROWS)
+
+    def _forward_param_autograd(self, x: Tokens) -> Tokens:
+        """Differentiable fused parameter aggregation: the routing in torch autograd (the router gets its gradient
+        through the routing weights), the MoE in one autograd.Function that saves only its inputs; dense deltas."""
+        from ..triton_kernels.train import fused_moe_autograd
+
+        idx, r = self.topk(x)
+        return fused_moe_autograd(x, idx, r, (self.gate, self.up, self.down),
+                                  (self.d_gate, self.d_up, self.d_down), self.n_delta)  # fmt: skip
 
     def forward_matrix(self, x: Tokens) -> Tokens:
         """Per-matrix output aggregation: grouped GEMM when available and worth it, else the per-expert loop."""

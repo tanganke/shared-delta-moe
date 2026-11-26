@@ -161,6 +161,10 @@ class DareDeltaMoE(DeltaMoE):
     def from_delta_moe(
         cls, m: DeltaMoE, keep: float, block: int = 1, seed: int = 0
     ) -> "DareDeltaMoE":
+        from .hier import HierDeltaMoE
+
+        if isinstance(m, HierDeltaMoE):
+            raise TypeError("DareDeltaMoE has a flat router; a HierDeltaMoE cannot be converted")
         g = m.gate
         out = cls(
             g.shape[1],
@@ -220,8 +224,9 @@ class DareDeltaMoE(DeltaMoE):
         return self._delta(2)
 
     def _use_triton(self, x: Tensor) -> bool:
-        # the kernel's K tile and the block must divide one another; tiles are powers of 2
-        return self.block & (self.block - 1) == 0 and super()._use_triton(x)
+        # the kernel's K tile and the block must divide one another; tiles are powers of 2. Forward only: the Triton
+        # backward takes dense deltas (DARE trains through the materialised path)
+        return self.block & (self.block - 1) == 0 and not self._needs_grad(x) and super()._use_triton(x)
 
     @torch.no_grad()
     def _mask_bits(self) -> None:
