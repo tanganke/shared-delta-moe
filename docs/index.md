@@ -21,6 +21,7 @@ guide/delta-formats
 guide/qwen3_5
 guide/vllm
 guide/training
+guide/similarity
 ```
 
 ```{toctree}
