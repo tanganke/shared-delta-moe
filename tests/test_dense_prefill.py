@@ -93,6 +93,73 @@ def test_torch_compile_prefill():
         constants.DENSE_PREFILL_PAIRS_PER_GROUP = old
 
 
+def test_cuda_graph_prefill():
+    """Capture past the threshold: with the scratch warmed up on the capture stream the graph runs the grouped path;
+    with none (warm-up on another stream) it stays on Triton and allocates no scratch while capturing. Both replay
+    correctly with new inputs."""
+    if not GPU or torch.cuda.get_device_capability()[0] != 9:
+        print("skipped: needs sm90")
+        return
+    from shared_delta_moe import constants
+    from shared_delta_moe.cuda_kernels import dense_moe
+
+    m, _, x = make(1, 2, 192, 320, torch.bfloat16, "cuda")
+    old, constants.DENSE_PREFILL_PAIRS_PER_GROUP = constants.DENSE_PREFILL_PAIRS_PER_GROUP, 8
+    calls, grouped = [], dense_moe.grouped_moe
+    dense_moe.grouped_moe = lambda *a: calls.append(1) or grouped(*a)
+    try:
+        for warm in (True, False):
+            dense_moe._SCRATCH.clear()
+            xs = x.clone()
+            s = torch.cuda.Stream()
+            with torch.no_grad():
+                constants.DENSE_PREFILL_PAIRS_PER_GROUP = 1 << 62
+                m._forward_param_triton(xs)  # the Triton kernels compiled and tuned outside the capture
+                constants.DENSE_PREFILL_PAIRS_PER_GROUP = 8
+                m._forward_param_triton(xs)  # default stream: the add kernel compiled; scratch for this stream only
+                torch.cuda.synchronize()
+                if warm:
+                    with torch.cuda.stream(s):
+                        m._forward_param_triton(xs)
+                    torch.cuda.synchronize()
+                n = len(dense_moe._SCRATCH)
+                calls.clear()
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g, stream=s):
+                    out = m._forward_param_triton(xs)
+                assert len(dense_moe._SCRATCH) == n, "scratch allocated during capture"
+                assert bool(calls) == warm, (warm, calls)
+                for _ in range(2):  # new inputs, new routing, same graph
+                    xs.copy_(torch.randn_like(xs))
+                    g.replay()
+                    assert rel(out, m._forward_param(xs)) < 2e-2, warm
+    finally:
+        constants.DENSE_PREFILL_PAIRS_PER_GROUP, dense_moe.grouped_moe = old, grouped
+
+
+def test_inference_mode_then_no_grad_and_grad():
+    """Scratch first made under inference_mode still works under no_grad; inputs needing a gradient stay off it."""
+    if not GPU or torch.cuda.get_device_capability()[0] != 9:
+        print("skipped: needs sm90")
+        return
+    from shared_delta_moe.cuda_kernels import dense_moe
+    from shared_delta_moe.triton_kernels import fused as F
+
+    m, _, x = make(1, 2, 192, 320, torch.bfloat16, "cuda")
+    base, ds = (m.gate, m.up, m.down), (m.d_gate, m.d_up, m.d_down)
+    dense_moe._SCRATCH.clear()
+    with torch.inference_mode():
+        a = dense_moe.grouped_moe(x, F.route(*m.topk(x), m.n_delta), base, ds)
+    with torch.no_grad():
+        b = dense_moe.grouped_moe(x, F.route(*m.topk(x), m.n_delta), base, ds)
+    assert torch.equal(a, b)
+    assert not dense_moe.supports(x, base, ds)  # grad enabled, parameters require grad
+    with torch.no_grad():
+        assert dense_moe.supports(x, base, ds)
+        assert not dense_moe.supports(x.half(), base, ds)  # bf16 only
+        assert not dense_moe.supports(x, (m.gate.mT.contiguous().mT, m.up, m.down), ds)  # non-contiguous base
+
+
 if __name__ == "__main__":
     for name, f in list(globals().items()):
         if name.startswith("test_"):

@@ -24,23 +24,30 @@ from ..triton_kernels.fused import Routing
 _SCRATCH: dict[tuple, Tensor] = {}
 
 
-def _scratch(name: str, shape: tuple[int, ...], like: Tensor) -> Tensor:
-    """A buffer reused across forwards and layers (one per name, shape, dtype, device): a fixed address, so the
-    forward can still be captured in a CUDA graph."""
-    # ponytail: one buffer per shape for the process lifetime; free with _SCRATCH.clear() if memory is tight
-    key = (name, shape, like.dtype, like.device)
+def _key(name: str, w: Tensor, d: Tensor) -> tuple:
+    """Scratch key: one buffer per projection, shape, dtype, device and stream (two streams never share one)."""
+    return name, (d.shape[0] + 1, *w.shape), w.dtype, w.device, torch.cuda.current_stream(w.device).cuda_stream
+
+
+def _scratch(name: str, w: Tensor, d: Tensor) -> Tensor:
+    """A (G + 1, N, K) buffer reused across forwards and layers: a fixed address, so a forward can be captured in a
+    CUDA graph once the buffer exists (``supports`` keeps capture off this path until then, so the buffer never comes
+    from a graph pool). A normal tensor even when first made under inference mode."""
+    # ponytail: kept for the process lifetime; _SCRATCH.clear() releases it
+    key = _key(name, w, d)
     if key not in _SCRATCH:
-        _SCRATCH[key] = torch.empty(shape, dtype=like.dtype, device=like.device)
+        with torch.inference_mode(False):
+            _SCRATCH[key] = torch.empty(key[1], dtype=w.dtype, device=w.device)
     return _SCRATCH[key]
 
 
 @triton.jit
 def _add_kernel(w_ptr, d_ptr, o_ptr, gstart_ptr, NK, sog, BLOCK: tl.constexpr):
     """o[g] = w + d[g] for the groups with rows (an empty group is skipped on the device: no host sync)."""
-    g = tl.program_id(0)
+    g = tl.program_id(1)  # (axis 1 is capped at 65535 programs: the blocks go on axis 0)
     if tl.load(gstart_ptr + g + 1) == tl.load(gstart_ptr + g):
         return
-    off = tl.program_id(1).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    off = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     m = off < NK
     w = tl.load(w_ptr + off, mask=m)
     d = tl.load(d_ptr + g.to(tl.int64) * NK + off, mask=m)
@@ -51,7 +58,7 @@ def _add(w: Tensor, d: Tensor, out: Tensor, gstart: Tensor) -> None:
     """out[g] = w + d[g] for every delta group g with rows (w, d, out[g] contiguous (N, K) blocks)."""
     G, NK, B = d.shape[0], w.numel(), 4096
     with torch.cuda.device(w.device):
-        _add_kernel[(G, triton.cdiv(NK, B))](w, d, out, gstart, NK, out.stride(0), BLOCK=B)
+        _add_kernel[(triton.cdiv(NK, B), G)](w, d, out, gstart, NK, out.stride(0), BLOCK=B)
 
 
 def materialise(base: tuple[Tensor, Tensor, Tensor], deltas: tuple[Tensor, Tensor, Tensor],
@@ -69,13 +76,14 @@ def materialise(base: tuple[Tensor, Tensor, Tensor], deltas: tuple[Tensor, Tenso
     """
     out = []
     for name, w, d in zip(("gate", "up", "down"), base, deltas):
-        s = _scratch(name, (d.shape[0] + 1, *w.shape), w)
+        s = _scratch(name, w, d)
         _add(w, d, s, gstart)
         s[-1].copy_(w)
         out.append(s)
     return out
 
 
+@torch.no_grad()  # not differentiable (supports() refuses inputs that need a gradient)
 def grouped_moe(x: Tensor, r: Routing, base: tuple[Tensor, Tensor, Tensor],
                 deltas: tuple[Tensor, Tensor, Tensor]) -> Tensor:  # fmt: skip
     """Parameter-aggregation MoE forward through materialised weights and ``F.grouped_mm``.
@@ -115,10 +123,21 @@ def unsort(y: Tensor, r: Routing) -> Tensor:
 
 
 def supports(x: Tensor, base: tuple[Tensor, Tensor, Tensor], deltas: tuple[Tensor, Tensor, Tensor]) -> bool:
-    """Can ``grouped_moe`` take these? sm90 (where it was measured), ``F.grouped_mm``, bf16/fp16 everywhere,
-    contiguous deltas, hidden and inter multiples of 8 (16-byte rows for the grouped GEMM)."""
+    """Can ``grouped_moe`` take these?
+
+    Needs sm90 (where it was measured) and ``F.grouped_mm``; bf16 everywhere (fp16 goes to torch's per-group
+    fallback, which syncs with the host); contiguous weights and deltas, hidden and inter multiples of 8 (16-byte
+    rows); no input that needs a gradient; and, while a CUDA graph is being captured, scratch buffers that already
+    exist for this stream (they are never allocated during capture).
+    """
     if not (x.is_cuda and hasattr(F, "grouped_mm") and torch.cuda.get_device_capability(x.device)[0] == 9):
         return False
     ts = (x, *base, *deltas)
-    return (x.dtype in (torch.bfloat16, torch.float16) and all(t.dtype == x.dtype for t in ts)
-            and all(d.is_contiguous() for d in deltas) and all(n % 8 == 0 for n in base[0].shape))  # fmt: skip
+    if not (all(t.dtype == torch.bfloat16 for t in ts) and all(t.is_contiguous() for t in ts[1:])
+            and all(n % 8 == 0 for n in base[0].shape)):  # fmt: skip
+        return False
+    if torch.is_grad_enabled() and any(t.requires_grad for t in ts):
+        return False
+    if torch.cuda.is_current_stream_capturing():
+        return all(_key(n, w, d) in _SCRATCH for n, w, d in zip(("gate", "up", "down"), base, deltas))
+    return True

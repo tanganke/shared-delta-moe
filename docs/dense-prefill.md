@@ -7,7 +7,9 @@ and the vLLM plugin) leaves the Triton GEMMs for `cuda_kernels/dense_moe.py`:
 1. The Triton routing sort, as before.
 2. $W_b + \Delta_g$ for every group with rows into a scratch per projection, (G + 1, N, K), with the base in the
    last slot for the zero expert. One Triton add per projection; an empty group is skipped on the device, so there is
-   no host sync. The scratch is reused across forwards and layers (one per shape: the 27B shard holds 1.07 GB).
+   no host sync. The scratch is reused across forwards and layers: 3 · (G + 1) · I · H elements per shape, dtype, device
+   and stream (27B shard in bf16: 1.07 GB), never freed (`dense_moe._SCRATCH.clear()` releases it). It is never
+   allocated during CUDA-graph capture: until it exists for the capturing stream, a captured forward stays on Triton.
 3. `F.grouped_mm` (CUTLASS on sm90) for gate and up, SiLU · up in torch, `F.grouped_mm` for down, then back to pair
    order (a gather) times the routing weight, the slots summed. These are the materialised forward's own ops, so
    the rounding (g, u, SiLU(g), h, y, routing weight in bf16) is the model's; at 2048 tokens and more the output
@@ -18,8 +20,9 @@ At large P the GEMMs are compute-bound and every weight tile is reused by many r
 weight operand is summed in registers (Triton: 34–39% of peak). Below the threshold, the extra pass over the
 weights costs more than that, and Triton stays.
 
-The routing sort's Triton kernel and the add need Triton; no compiled extension is needed, so the vLLM image (no
-nvcc) runs it as is. Since this path has no upper limit, `forward_param` on Hopper no longer falls back to the
+Inference only (bf16, no input that needs a gradient; fp16 would hit torch's host-synchronising grouped-GEMM
+fallback), contiguous weights. The routing sort's Triton kernel and the add need Triton; no compiled extension is
+needed, so the vLLM image (no nvcc) runs it as is. Since this path has no upper limit, `forward_param` on Hopper no longer falls back to the
 host-synchronising materialised loop past `TRITON_MAX_PAIRS_HOPPER`.
 
 ## Measurements
