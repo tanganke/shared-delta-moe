@@ -86,6 +86,9 @@ class DeltaMoE(nn.Module):
         triton_train: Train through the fused Triton forward + backward (``triton_kernels/train.py``) instead of
             materialised cuBLAS: holds no :math:`W_b + \Delta_e` and no per-pair activations for the backward, but
             measured slower (docs/internals/benchmarks.md, Training). Default False.
+        remat: The materialised training path recomputes :math:`W_b + \Delta_e` in the backward instead of keeping it
+            (``_mlp_remat``): ~21 GiB less on a whole Qwen3.5-4B without checkpointing, 15-30% slower step. Set
+            False when the step fits anyway. Default True.
         router: ``nn.Linear(H, N+Z, bias=False)``; rows :math:`N, \ldots, N+Z-1` are the zero experts.
         gate: (I, H) base gate weight :math:`W_b`.
         up: (I, H) base up weight :math:`W_b`.
@@ -101,6 +104,7 @@ class DeltaMoE(nn.Module):
     # train through the fused Triton forward + backward (triton_kernels/train.py) instead of materialised cuBLAS:
     # holds no W_b + Delta_e and no per-pair activations for the backward, but measured slower (docs/internals/benchmarks.md, Training)
     triton_train: bool = False
+    remat: bool = True  # recompute W_b + Delta_e in the materialised backward (_mlp_remat)
     gate: nn.Parameter  # I H
     up: nn.Parameter  # I H
     down: nn.Parameter  # H I
@@ -268,6 +272,40 @@ class DeltaMoE(nn.Module):
         h = F.silu(g) * u
         return F.linear(h, self.down) + F.linear(h, dd)
 
+    def _mlp_remat(self, x: Tokens, e: int) -> Tokens:
+        r"""``mlp(x, *self.weights(e))``, but autograd does not keep :math:`W_b + \Delta_e` for the backward: the
+        saved copies are swapped for a recipe and recomputed (one add per weight) when the backward needs them, so a
+        training step holds the activations only, not one materialised expert per routed expert and layer. Not done
+        under other saved-tensor hooks (activation checkpointing, offloading), which already decide what is kept, nor
+        with ``remat`` False or without torch's (private) hook query. Saves nothing under autocast: F.linear then
+        saves its own cast copy, which is kept. Values and gradients are unchanged: the recomputed sum is the same sum."""
+        w = self.weights(e)
+        top = getattr(torch._C._autograd, "_top_saved_tensors_default_hooks", None)
+        if not self.remat or e < 0 or not torch.is_grad_enabled() or top is None or top(False) is not None:
+            return mlp(x, *w)
+        # metadata only: autograd keeps the hooks with every saved tensor, so a closure over w would keep it alive
+        ptr = {t.untyped_storage().data_ptr(): (i, t.dtype, t.untyped_storage().nbytes()) for i, t in enumerate(w)}
+        cache: dict[int, Tensor] = {}
+
+        def pack(t: Tensor) -> "Tensor | tuple":
+            # the weight itself or a view of it (F.linear may save W.t()); w[i] is contiguous, so offset 0 = same start
+            i, dtype, nbytes = ptr.get(t.untyped_storage().data_ptr(), (-1, None, 0))
+            if i < 0 or t.dtype != dtype or t.untyped_storage().nbytes() != nbytes:
+                return t
+            return i, t.shape, t.stride(), t.storage_offset()
+
+        def unpack(p: "Tensor | tuple") -> Tensor:
+            if isinstance(p, Tensor):
+                return p
+            i, shape, stride, offset = p
+            if i not in cache:
+                with torch.no_grad():
+                    cache.update(enumerate(self.weights(e)))
+            return cache.pop(i).as_strided(shape, stride, offset)
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+            return mlp(x, *w)  # w (the only reference left) is freed on return
+
     def _forward_param(self, x: Tokens, min_rows: int = 0) -> Tokens:
         r"""``min_rows > 0``: an expert with fewer routed rows skips materialising :math:`W_b + \Delta_e` and uses
         ``mlp_split`` (reads :math:`W_b` and :math:`\Delta_e` once, writes no weights: cheaper while memory-bound, twice the FLOPs).
@@ -280,7 +318,7 @@ class DeltaMoE(nn.Module):
             if 0 <= e and len(rows) < min_rows:
                 y = self.mlp_split(x[rows], e)
             else:
-                y = mlp(x[rows], *self.weights(e))
+                y = self._mlp_remat(x[rows], e)
             out = out.index_add(0, rows, (r[rows, slots, None] * y).to(out.dtype))  # (autocast: y in another dtype)
         return out
 

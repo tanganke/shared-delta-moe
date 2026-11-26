@@ -219,6 +219,8 @@ Whole Qwen3.5-4B text model, full-parameter training, batch 2 x 2048, bf16 weigh
 | DARE 0.2/64, kept values trained | 6.48B / 6.47B | 51.0 | 111.9 | 1.1 |
 | dense deltas (`DeltaMoE`) trained | 15.53B / 15.53B | 118.7 | out of memory | 0.8 |
 
+The "none" column predates `DeltaMoE._mlp_remat`. With it (the materialised weights recomputed in the backward; same H200, 2026-11-27), without checkpointing: DARE frozen top-1 92.9 → 71.7 GiB (0.6 → 0.8 s/step), DARE trained 111.8 → 90.7 GiB (0.8 → 0.9 s/step); dense deltas trained still out of memory; with checkpointing unchanged (118.7 GiB).
+
 ## Per implementation, previous kernel (single MoE layer, bf16, eager, ms)
 
 The per-implementation tables below were measured with the previous kernel (5522b23; one launch per projection). Its "param Triton" column is superseded by the section above.
