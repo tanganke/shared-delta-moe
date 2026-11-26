@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.4.0  # setup-uv publishes no moving major tag
         with:
           python-version: "3.12"
       # CPU torch: autodoc imports the package; the CUDA wheels from the lock would be gigabytes for nothing
