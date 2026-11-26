@@ -37,6 +37,22 @@ class Source(Protocol):
     def get(self, key: str) -> torch.Tensor: ...
 
 
+class Mean:
+    """One expert that is the mean of several fine-tunes (e.g. seeds), read one tensor at a time; fp32 sum, the
+    first source's dtype. Keys: those every source has."""
+
+    def __init__(self, sources: Sequence[Source]) -> None:
+        self.sources = sources
+
+    def keys(self) -> list[str]:
+        have = [set(s.keys()) for s in self.sources[1:]]
+        return [k for k in self.sources[0].keys() if all(k in h for h in have)]
+
+    def get(self, key: str) -> torch.Tensor:
+        ts = [s.get(key) for s in self.sources]
+        return (sum(t.float() for t in ts) / len(ts)).to(ts[0].dtype)
+
+
 def convert(base: Source, groups: dict[str, Sequence[Source]], dst: Path, zeros: Sequence[int], top_k: int = 1,
             group_top_k: int | None = None, merge: str = "simple_average",
             merge_args: dict[str, Any] | None = None, shard_gb: float = 5.0,
@@ -123,7 +139,7 @@ def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("base", type=Path)
     ap.add_argument("dst", type=Path)
-    ap.add_argument("--group", action="append", required=True, help="NAME=DIR[,DIR...]: one domain's fine-tunes")
+    ap.add_argument("--group", action="append", required=True, help="NAME=DIR[,DIR...]: one domain's fine-tunes, one expert each; DIR+DIR+... is one expert, their mean")
     ap.add_argument("--zeros", default="0", help="zero experts per group: one int, or one per group (a,b,...)")
     ap.add_argument("--top-k", type=int, default=1, help="experts per group")
     ap.add_argument("--group-top-k", type=int, help="groups per token (default: dense over every group)")
@@ -134,7 +150,8 @@ def main(argv: list[str] | None = None) -> None:
     groups, ckpt = {}, functools.cache(lambda d: Checkpoint(Path(d).resolve()))  # one source per directory
     for g in a.group:
         name, dirs = g.split("=", 1)
-        groups.setdefault(name, []).extend(ckpt(d) for d in dirs.split(","))  # a repeated name extends
+        experts = [ckpt(d) if "+" not in d else Mean([ckpt(p) for p in d.split("+")]) for d in dirs.split(",")]
+        groups.setdefault(name, []).extend(experts)  # a repeated name extends
     zeros = [int(z) for z in a.zeros.split(",")]
     zeros = zeros * len(groups) if len(zeros) == 1 else zeros
     merge_args = {k: _value(v) for k, v in (s.split("=", 1) for s in a.merge_arg)}

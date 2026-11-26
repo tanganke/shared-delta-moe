@@ -159,6 +159,14 @@ def test_vl_layout_and_missing_keys():
         out = Checkpoint(Path(d) / "dup")
         torch.testing.assert_close(out.get(f"{p}.d_up"), torch.tensor([1.0, 3.0, 1.0])[:, None, None].expand(3, 6, 4))
         torch.testing.assert_close(out.get("model.visual.blocks.0.mlp.linear_fc1.weight"), base["model.visual.blocks.0.mlp.linear_fc1.weight"] + 2)
+        # Mean: one expert = the mean of two fine-tunes (ft0 + 1, ft1 + 3 -> + 2); the merge sees the mean once
+        from shared_delta_moe.models.qwen3_5.qwen3_5_hier_delta_moe.convert import Mean
+
+        convert(Dict(base), {"a": [Mean([Dict(fts[0]), Dict(fts[1])])], "b": [Dict(fts[0])]}, Path(d) / "mean", [0, 0], log=lambda s: None)
+        out = Checkpoint(Path(d) / "mean")
+        torch.testing.assert_close(out.get(f"{p}.d_up"), torch.tensor([2.0, 1.0])[:, None, None].expand(2, 6, 4))
+        torch.testing.assert_close(out.get("model.visual.blocks.0.mlp.linear_fc1.weight"), base["model.visual.blocks.0.mlp.linear_fc1.weight"] + 1.5)
+        assert torch.equal(out.get("model.ids"), torch.arange(5))
 
 
 if __name__ == "__main__":
