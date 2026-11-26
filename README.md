@@ -64,7 +64,9 @@ uv run --group docs --extra transformers sphinx-build -W -b html docs docs/_buil
 Published at https://tanganke.github.io/shared-delta-moe/, built by `.github/workflows/docs.yml` on every push to
 main (pull requests build only).
 
-- A new page goes into a toctree in `docs/index.md` (and this list); a new public module into `docs/api.md`.
+- A new page goes into a toctree in `docs/index.md` (and this list). A new module needs nothing: `docs/api.md` runs
+  autosummary recursively over the package (one page per module, generated into `docs/_api/`); a new subpackage needs an
+  `__init__.py` with a one-line docstring.
 - Public docstrings are Google style (summary line, then `Args:` / `Returns:` / `Raises:`, shapes in each argument),
   rendered by napoleon; the text inside is reStructuredText: aligned blocks after `::` and a blank line, `|x|` as
   ``` ``|x|`` ```. NamedTuple fields go in `:ivar name:` entries, not `Attributes:`. The build runs with `-W`, so a
@@ -83,4 +85,4 @@ main (pull requests build only).
 - [qwen3_5.md](docs/qwen3_5.md): converting a whole Qwen3.5 model: plain MoE -> DeltaMoE (and BitDelta), dense base + domain fine-tunes -> HierDeltaMoE (merge methods)
 - [speed-per-implementation.md](docs/speed-per-implementation.md): every implementation per layer, H200 and RTX 6000 Ada (previous kernel 5522b23)
 - [transformers-decode.md](docs/transformers-decode.md): why the plain MoE looked slow in transformers' `generate()` (`batched_mm` switch) and the fix
-- [api.md](docs/api.md): API reference, generated from the docstrings (models, merging, Triton kernels, Qwen3.5 blocks, checkpoint converters)
+- [api.md](docs/api.md): API reference, one page per module in the package layout, generated from the docstrings

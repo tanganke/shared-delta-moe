@@ -1,89 +1,13 @@
 # API
 
-Generated from the docstrings.
-
-## Models
-
-```{eval-rst}
-.. automodule:: shared_delta_moe.models.delta_moe
-   :members:
-
-.. automodule:: shared_delta_moe.models.packed
-   :members:
-
-.. automodule:: shared_delta_moe.models.dare
-   :members:
-
-.. automodule:: shared_delta_moe.models.bitdelta
-   :members:
-
-.. automodule:: shared_delta_moe.models.hier
-   :members:
-```
-
-## Merging and helpers
+Generated from the docstrings, one page per module, following the package layout. The package re-exports
+`DeltaMoE`, `DareDeltaMoE`, `BitDeltaMoE`, `HierDeltaMoE`, `mlp` and `random_experts`; they are documented in their
+modules.
 
 ```{eval-rst}
-.. automodule:: shared_delta_moe.merging
-   :members:
+.. autosummary::
+   :toctree: _api
+   :recursive:
 
-.. automodule:: shared_delta_moe.ops
-   :members:
-
-.. automodule:: shared_delta_moe.testing
-   :members:
-```
-
-## Triton kernels
-
-```{eval-rst}
-.. automodule:: shared_delta_moe.triton_kernels.fused
-   :members: Delta, route, gate_up, down, fused_moe
-
-.. automodule:: shared_delta_moe.triton_kernels.train
-   :members:
-```
-
-## CUDA kernels
-
-```{eval-rst}
-.. automodule:: shared_delta_moe.cuda_kernels.packed_ops
-   :members: available, supports, moe, matrix_moe, matrix_moe_any, build
-```
-
-## Dense prefill
-
-```{eval-rst}
-.. automodule:: shared_delta_moe.cuda_kernels.dense_moe
-   :members: materialise, grouped_moe, unsort, supports
-```
-
-## Qwen3.5 in transformers
-
-```{eval-rst}
-.. automodule:: shared_delta_moe.models.qwen3_5.common
-   :members:
-
-.. automodule:: shared_delta_moe.models.qwen3_5.qwen3_5_delta_moe.modeling
-   :members:
-
-.. automodule:: shared_delta_moe.models.qwen3_5.qwen3_5_hier_delta_moe.modeling
-   :members:
-```
-
-## Checkpoint converters
-
-Command-line tools (`python -m <module> --help`).
-
-```{eval-rst}
-.. automodule:: shared_delta_moe.models.qwen3_5.qwen3_5_delta_moe.convert
-
-.. automodule:: shared_delta_moe.models.qwen3_5.qwen3_5_hier_delta_moe.convert
-```
-
-## vLLM
-
-```{eval-rst}
-.. automodule:: shared_delta_moe.vllm_plugin
-   :members:
+   shared_delta_moe
 ```
