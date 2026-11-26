@@ -16,7 +16,40 @@ flowchart LR
     S --> y([y])
 ```
 
-Stored per layer: $W_b$ once, one $\Delta_e$ per delta expert, the router; a zero expert has no parameters.
+**Storage.** The diagram above is the computation. What a layer stores is $W_b$ once and one $\Delta_e$ per delta
+expert; a zero expert stores nothing but its router row. State dict of one layer (Qwen3.5 checkpoints: under
+`model.layers.{l}.mlp.`), $n$ deltas, $Z$ zero experts:
+
+| key | shape | holds |
+|---|---|---|
+| `gate`, `up`, `down` | $(I, H)$, $(I, H)$, $(H, I)$ | $W_b$, once |
+| `d_gate`, `d_up`, `d_down` | $(n, I, H)$, $(n, I, H)$, $(n, H, I)$ | $\Delta_1, \ldots, \Delta_n$ |
+| `router.weight` | $(n+Z,\ H)$ | rows $0..n-1$ route to the deltas, rows $n..n+Z-1$ to the base |
+
+```mermaid
+flowchart LR
+    subgraph stored ["stored"]
+        sWb[("W_b")]
+        sd1[("Δ_1")]
+        sdn[("Δ_n")]
+    end
+    subgraph run ["experts"]
+        x1["W_b + Δ_1"]
+        xn["W_b + Δ_n"]
+        xz["zero expert"]
+    end
+    sWb --> x1 & xn & xz
+    sd1 --> x1
+    sdn --> xn
+```
+
+- **Size.** $(1+n)$ MLPs of weights plus the router: the original MoE's $n+1$ experts, whatever $Z$ is.
+- **From a Qwen3.5 MoE** (`qwen3_5_delta_moe.convert`): the chosen base expert's weights become $W_b$, every other
+  expert $e$ becomes $\Delta_e = W_e - W_b$ in the checkpoint dtype, and the base's router row moves to the end
+  (row $n$, the zero expert, $Z=1$). The shared expert is dropped (the converter asserts its output is zero).
+- **Not stored.** $Z$ and top-k are in the config (`delta_moe_zero_experts`, `num_experts_per_tok`; `num_experts` =
+  $n+Z$).
+- **Compressed deltas** replace `d_<proj>` with their own buffers; see below.
 
 The forwards that compute it are in [forwards.md](forwards.md). A $\Delta_e$ can also be stored compressed; the base
 is always dense:

@@ -14,7 +14,8 @@ napoleon_google_docstring = True
 napoleon_numpy_docstring = False
 myst_enable_extensions = ["dollarmath", "amsmath"]
 myst_fence_as_directive = ["mermaid"]  # ```mermaid blocks render as diagrams (also on GitHub)
-mermaid_init_config = {"startOnLoad": False, "flowchart": {"useMaxWidth": False}}  # natural size, not stretched
+mermaid_init_config = {"startOnLoad": False, "flowchart": {"useMaxWidth": False},  # natural size, not stretched
+                       "deterministicIds": True}  # else ids are Date.now(): two diagrams in one ms collide
 myst_heading_anchors = 3
 autodoc_member_order = "bysource"
 autodoc_typehints = "description"
