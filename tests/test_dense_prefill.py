@@ -41,17 +41,44 @@ def test_matches_materialised():
             _check(m, x[:t], (m.top_k, m.n_delta, x.shape[1], t))
 
 
+@torch.no_grad()
 def test_empty_groups_and_zero_expert():
+    """Routings built directly: an empty group between two non-empty ones, and every pair on the zero expert;
+    grouped_moe and fused_moe (past the threshold) == _forward_param on the same routing."""
     if not GPU:
         print("skipped: no CUDA/Triton")
         return
-    m, _, x = make(1, 1, 192, 320, torch.bfloat16, "cuda")
-    with torch.no_grad():
-        m.router.weight[1] -= 100  # delta 1 never picked: an empty group between two non-empty ones
-    _check(m, x, "delta 1 empty")
-    with torch.no_grad():
-        m.router.weight[-1] += 1000  # every pair on the zero expert: only the base group has rows
-    _check(m, x, "all zero expert")
+    from shared_delta_moe import constants
+    from shared_delta_moe.cuda_kernels import dense_moe
+    from shared_delta_moe.triton_kernels import fused as F
+
+    m, _, x = make(1, 2, 192, 320, torch.bfloat16, "cuda")
+    G, (T, k) = m.n_delta, (x.shape[0], m.top_k)  # groups 0..G-1 the deltas, G the zero expert
+    assert G == 3
+    rw = torch.rand(T, k, device="cuda").softmax(-1)
+    empty_mid = torch.tensor([0, 2, G], device="cuda")[torch.randint(3, (T, k), device="cuda")]
+    base, ds = (m.gate, m.up, m.down), (m.d_gate, m.d_up, m.d_down)
+    old, constants.DENSE_PREFILL_PAIRS_PER_GROUP = constants.DENSE_PREFILL_PAIRS_PER_GROUP, 8
+    calls, grouped = [], dense_moe.grouped_moe
+    dense_moe.grouped_moe = lambda *a: calls.append(1) or grouped(*a)
+    try:
+        for tag, idx in (("group 1 empty", empty_mid), ("all zero expert", torch.full((T, k), G, device="cuda"))):
+            gs = F.route(idx, rw, G).gstart.tolist()
+            if tag == "group 1 empty":
+                assert gs[1] > gs[0] and gs[2] == gs[1] and gs[3] > gs[2] and gs[4] > gs[3], gs
+            else:
+                assert gs[G] == 0 and gs[G + 1] == T * k, gs
+            m.topk = lambda _x, idx=idx: (idx, rw)  # the reference routes the same way
+            want = m._forward_param(x)
+            got = grouped(x, F.route(idx, rw, G), base, ds)
+            assert rel(got, want) < 2e-2, (tag, rel(got, want))
+            calls.clear()
+            got = F.fused_moe(x, idx, rw, G, base, m._kernel_deltas())
+            assert rel(got, want) < 2e-2, (tag, "fused_moe", rel(got, want))
+            assert calls == ([1] if torch.cuda.get_device_capability()[0] == 9 else []), (tag, calls)
+    finally:
+        m.__dict__.pop("topk", None)
+        constants.DENSE_PREFILL_PAIRS_PER_GROUP, dense_moe.grouped_moe = old, grouped
 
 
 def test_forward_param_dispatch():
@@ -76,21 +103,54 @@ def test_forward_param_dispatch():
 
 
 def test_torch_compile_prefill():
-    """The prefill path inside the one opaque op under torch.compile (fullgraph): same output."""
+    """The prefill path inside the one opaque op under torch.compile (fullgraph): taken, same output."""
     if not GPU or torch.cuda.get_device_capability()[0] != 9:
         print("skipped: needs sm90")
         return
     from shared_delta_moe import constants
+    from shared_delta_moe.cuda_kernels import dense_moe
 
     m, _, x = make(1, 2, 192, 320, torch.bfloat16, "cuda")
     old, constants.DENSE_PREFILL_PAIRS_PER_GROUP = constants.DENSE_PREFILL_PAIRS_PER_GROUP, 8
+    calls, grouped = [], dense_moe.grouped_moe
+    dense_moe.grouped_moe = lambda *a: calls.append(1) or grouped(*a)
     try:
         torch._dynamo.reset()
         f = torch.compile(m._forward_param_triton, fullgraph=True)
         with torch.no_grad():
             assert rel(f(x), m._forward_param(x)) < 2e-2
     finally:
-        constants.DENSE_PREFILL_PAIRS_PER_GROUP = old
+        constants.DENSE_PREFILL_PAIRS_PER_GROUP, dense_moe.grouped_moe = old, grouped
+    assert calls, "prefill path not taken under torch.compile"
+
+
+def test_autocast_prefill():
+    """bf16 model, top-2, past the threshold, inside autocast and no_grad: bf16 out (the slot sum not fp32, no fp16
+    grouped_mm), grouped path taken, == _forward_param."""
+    if not GPU or torch.cuda.get_device_capability()[0] != 9:
+        print("skipped: needs sm90")
+        return
+    from shared_delta_moe import constants
+    from shared_delta_moe.cuda_kernels import dense_moe
+
+    m, _, x = make(1, 2, 192, 320, torch.bfloat16, "cuda")
+    old, constants.DENSE_PREFILL_PAIRS_PER_GROUP = constants.DENSE_PREFILL_PAIRS_PER_GROUP, 8
+    calls, grouped = [], dense_moe.grouped_moe
+    dense_moe.grouped_moe = lambda *a: calls.append(1) or grouped(*a)
+    try:
+        with torch.no_grad():
+            want = m._forward_param(x)
+            routing = m.topk(x)
+            m.topk = lambda _x: routing  # autocast's router logits could flip near-ties: route as the reference did
+            for dt in (torch.bfloat16, torch.float16):
+                calls.clear()
+                with torch.autocast("cuda", dtype=dt):
+                    got = m.forward_param(x)
+                assert calls and got.dtype == torch.bfloat16, (dt, calls, got.dtype)
+                assert rel(got, want) < 2e-2, (dt, rel(got, want))
+    finally:
+        m.__dict__.pop("topk", None)
+        constants.DENSE_PREFILL_PAIRS_PER_GROUP, dense_moe.grouped_moe = old, grouped
 
 
 def test_cuda_graph_prefill():

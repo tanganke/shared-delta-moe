@@ -65,6 +65,7 @@ def materialise(base: tuple[Tensor, Tensor, Tensor], deltas: tuple[Tensor, Tenso
 
 
 @torch.no_grad()  # not differentiable (supports() refuses inputs that need a gradient)
+@torch.autocast("cuda", enabled=False)  # autocast's fp16 grouped_mm would hit torch's host-syncing fallback
 def grouped_moe(x: Tensor, r: Routing, base: tuple[Tensor, Tensor, Tensor],
                 deltas: tuple[Tensor, Tensor, Tensor]) -> Tensor:  # fmt: skip
     """Parameter-aggregation MoE forward through materialised weights and ``F.grouped_mm``.
@@ -99,7 +100,7 @@ def unsort(y: Tensor, r: Routing) -> Tensor:
     inv = torch.empty_like(r.perm)
     inv[r.perm] = torch.arange(r.perm.numel(), dtype=r.perm.dtype, device=r.perm.device)
     o = y[inv] * r.weight.to(y.dtype)[:, None]
-    return o if r.top_k == 1 else o.view(r.tokens, r.top_k, -1).sum(1)
+    return o if r.top_k == 1 else o.view(r.tokens, r.top_k, -1).sum(1).to(y.dtype)  # (autocast would make it fp32)
 
 
 def supports(x: Tensor, base: tuple[Tensor, Tensor, Tensor], deltas: tuple[Tensor, Tensor, Tensor]) -> bool:
