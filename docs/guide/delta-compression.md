@@ -112,10 +112,12 @@ Keep a fraction $p$ of the entries, store their values (bf16) and where they are
 - **Importance DARE** keeps entry $(i,j)$ with its own probability $q_{ij}$, rescaled by $1/q_{ij}$ (still
   unbiased). The output-error variance $\sum_{ij} \Delta_{ij}^2 \|X_{:,j}\|^2 (1/q_{ij} - 1)$ under the budget
   $\sum_{ij} q_{ij} = pRC$ is minimised (Lagrange) by
+
   $$
   q_{ij} = \min\!\left(1,\ c\, s_{ij}\right), \qquad s_{ij} = |\Delta_{ij}|\, \|X_{:,j}\|,
   $$
-  $c$ set by the budget: sample in proportion to each entry's effect on the output. With 1 x $B$ blocks the same
+
+  with $c$ set by the budget: sample in proportion to each entry's effect on the output. With 1 x $B$ blocks the same
   argument gives $s_{ib} = \|X_{:,b}\, \delta_{i,b}\| = (\delta_{i,b}^\top \mathbf{H}_{bb}\, \delta_{i,b})^{1/2}$,
   $\mathbf{H}_{bb}$ the block's diagonal block of the Gram. A decoder must regenerate the mask, so it needs $q$:
   `importance_dare` replaces $s$ by the outer product of its row and column sums,
@@ -221,7 +223,7 @@ version before the block-optimal score now in `compress.py`.)
 
 ### Accuracy
 
-% (4 samples per question, 500 questions per set), against the dense-delta model; in parentheses the paired
+Accuracy in % (4 samples per question, 500 questions per set), against the dense-delta model; in parentheses the paired
 difference with its 95% bootstrap interval over questions. Generation uses the same seeds for every model, so most
 samples coincide and the intervals are narrow.
 
