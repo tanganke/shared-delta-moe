@@ -54,7 +54,7 @@ from ..constants import (
     TRITON_MAX_PAIRS_OLDER,
     TRITON_MIN_PAIRS,
 )
-from ..ops import gmm, groups, mlp, sort_rows
+from ..ops import gmm, groups, mlp, pow2, sort_rows
 from ..type_hints import (
     DenseExperts,
     Experts,
@@ -66,10 +66,6 @@ from ..type_hints import (
     RouterWeight,
     Tokens,
 )
-
-
-def _pow2(n: int) -> int:
-    return 1 << (n - 1).bit_length()
 
 
 class DeltaMoE(nn.Module):
@@ -142,13 +138,14 @@ class DeltaMoE(nn.Module):
             p(inter, hidden),
             p(hidden, inter),
         )
+        # (experts, rows, cols) of each projection's deltas, for the packed formats (models/packed.py)
+        self.shapes = {"gate": (n_delta, inter, hidden), "up": (n_delta, inter, hidden), "down": (n_delta, hidden, inter)}
         self._init_deltas(n_delta, inter, hidden, factory)
 
     def _init_deltas(
         self, n: int, inter: int, hidden: int, factory: dict[str, Any]
     ) -> None:
-        """Delta storage; a subclass with another format (``dare.DareDeltaMoE``) overrides this and
-        ``d_gate``/``d_up``/``d_down``."""
+        """Delta storage; a packed format (``packed.PackedDeltaMoE``) overrides this and ``d_gate``/``d_up``/``d_down``."""
         self.d_gate, self.d_up, self.d_down = (
             nn.Parameter(torch.empty(n, inter, hidden, **factory)),
             nn.Parameter(torch.empty(n, inter, hidden, **factory)),
@@ -398,7 +395,7 @@ class DeltaMoE(nn.Module):
         ``TRITON_MAX_PAIRS_*`` (token, slot) pairs."""
         if not (HAS_TRITON and x.is_cuda and x.dtype in TRITON_DTYPES and self.gate.dtype == x.dtype):
             return False  # (weights in another dtype: e.g. an fp32 model under bf16 autocast)
-        if _pow2(self.top_k) * _pow2(self.n_delta + 2) > SORT_ONE_HOT_MAX:
+        if pow2(self.top_k) * pow2(self.n_delta + 2) > SORT_ONE_HOT_MAX:
             return False  # the routing sort's one-hot, even one token at a time
         if self._needs_grad(x):
             # weight gradients use F.grouped_mm: 16-byte aligned rows (hidden and inter multiples of 8 in bf16/fp16)

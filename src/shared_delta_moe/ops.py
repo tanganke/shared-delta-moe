@@ -1,4 +1,4 @@
-"""Stateless building blocks: the SwiGLU MLP, grouping routed rows, and one grouped GEMM."""
+"""Stateless building blocks: the SwiGLU MLP, grouping routed rows, one grouped GEMM, and bit packing."""
 
 import torch
 import torch.nn.functional as F
@@ -16,6 +16,39 @@ from .type_hints import (
     StackedWeight,
     Tokens,
 )
+
+
+def pow2(n: int) -> int:
+    """Smallest power of 2 that is at least n (n >= 1)."""
+    return 1 << (n - 1).bit_length()
+
+
+def pack_bits(b: torch.Tensor) -> torch.Tensor:
+    r"""Pack booleans along the last dimension into int32 words.
+
+    Args:
+        b: (..., C) bool.
+
+    Returns:
+        (..., ceil(C / 32)) int32: entry :math:`c` in bit :math:`c \bmod 32` of word :math:`\lfloor c / 32 \rfloor`,
+        set where True; the padding bits of the last word are clear.
+    """
+    words = -(-b.shape[-1] // 32)
+    b = F.pad(b, (0, words * 32 - b.shape[-1])).view(*b.shape[:-1], words, 32).long()
+    w = (b << torch.arange(32, device=b.device)).sum(-1)
+    return torch.where(w >= 2**31, w - 2**32, w).to(torch.int32)
+
+
+def unpack_bits(w: torch.Tensor) -> torch.Tensor:
+    """Unpack ``pack_bits`` words.
+
+    Args:
+        w: (..., W) int32 words.
+
+    Returns:
+        (..., 32 W) int32 of 0 and 1, padding bits included.
+    """
+    return ((w[..., None] >> torch.arange(32, dtype=torch.int32, device=w.device)) & 1).flatten(-2)
 
 
 def mlp(x: Tokens, gate: InWeight, up: InWeight, down: OutWeight) -> Tokens:

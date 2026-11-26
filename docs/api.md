@@ -8,6 +8,9 @@ Generated from the docstrings.
 .. automodule:: shared_delta_moe.models.delta_moe
    :members:
 
+.. automodule:: shared_delta_moe.models.packed
+   :members:
+
 .. automodule:: shared_delta_moe.models.dare
    :members:
 

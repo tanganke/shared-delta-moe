@@ -27,9 +27,9 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
+from ..ops import pack_bits, pow2, unpack_bits
 from .delta_moe import DeltaMoE
-
-PROJ = ("gate", "up", "down")
+from .packed import PROJ, PackedDeltaMoE
 
 
 def pack_signs(d: Tensor) -> Tensor:
@@ -43,9 +43,7 @@ def pack_signs(d: Tensor) -> Tensor:
         ``d[..., c] >= 0``.
     """
     assert d.shape[-1] % 32 == 0
-    b = (d >= 0).view(*d.shape[:-1], d.shape[-1] // 32, 32).long() << torch.arange(32, device=d.device)
-    w = b.sum(-1)
-    return torch.where(w >= 2**31, w - 2**32, w).to(torch.int32)
+    return pack_bits(d >= 0)
 
 
 def unpack_signs(w: Tensor, dtype: torch.dtype) -> Tensor:
@@ -58,8 +56,7 @@ def unpack_signs(w: Tensor, dtype: torch.dtype) -> Tensor:
     Returns:
         (..., C) of :math:`+1` (bit set) and :math:`-1` (bit clear) in dtype.
     """
-    bits = (w[..., None] >> torch.arange(32, dtype=torch.int32, device=w.device)) & 1
-    return (bits * 2 - 1).to(dtype).flatten(-2)
+    return (unpack_bits(w) * 2 - 1).to(dtype)
 
 
 def scale_block(scale: "str | int", cols: int) -> int:
@@ -76,7 +73,7 @@ def scale_block(scale: "str | int", cols: int) -> int:
         assert scale >= 1 and scale & (scale - 1) == 0 and cols % scale == 0, (scale, cols)
         return scale
     assert scale in ("matrix", "row"), scale
-    return 1 << (cols - 1).bit_length()
+    return pow2(cols)
 
 
 def scales(d: Tensor, scale: "str | int") -> Tensor:
@@ -101,7 +98,7 @@ def scales(d: Tensor, scale: "str | int") -> Tensor:
     return s.to(d.dtype)
 
 
-class BitDeltaMoE(DeltaMoE):
+class BitDeltaMoE(PackedDeltaMoE):
     """DeltaMoE whose deltas are BitDelta (see the module docstring).
 
     The materialised path unpacks only the routed expert (``delta(e)``); ``d_gate`` / ``d_up`` / ``d_down`` unpack
@@ -128,7 +125,6 @@ class BitDeltaMoE(DeltaMoE):
 
     def _init_deltas(self, n: int, inter: int, hidden: int, factory: dict[str, Any]) -> None:
         assert inter % 32 == 0 and hidden % 32 == 0, "sign bits are packed 32 to an int32 word along each row"
-        self.shapes = {"gate": (n, inter, hidden), "up": (n, inter, hidden), "down": (n, hidden, inter)}
         self.sblock = {name: scale_block(self.scale, C) for name, (_, _, C) in self.shapes.items()}
         for name, (G, R, C) in self.shapes.items():
             self.register_buffer(f"b_{name}", torch.empty(G, R, C // 32, dtype=torch.int32, device=factory["device"]))
@@ -145,12 +141,14 @@ class BitDeltaMoE(DeltaMoE):
 
         Returns:
             The BitDeltaMoE, on m's device and in m's dtype, holding each delta's sign bits and its scales.
+
+        Raises:
+            TypeError: If m is a HierDeltaMoE (BitDeltaMoE has a flat router).
         """
         g = m.gate
         out = cls(g.shape[1], g.shape[0], m.n_delta, m.top_k, m.num_zero_experts, g.device, g.dtype, scale)
-        out.router.weight.copy_(m.router.weight)
+        out._copy_shared(m)
         for name in PROJ:
-            getattr(out, name).copy_(getattr(m, name))
             d = getattr(m, f"d_{name}")
             getattr(out, f"b_{name}").copy_(pack_signs(d))
             getattr(out, f"s_{name}").copy_(scales(d, scale))
@@ -161,44 +159,6 @@ class BitDeltaMoE(DeltaMoE):
         scales."""
         s, C = getattr(self, f"s_{name}"), self.shapes[name][2]
         return s[e].repeat_interleave(self.sblock[name], 1)[:, :C] * unpack_signs(getattr(self, f"b_{name}")[e], s.dtype)
-
-    def delta(self, e: int) -> tuple[Tensor, Tensor, Tensor]:
-        r"""Dense :math:`\mathrm{diag}(s_e)\,\mathrm{sign}(\Delta_e)` of one expert; differentiable in the scales.
-
-        Args:
-            e: Delta expert index, in [0, n_delta).
-
-        Returns:
-            (:math:`\Delta_\mathrm{gate}` (I, H), :math:`\Delta_\mathrm{up}` (I, H), :math:`\Delta_\mathrm{down}`
-            (H, I)) of expert :math:`e`.
-        """
-        return self._unpack("gate", e), self._unpack("up", e), self._unpack("down", e)
-
-    def _delta(self, name: str) -> Tensor:
-        G, R, C = self.shapes[name]
-        if G == 0:
-            return getattr(self, f"s_{name}").new_zeros(G, R, C)
-        return torch.stack([self._unpack(name, e) for e in range(G)])
-
-    @property
-    def d_gate(self) -> Tensor:  # type: ignore[override]
-        """Dense gate deltas of every expert, unpacked on each access: (N, I, H)."""
-        return self._delta("gate")
-
-    @property
-    def d_up(self) -> Tensor:  # type: ignore[override]
-        """Dense up deltas of every expert, unpacked on each access: (N, I, H)."""
-        return self._delta("up")
-
-    @property
-    def d_down(self) -> Tensor:  # type: ignore[override]
-        """Dense down deltas of every expert, unpacked on each access: (N, H, I)."""
-        return self._delta("down")
-
-    def _use_triton(self, x: Tensor) -> bool:
-        # the fused kernels take sign bits forward-only (triton_train's backward: dense deltas); with a gradient
-        # needed, the materialised path
-        return not self._needs_grad(x) and super()._use_triton(x)
 
     def _kernel_deltas(self) -> "tuple[Delta, Delta, Delta]":
         from ..triton_kernels import Delta

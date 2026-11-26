@@ -103,6 +103,19 @@ def test_scale_gradients():
             assert torch.allclose(getattr(b, f"s_{n}").grad, want, atol=1e-5), (z, k, n)
 
 
+def test_packed_refuses_hier():
+    """A HierDeltaMoE has a two-level router, which the flat packed forms (BitDelta, DARE) cannot hold."""
+    from shared_delta_moe import DareDeltaMoE, HierDeltaMoE
+
+    h = HierDeltaMoE(H, I, [2, 1], [1, 1], 1)
+    for convert in (lambda: BitDeltaMoE.from_delta_moe(h), lambda: DareDeltaMoE.from_delta_moe(h, 0.5)):
+        try:
+            convert()
+        except TypeError:
+            continue
+        raise AssertionError("converted a HierDeltaMoE")
+
+
 def _gpu(z, k, hidden=192, inter=320, scale="row"):
     m, _, x = make(z, k, hidden, inter, torch.bfloat16, "cuda")
     return BitDeltaMoE.from_delta_moe(m, scale), x

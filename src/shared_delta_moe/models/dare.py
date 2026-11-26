@@ -23,9 +23,10 @@ from typing import Any
 import torch
 from torch import Tensor
 
+from ..ops import pack_bits, unpack_bits
 from .delta_moe import DeltaMoE
+from .packed import PROJ, PackedDeltaMoE
 
-PROJ = ("gate", "up", "down")
 M32 = 0xFFFFFFFF
 
 
@@ -123,11 +124,7 @@ def mask_bits(seed: int, stream: int, rows: int, cols: int, keep: float, block: 
     """
     u = torch.arange(rows * (cols // block), device=device)
     z = torch.zeros_like(u)
-    kept = (philox(u, z + stream, z, z, seed & M32, seed >> 32) < threshold(keep)).view(rows, -1)
-    words = -(-kept.shape[1] // 32)
-    kept = torch.nn.functional.pad(kept, (0, words * 32 - kept.shape[1])).view(rows, words, 32).long()
-    w = (kept << torch.arange(32, device=device)).sum(-1)
-    return torch.where(w >= 2**31, w - 2**32, w).to(torch.int32)
+    return pack_bits((philox(u, z + stream, z, z, seed & M32, seed >> 32) < threshold(keep)).view(rows, -1))
 
 
 def pack(
@@ -155,7 +152,7 @@ def pack(
     return torch.cat(vals), (c.cumsum(0) - c).view(d.shape[:2])
 
 
-class DareDeltaMoE(DeltaMoE):
+class DareDeltaMoE(PackedDeltaMoE):
     r"""DeltaMoE whose deltas are seeded DARE (see the module docstring).
 
     The materialised path (training) unpacks only the routed expert :math:`e` from the mask bitmap (``delta(e)``);
@@ -207,7 +204,7 @@ class DareDeltaMoE(DeltaMoE):
             m, v, p = getattr(self, f"m_{n}"), getattr(self, f"v_{n}"), getattr(self, f"p_{n}")
             if m.device.type == "meta" or v.device.type == "meta":
                 continue
-            c = sum(((m >> b) & 1).sum(-1) for b in range(32)).flatten() * self.block  # kept per row
+            c = unpack_bits(m).sum(-1).flatten() * self.block  # kept per row
             if v.numel() != int(c.sum()) or not torch.equal(p.flatten(), c.cumsum(0) - c):
                 raise RuntimeError(
                     f"DareDeltaMoE: packed {n} deltas do not match keep={self.keep}, block={self.block}, "
@@ -226,11 +223,6 @@ class DareDeltaMoE(DeltaMoE):
         self, n: int, inter: int, hidden: int, factory: dict[str, Any]
     ) -> None:
         # packed buffers start empty: filled by from_delta_moe, or sized by load_state_dict (_resize_packed)
-        self.shapes = {
-            "gate": (n, inter, hidden),
-            "up": (n, inter, hidden),
-            "down": (n, hidden, inter),
-        }
         for name in PROJ:
             self.register_buffer(f"v_{name}", torch.empty(0, **factory))
             self.register_buffer(
@@ -261,10 +253,6 @@ class DareDeltaMoE(DeltaMoE):
         Raises:
             TypeError: If m is a HierDeltaMoE (DareDeltaMoE has a flat router).
         """
-        from .hier import HierDeltaMoE
-
-        if isinstance(m, HierDeltaMoE):
-            raise TypeError("DareDeltaMoE has a flat router; a HierDeltaMoE cannot be converted")
         g = m.gate
         out = cls(
             g.shape[1],
@@ -278,9 +266,8 @@ class DareDeltaMoE(DeltaMoE):
             g.device,
             g.dtype,
         )
-        out.router.weight.copy_(m.router.weight)
+        out._copy_shared(m)
         for j, name in enumerate(PROJ):
-            getattr(out, name).copy_(getattr(m, name))
             v, p = pack(getattr(m, f"d_{name}"), seed, j, keep, block)
             setattr(out, f"v_{name}", v)
             setattr(out, f"p_{name}", p)
@@ -295,53 +282,13 @@ class DareDeltaMoE(DeltaMoE):
     def _unpack(self, name: str, e: int) -> Tensor:
         r"""Dense :math:`\Delta_e` of one projection from the bitmap (no Philox); differentiable in ``v_<name>``."""
         _, R, C = self.shapes[name]
-        w = self._bits(name)[e]  # (R, words)
-        bits = (w[..., None] >> torch.arange(32, dtype=torch.int32, device=w.device)) & 1
-        keep = bits.view(R, -1)[:, : C // self.block].bool().repeat_interleave(self.block, 1)
+        keep = unpack_bits(self._bits(name)[e])[:, : C // self.block].bool().repeat_interleave(self.block, 1)
         v = getattr(self, f"v_{name}")
         return v.new_zeros(R, C).masked_scatter(keep, v[int(getattr(self, f"p_{name}")[e, 0]) :])
 
-    def delta(self, e: int) -> tuple[Tensor, Tensor, Tensor]:
-        r"""Dense deltas of one expert, unpacked from the mask bitmap (no Philox); differentiable in ``v_<proj>``.
-
-        Args:
-            e: Delta expert index, in [0, n_delta).
-
-        Returns:
-            (:math:`\Delta_\mathrm{gate}` (I, H), :math:`\Delta_\mathrm{up}` (I, H), :math:`\Delta_\mathrm{down}`
-            (H, I)) of expert :math:`e`.
-
-        Raises:
-            RuntimeError: If the mask bitmaps are not built (e.g. made on meta, then to_empty, no load).
-        """
-        return self._unpack("gate", e), self._unpack("up", e), self._unpack("down", e)
-
-    def _delta(self, j: int) -> Tensor:
-        name = PROJ[j]
-        G, R, C = self.shapes[name]
-        if G == 0:
-            return getattr(self, f"v_{name}").new_zeros(G, R, C)
-        return torch.stack([self._unpack(name, e) for e in range(G)])
-
-    @property
-    def d_gate(self) -> Tensor:  # type: ignore[override]
-        """Dense gate deltas of every expert, unpacked on each access: (N, I, H)."""
-        return self._delta(0)
-
-    @property
-    def d_up(self) -> Tensor:  # type: ignore[override]
-        """Dense up deltas of every expert, unpacked on each access: (N, I, H)."""
-        return self._delta(1)
-
-    @property
-    def d_down(self) -> Tensor:  # type: ignore[override]
-        """Dense down deltas of every expert, unpacked on each access: (N, H, I)."""
-        return self._delta(2)
-
     def _use_triton(self, x: Tensor) -> bool:
-        # the kernel's K tile and the block must divide one another; tiles are powers of 2. Forward only: the Triton
-        # backward takes dense deltas (DARE trains through the materialised path)
-        return self.block & (self.block - 1) == 0 and not self._needs_grad(x) and super()._use_triton(x)
+        # the kernel's K tile and the block must divide one another; tiles are powers of 2
+        return self.block & (self.block - 1) == 0 and super()._use_triton(x)
 
     @torch.no_grad()
     def _mask_bits(self) -> None:
