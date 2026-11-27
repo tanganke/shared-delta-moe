@@ -12,8 +12,10 @@ with :math:`e_i \ge N` (a zero expert) adds nothing. The routing comes from outs
 attention block, routed like the layer's MoE MLP (``DeltaMoE.topk`` with that router), set by a forward pre-hook
 (``models/qwen3_5/common.py``), so the projections of a block share it.
 
-Deltas are dense (``deltas``) or group-grid codes as in ``grid.py`` (``codes``, ``steps``, ``lows``). The forward is a
-loop over the routed experts with ``index_add`` (differentiable: routers, steps, dense deltas); no fused kernel yet.
+Deltas are dense (``deltas``) or group-grid codes as in ``grid.py`` (``codes``, ``steps``, ``lows``). The forward is
+:math:`W_b x` plus, without a gradient, on CUDA in bf16 / fp16 with 2-bit grids: one fused Triton launch for
+:math:`\sum_i r_i \Delta_{e_i} x` (``triton_kernels/fused.py``'s down kernel, mode 3, over a zero base; no host
+sync). Otherwise a loop over the routed experts with ``index_add`` (differentiable: routers, steps, dense deltas).
 """
 
 from typing import Any
@@ -22,6 +24,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from ..constants import HAS_TRITON
 from .grid import code_bits, grid_delta
 
 
@@ -81,6 +84,30 @@ class RoutedDeltaLinear(nn.Linear):
         return grid_delta(self.codes[e], self.steps[e], None if self.symmetric else self.lows[e], self.levels,
                           self.bits)  # fmt: skip
 
+    FUSED_MAX_ENTRIES = 1 << 28  # (pairs, out) the down kernel writes before the slot sum: 512 MiB in bf16
+
+    def _fused(self, x: Tensor, r: Tensor, pairs: int) -> bool:
+        if not (HAS_TRITON and x.is_cuda and x.dtype in (torch.bfloat16, torch.float16) and self.levels is not None):
+            return False
+        if code_bits(self.levels) != 2 or self.group & (self.group - 1) or self.n_delta == 0:
+            return False
+        if pairs * self.out_features > self.FUSED_MAX_ENTRIES:  # e.g. lm_head over a whole sequence: the loop
+            return False
+        # forward-only: a gradient for x, the routers (through r) or any parameter takes the loop
+        return not (torch.is_grad_enabled() and (x.requires_grad or r.requires_grad
+                                                 or any(p.requires_grad for p in self.parameters())))
+
+    def _fused_deltas(self, x: Tensor, idx: Tensor, r: Tensor) -> Tensor:
+        r""":math:`\sum_i r_i \Delta_{e_i} x` per token: the fused down kernel over a zero base (a stride-0 view, every
+        load the same cached zero), the grids decoded tile by tile; pairs of no delta contribute 0."""
+        from ..triton_kernels.fused import Delta, down, route
+
+        rt = route(idx, r, self.n_delta)
+        s = self.steps.detach()
+        z = -s * ((self.levels - 1) / 2) if self.symmetric else self.lows.detach()  # type: ignore[operator]
+        zero = x.new_zeros(1, 1).expand(self.out_features, self.in_features)
+        return down(x[rt.perm // rt.top_k], rt, zero, Delta(3, self.codes, s, z, self.group))
+
     def forward(self, x: Tensor) -> Tensor:
         """``x @ weight.T`` plus each token's routed deltas.
 
@@ -98,6 +125,8 @@ class RoutedDeltaLinear(nn.Linear):
             raise RuntimeError(f"RoutedDeltaLinear: no routing for these {x.numel() // x.shape[-1]} tokens")
         idx, r = self.route
         xs, ys = x.reshape(-1, x.shape[-1]), y.reshape(-1, y.shape[-1])
+        if self._fused(x, r, idx.numel()):
+            return (ys + self._fused_deltas(xs, idx, r)).view(y.shape)
         for e in idx.unique().tolist():
             if e >= self.n_delta:
                 continue

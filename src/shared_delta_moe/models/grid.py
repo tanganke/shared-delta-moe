@@ -91,8 +91,9 @@ class GridDeltaMoE(PackedDeltaMoE):
     """DeltaMoE whose deltas are group-grid codes (see the module docstring).
 
     The materialised path unpacks only the routed expert (``delta(e)``); ``d_gate`` / ``d_up`` / ``d_down`` unpack
-    every expert on access, so the other inherited forwards work too (as references). No fused kernel reads the codes
-    yet: every forward is the materialised one. Build with ``from_delta_moe``; the constructor leaves the buffers
+    every expert on access, so the other inherited forwards work too (as references). The module's forward, for
+    2-bit codes: the fused Triton forward (``triton_kernels/fused.py`` mode 3, forward-only, the pair counts of
+    ``DeltaMoE._use_triton``), else the materialised one. Build with ``from_delta_moe``; the constructor leaves the buffers
     uninitialised (``torch.empty``).
 
     Args:
@@ -136,9 +137,25 @@ class GridDeltaMoE(PackedDeltaMoE):
         """Storage per delta entry: code bits plus the steps (and lowest levels) in the model dtype."""
         return self.bits + (1 if self.symmetric else 2) * 8 * self.s_gate.element_size() / self.group
 
-    # no fused or CUDA kernel reads the codes yet
+    def kernel_ok(self) -> bool:
+        """Whether the fused Triton kernels read these grids (mode 3): 2-bit codes, a power-of-2 group."""
+        return self.bits == 2 and self.group & (self.group - 1) == 0
+
     def _use_triton(self, x: Tensor) -> bool:
-        return False
+        return self.kernel_ok() and super()._use_triton(x)
+
+    def _kernel_deltas(self) -> "tuple[Any, Any, Any]":
+        from ..triton_kernels import Delta
+
+        out = []
+        for n in PROJ:
+            s = getattr(self, f"s_{n}").detach()
+            # ponytail: symmetric grids rebuild their lowest levels per call (1/g of the codes); cache if it shows
+            z = -s * ((self.levels - 1) / 2) if self.symmetric else getattr(self, f"z_{n}").detach()
+            out.append(Delta(3, getattr(self, f"c_{n}"), s, z, self.group))
+        return tuple(out)  # type: ignore[return-value]
+
+    # no CUDA (packed_ops) kernel reads the codes
 
     def _matrix_cuda(self, x: Tensor) -> bool:
         return False

@@ -1,0 +1,141 @@
+"""Fused Triton mode 3 (2-bit group grids): GridDeltaMoE / GridHierDeltaMoE's fused forward against the materialised
+one (bf16, CUDA), every config and split-K, CUDA graphs and torch.compile; RoutedDeltaLinear's fused delta path
+against its loop. GPU only (skipped otherwise); python tests/test_grid_kernel.py also runs it."""
+
+import torch
+
+from shared_delta_moe import DeltaMoE, HierDeltaMoE
+from shared_delta_moe.constants import HAS_TRITON
+from shared_delta_moe.models import grid as Gd
+from shared_delta_moe.models.routed_linear import RoutedDeltaLinear
+from shared_delta_moe import compress as C
+
+GPU = torch.cuda.is_available() and HAS_TRITON
+
+
+def rel(a, b):
+    return ((a - b).abs().max() / b.abs().max()).item()
+
+
+def _module(hier, levels, group, symmetric, hidden=256, inter=384):
+    torch.manual_seed(0)
+    if hier:  # widths 3 (2 + 1 zero) and 4: k1 = 4 pads the first group, dense routing in both
+        m = HierDeltaMoE(hidden, inter, [2, 4], [1, 0], top_k=4, group_top_k=None, device="cuda", dtype=torch.bfloat16)
+    else:
+        m = DeltaMoE(hidden, inter, 5, top_k=2, num_zero_experts=1, device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        for n, p in m.named_parameters():
+            p.normal_(std=0.02 if n.startswith("d_") else (1.0 if "router" in n else 0.05))
+    g = Gd.GridDeltaMoE.from_delta_moe(m, levels, group, symmetric)
+    return g, torch.randn(256, hidden, device="cuda", dtype=torch.bfloat16)
+
+
+CASES = [(False, 4, 128, False), (True, 4, 128, False), (True, 3, 64, True), (False, 4, 32, False)]
+
+
+def test_fused_matches_materialised():
+    if not GPU:
+        print("skipped: no CUDA/Triton")
+        return
+    for case in CASES:
+        g, x = _module(*case)
+        assert g.kernel_ok()
+        for t in (1, 3, 37, 200):
+            with torch.no_grad():
+                got, want = g._forward_param_triton(x[:t]), g._forward_param(x[:t])
+            assert rel(got, want) < 2e-2, (case, t, rel(got, want))
+        with torch.no_grad():  # the module's own forward takes the fused path at these sizes
+            assert g._use_triton(x[:8]) and rel(g(x[:8]), g._forward_param(x[:8])) < 2e-2
+
+
+def test_every_config_and_split_k():
+    if not GPU:
+        print("skipped: no CUDA/Triton")
+        return
+    from shared_delta_moe.triton_kernels import fused as F
+
+    for case in CASES[1:3]:
+        g, x = _module(*case)
+        dg, du, dd = g._kernel_deltas()
+        with torch.no_grad():
+            for t in (1, 37):
+                xs = x[:t]
+                want = g._forward_param(xs)
+                r = F.route(*g.topk(xs), g.n_delta)
+                h_ref = F.gate_up(xs, r, g.gate, g.up, dg, du, F.GATE_UP_CONFIGS[0])
+                for c in F.GATE_UP_CONFIGS:
+                    try:
+                        h = F.gate_up(xs, r, g.gate, g.up, dg, du, c)
+                    except ValueError:
+                        continue
+                    assert rel(h, h_ref) < 2e-2, ("gate_up", case, c, t)
+                for c in F.DOWN_CONFIGS:
+                    for s in (1, 2, 4):
+                        try:
+                            y = F.down(h_ref, r, g.down, dd, c, split_k=s)
+                        except ValueError:
+                            continue
+                        assert rel(y, want) < 2e-2, ("down", case, c, s, t)
+
+
+def test_cuda_graph_and_compile():
+    if not GPU:
+        print("skipped: no CUDA/Triton")
+        return
+    g, x = _module(True, 4, 128, False)
+    xs = x[:8].clone()
+    with torch.no_grad():
+        g._forward_param_triton(xs)
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            g._forward_param_triton(xs)
+        torch.cuda.current_stream().wait_stream(s)
+        cg = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(cg):
+            out = g._forward_param_triton(xs)
+        for _ in range(2):
+            xs.copy_(torch.randn_like(xs))
+            cg.replay()
+            assert rel(out, g._forward_param(xs)) < 2e-2
+        torch._dynamo.reset()
+        f = torch.compile(g._forward_param_triton, fullgraph=True)
+        assert rel(f(x[:37]), g._forward_param(x[:37])) < 2e-2
+
+
+def test_routed_linear_fused():
+    if not GPU:
+        print("skipped: no CUDA/Triton")
+        return
+    torch.manual_seed(0)
+    for levels, group, sym in ((4, 128, False), (3, 64, True)):
+        Cn, R, N, K = 512, 384, 4, 3
+        lin = RoutedDeltaLinear(Cn, R, N, levels, group, sym, device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad():
+            lin.weight.normal_(std=0.05)
+            for e in range(N):
+                q, lo, st = C.quantize(torch.randn(R, Cn, device="cuda") * 0.01, None, levels, group, sym)
+                lin.codes[e], lin.steps[e] = Gd.pack_codes(q, 2), st.bfloat16()
+                if not sym:
+                    lin.lows[e] = lo.bfloat16()
+        for T in (1, 5, 300):
+            idx = torch.randint(0, N + 2, (T, K), device="cuda")  # >= N: no delta
+            r = torch.rand(T, K, device="cuda").softmax(-1)
+            lin.route = (idx, r)
+            x = torch.randn(T, Cn, device="cuda", dtype=torch.bfloat16)
+            with torch.no_grad():
+                assert lin._fused(x, r, idx.numel())
+                got = lin(x)
+            assert not lin._fused(x, r.requires_grad_(True), idx.numel()), "router gradient: the loop"
+            lin.route = (idx, r)
+            want = lin(x)  # the loop (a gradient is needed)
+            want.float().sum().backward()
+            assert r.grad is not None and r.grad.abs().sum() > 0
+            assert rel(got, want.detach()) < 2e-2, (levels, T, rel(got, want.detach()))
+
+
+if __name__ == "__main__":
+    for name, f in list(globals().items()):
+        if name.startswith("test_"):
+            f()
+            print("ok", name)

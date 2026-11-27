@@ -17,13 +17,15 @@ The GEMM kernels are persistent: each program walks tiles (group, row tile, colu
 order, so programs running at the same time share weight and activation tiles in L2. The tile list is derived on
 the device from ``gstart``, which is what lets a whole forward run under a CUDA graph.
 
-Deltas come in three storage modes (``MODE``):
+Deltas come in four storage modes (``MODE``):
 
 - 0: dense, (G, N, K).
 - 1: seeded DARE (``models/dare.py``), the keep bits of each tile read from a 1-bit-per-block mask bitmap and the
   kept values gathered from the packed storage.
 - 2: BitDelta (``models/bitdelta.py``), sign bits expanded to :math:`\pm` scale per tile, the scales one per row or
   per block.
+- 3: group grids (``models/grid.py``), 2-bit codes :math:`q` expanded to :math:`\ell + s q` per tile, one step
+  :math:`s` and lowest level :math:`\ell` per group of entries along K.
 
 On Hopper (sm90+) with dense deltas the weight tiles are loaded with TMA (tensor descriptors), so that address
 arithmetic and masking leave the main loop. Row offsets (row index times row stride) are int64: :math:`h`
@@ -221,6 +223,30 @@ def _bit_delta(b_ptr, s_ptr, s_row, row, k0, K, dmask, MW, SB: tl.constexpr, BN:
     return tl.where(dmask, sign * s, 0.0)
 
 
+@triton.jit
+def _grid_delta(c_ptr, s_ptr, z_ptr, row, k0, K, dmask, MW, SB: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    """Group-grid tile, float32: entry c of a row is z + s q, q the 2-bit code in bits 2 (c % 16) of word c // 16, s / z
+    the step / lowest level of group c // SB (row (BN, 1): the rows' index in (G, N); MW code words, K / SB groups per
+    row; BK a multiple of 16, SB a power of 2)."""
+    W: tl.constexpr = BK // 16
+    wj = k0 // 16 + tl.arange(0, W)[None, :]
+    rm = tl.max(dmask.to(tl.int32), axis=1)[:, None] > 0  # rows with a delta
+    w = tl.load(c_ptr + row * MW + wj, mask=rm & (wj < MW), other=0)  # (BN, W)
+    q = tl.reshape((w[:, :, None] >> (tl.arange(0, 16) * 2)[None, None, :]) & 3, (BN, BK)).to(tl.float32)
+    NB = K // SB
+    if SB >= BK:  # one group for the whole tile
+        s = tl.load(s_ptr + row * NB + k0 // SB, mask=rm, other=0.0).to(tl.float32)  # (BN, 1)
+        z = tl.load(z_ptr + row * NB + k0 // SB, mask=rm, other=0.0).to(tl.float32)
+    else:  # BK / SB groups per row, each repeated over its entries
+        J: tl.constexpr = BK // SB
+        j = k0 // SB + tl.arange(0, J)[None, :]
+        s = tl.load(s_ptr + row * NB + j, mask=rm & (j < NB), other=0.0).to(tl.float32)  # (BN, J)
+        z = tl.load(z_ptr + row * NB + j, mask=rm & (j < NB), other=0.0).to(tl.float32)
+        s = tl.reshape(tl.broadcast_to(s[:, :, None], (BN, J, SB)), (BN, BK))
+        z = tl.reshape(tl.broadcast_to(z[:, :, None], (BN, J, SB)), (BN, BK))
+    return tl.where(dmask, z + s * q, 0.0)
+
+
 # ------------------------------------------------------------------------------------------------ GEMM kernels
 
 
@@ -348,9 +374,12 @@ def _gate_up_kernel(
             elif MODE == 1:
                 dg, rg = _dare_delta(dg_ptr, rg, k0, kk, dmask, mg_ptr, mrow, wg_bits, K // B, B, BN, BK, MWP)
                 du, ru = _dare_delta(du_ptr, ru, k0, kk, dmask, mu_ptr, mrow, wu_bits, K // B, B, BN, BK, MWP)
-            else:  # +-scale is exact in the model dtype, so W_b + delta rounds as in the materialised forward
+            elif MODE == 2:  # +-scale is exact in the model dtype, so W_b + delta rounds as in the materialised forward
                 dg = _bit_delta(dg_ptr, pg_ptr, sg, brow, k0, K, dmask, MW, B, BN, BK).to(wg.dtype)
                 du = _bit_delta(du_ptr, pu_ptr, su, brow, k0, K, dmask, MW, B, BN, BK).to(wu.dtype)
+            else:  # z + s q rounded once to the model dtype, as the materialised forward's addcmul
+                dg = _grid_delta(dg_ptr, pg_ptr, mg_ptr, brow, k0, K, dmask, MW, B, BN, BK).to(wg.dtype)
+                du = _grid_delta(du_ptr, pu_ptr, mu_ptr, brow, k0, K, dmask, MW, B, BN, BK).to(wu.dtype)
             at = tl.trans(a)
             acc_g = tl.dot(wg + dg, at, acc_g)
             acc_u = tl.dot(wu + du, at, acc_u)
@@ -413,8 +442,10 @@ def _down_kernel(
                 dw = _dense_delta(d_ptr, g, cols, kk, dmask, sdg, sdn, sdk)
             elif MODE == 1:
                 dw, run = _dare_delta(d_ptr, run, k0, kk, dmask, m_ptr, mrow, bits, K // B, B, BN, BK, MWP)
-            else:
+            elif MODE == 2:
                 dw = _bit_delta(d_ptr, p_ptr, sc, brow, k0, K, dmask, MW, B, BN, BK).to(w.dtype)
+            else:
+                dw = _grid_delta(d_ptr, p_ptr, m_ptr, brow, k0, K, dmask, MW, B, BN, BK).to(w.dtype)
             acc = tl.dot(w + dw, tl.trans(a), acc)
         pair = tl.load(perm_ptr + rows, mask=rmask, other=0)
         rw = tl.load(rw_ptr + pair, mask=rmask, other=0.0)
@@ -434,12 +465,16 @@ def _down_kernel(
 class Delta(NamedTuple):
     """One projection's deltas as the kernels take them, for G delta experts of (N, K) matrices.
 
-    :ivar mode: Storage mode. 0: dense; 1: seeded DARE (``models/dare.py``); 2: BitDelta (``models/bitdelta.py``).
+    :ivar mode: Storage mode. 0: dense; 1: seeded DARE (``models/dare.py``); 2: BitDelta (``models/bitdelta.py``);
+        3: 2-bit group grids (``models/grid.py``).
     :ivar d: Mode 0: (G, N, K) dense deltas. Mode 1: the packed kept values. Mode 2: (G, N, K / 32) int32 sign bits.
-    :ivar p: Mode 1: (G, N) each row's start in d. Mode 2: (G, N, cdiv(K, block)) scales. Unused in mode 0.
-    :ivar m: Mode 1: (G, N, words) int32, the keep bit of each DARE block (``models/dare.py`` ``mask_bits``). Unused
-        otherwise.
+        Mode 3: (G, N, K / 16) int32 2-bit codes.
+    :ivar p: Mode 1: (G, N) each row's start in d. Mode 2: (G, N, cdiv(K, block)) scales. Mode 3: (G, N, K / block)
+        steps. Unused in mode 0.
+    :ivar m: Mode 1: (G, N, words) int32, the keep bit of each DARE block (``models/dare.py`` ``mask_bits``). Mode 3:
+        (G, N, K / block) lowest levels. Unused otherwise.
     :ivar block: Mode 1: the DARE block size. Mode 2: the entries per scale (a power of 2), 0 for one scale per row.
+        Mode 3: the grid group (a power of 2 dividing K).
     """
 
     mode: int
@@ -459,6 +494,8 @@ class Delta(NamedTuple):
             return self.d, self.d, 0
         if self.mode == 1:
             return self.p, self.m, self.m.shape[-1]  # type: ignore[return-value]
+        if self.mode == 3:
+            return self.p, self.m, self.d.shape[-1]  # type: ignore[return-value]
         return self.p, self.d, self.d.shape[-1]  # type: ignore[return-value]
 
     def mwp(self) -> int:
@@ -693,6 +730,19 @@ def fused_moe_bit(x: Tensor, idx: Tensor, rw: Tensor, wg: Tensor, wu: Tensor, wd
     return fused_moe(x, idx, rw, n_delta, (wg, wu, wd), deltas)  # type: ignore[arg-type]
 
 
+@torch.library.custom_op("shared_delta_moe::fused_moe_grid", mutates_args=())
+def fused_moe_grid(x: Tensor, idx: Tensor, rw: Tensor, wg: Tensor, wu: Tensor, wd: Tensor, cg: Tensor, cu: Tensor,
+                   cd: Tensor, sg: Tensor, su: Tensor, sd: Tensor, zg: Tensor, zu: Tensor, zd: Tensor, n_delta: int,
+                   group: int) -> Tensor:  # fmt: skip
+    deltas = tuple(Delta(3, c, s, z, group) for c, s, z in ((cg, sg, zg), (cu, su, zu), (cd, sd, zd)))
+    return fused_moe(x, idx, rw, n_delta, (wg, wu, wd), deltas)  # type: ignore[arg-type]
+
+
+@fused_moe_grid.register_fake
+def _(x, *args, **kwargs):
+    return x.new_empty(x.shape)
+
+
 @fused_moe_dense.register_fake
 def _(x, *args, **kwargs):
     return x.new_empty(x.shape)  # contiguous, as the op returns (empty_like would keep x's strides)
@@ -713,7 +763,7 @@ def fused_moe_any(x: Tensor, idx: Tensor, rw: Tensor, n_delta: int, base: tuple[
     """``fused_moe``, through the registered op while ``torch.compile`` traces.
 
     Eager calls run ``fused_moe`` directly (skipping the dispatcher); under ``torch.compile`` the forward is one opaque
-    op (``fused_moe_dense``, ``fused_moe_dare`` or ``fused_moe_bit``, by the deltas' mode).
+    op (``fused_moe_dense``, ``fused_moe_dare``, ``fused_moe_bit`` or ``fused_moe_grid``, by the deltas' mode).
 
     Args:
         x: (T, H) tokens.
@@ -731,6 +781,9 @@ def fused_moe_any(x: Tensor, idx: Tensor, rw: Tensor, n_delta: int, base: tuple[
     x = x.contiguous()  # Inductor may hand the op another layout of x than the one it traced
     if deltas[0].mode == 0:
         return fused_moe_dense(x, idx, rw, *base, *(d.d for d in deltas), n_delta)
+    if deltas[0].mode == 3:
+        return fused_moe_grid(x, idx, rw, *base, *(d.d for d in deltas), *(d.p for d in deltas),  # type: ignore[misc]
+                              *(d.m for d in deltas), n_delta, deltas[0].block)  # fmt: skip
     if deltas[0].mode == 2:
         return fused_moe_bit(x, idx, rw, *base, *(d.d for d in deltas), *(d.p for d in deltas), n_delta,  # type: ignore[misc]
                              deltas[0].block, deltas[2].block)  # fmt: skip
