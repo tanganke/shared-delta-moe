@@ -33,8 +33,11 @@ import torch
 from torch import Tensor, nn
 
 from .. import compress as C
+from ..constants import GROUPED_DTYPES, HAS_TRITON
+from ..ops import recompute_saved
 from .delta_moe import DeltaMoE
 from .hier import HierDeltaMoE
+from .moe import grouped_moe
 from .packed import PROJ, PackedDeltaMoE
 
 
@@ -96,6 +99,11 @@ class GridDeltaMoE(PackedDeltaMoE):
     ``DeltaMoE._use_triton``), else the materialised one. Build with ``from_delta_moe``; the constructor leaves the buffers
     uninitialised (``torch.empty``).
 
+    Router training (a gradient needed, every parameter but the router frozen, 2-bit codes, CUDA): every expert decoded
+    in one Triton pass per call (``triton_kernels/decode.py``), then cuBLAS grouped GEMMs (``_forward_decoded``); the
+    decoded weights are rebuilt for the backward, not kept. Other training (trainable grids or base) takes the
+    materialised path.
+
     Args:
         hidden: H, model hidden size.
         inter: I, expert intermediate size.
@@ -141,8 +149,36 @@ class GridDeltaMoE(PackedDeltaMoE):
         """Whether the fused Triton kernels read these grids (mode 3): 2-bit codes, a power-of-2 group."""
         return self.bits == 2 and self.group & (self.group - 1) == 0
 
+    def _router_only(self) -> bool:
+        return all(not p.requires_grad for n, p in self.named_parameters() if n != "router.weight")
+
     def _use_triton(self, x: Tensor) -> bool:
         return self.kernel_ok() and super()._use_triton(x)
+
+    def _use_decoded(self, x: Tensor) -> bool:
+        # x in the weights' dtype, or (an fp32 residual stream) under autocast to it, which the GEMMs would cast to
+        same = x.dtype == self.gate.dtype or (x.is_cuda and torch.is_autocast_enabled("cuda")
+                                              and torch.get_autocast_dtype("cuda") == self.gate.dtype)  # fmt: skip
+        return (self._needs_grad(x) and self.kernel_ok() and self._router_only() and HAS_TRITON and x.is_cuda
+                and self.gate.dtype in GROUPED_DTYPES and same)  # fmt: skip
+
+    def _decoded(self) -> list[Tensor]:
+        """(N + 1, R, C) full weights of every expert per projection, the base last (``decode_grid``)."""
+        from ..triton_kernels.decode import decode_grid
+
+        return [decode_grid(d, getattr(self, n).detach()) for d, n in zip(self._kernel_deltas(), PROJ)]
+
+    def _forward_decoded(self, x: Tensor) -> Tensor:
+        """Router training: the decoded experts (``_decoded``, rebuilt for the backward through ``recompute_saved``
+        rather than kept) and ``moe.grouped_moe``; gradients to x and the routing weights."""
+        idx, r = self.topk(x)
+        ws = self._decoded()
+        with recompute_saved(ws, self._decoded):  # every zero expert -> the base, n_delta
+            return grouped_moe(x.to(ws[0].dtype), idx.clamp(max=self.n_delta), r, *ws).to(x.dtype)
+
+    def forward_param(self, x: Tensor) -> Tensor:
+        """``DeltaMoE.forward_param``, or for router training ``_forward_decoded`` (see the class docstring)."""
+        return self._forward_decoded(x) if self._use_decoded(x) else super().forward_param(x)
 
     def _kernel_deltas(self) -> "tuple[Any, Any, Any]":
         from ..triton_kernels import Delta

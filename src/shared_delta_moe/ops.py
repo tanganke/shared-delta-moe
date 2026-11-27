@@ -1,8 +1,9 @@
 """Stateless building blocks: the SwiGLU MLP, grouping routed rows, one grouped GEMM, and bit packing."""
 
+import contextlib
 import inspect
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
 import torch
@@ -222,3 +223,44 @@ def gmm(a: GroupedRows, w: StackedWeight, offs: GroupEnds) -> GroupedOut:
         (R, out) row i of a times the transposed weight of its group.
     """
     return F.grouped_mm(a, w.mT, offs=offs)
+
+
+@contextlib.contextmanager
+def recompute_saved(ws: "Sequence[torch.Tensor]", recompute: "Callable[[], Sequence[torch.Tensor]]") -> Iterator[None]:
+    """Inside: autograd does not keep the tensors ``ws`` (or views of them) for the backward but a recipe, and
+    ``recompute()`` (no grad; the same tensors in the same order) rebuilds them when the backward needs one, so a
+    training step holds activations, not weights built per call (``DeltaMoE._mlp_remat``, the grid decode). A no-op
+    under other saved-tensor hooks (activation checkpointing, offloading), which already decide what is kept, without
+    grad, or without torch's (private) hook query. The recomputed tensors must equal the originals.
+
+    Args:
+        ws: Contiguous tensors built in the forward (each with its own storage).
+        recompute: Rebuilds them.
+    """
+    top = getattr(torch._C._autograd, "_top_saved_tensors_default_hooks", None)
+    if not torch.is_grad_enabled() or top is None or top(False) is not None:
+        yield
+        return
+    # metadata only: autograd keeps the hooks with every saved tensor, so a closure over ws would keep them alive
+    ptr = {t.untyped_storage().data_ptr(): (i, t.dtype, t.untyped_storage().nbytes()) for i, t in enumerate(ws)}
+    cache: dict[int, torch.Tensor] = {}
+
+    def pack(t: torch.Tensor) -> "torch.Tensor | tuple":
+        # the tensor itself or a view of it (F.linear may save W.t()); ws[i] is contiguous, so offset 0 = same start
+        i, dtype, nbytes = ptr.get(t.untyped_storage().data_ptr(), (-1, None, 0))
+        if i < 0 or t.dtype != dtype or t.untyped_storage().nbytes() != nbytes:
+            return t
+        return i, t.shape, t.stride(), t.storage_offset()
+
+    def unpack(p: "torch.Tensor | tuple") -> torch.Tensor:
+        if isinstance(p, torch.Tensor):
+            return p
+        i, shape, stride, offset = p
+        if i not in cache:
+            with torch.no_grad():
+                cache.update(enumerate(recompute()))
+        return cache.pop(i).as_strided(shape, stride, offset)
+
+    del ws
+    with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+        yield

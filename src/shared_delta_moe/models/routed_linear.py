@@ -15,7 +15,9 @@ attention block, routed like the layer's MoE MLP (``DeltaMoE.topk`` with that ro
 Deltas are dense (``deltas``) or group-grid codes as in ``grid.py`` (``codes``, ``steps``, ``lows``). The forward is
 :math:`W_b x` plus, without a gradient, on CUDA in bf16 / fp16 with 2-bit grids: one fused Triton launch for
 :math:`\sum_i r_i \Delta_{e_i} x` (``triton_kernels/fused.py``'s down kernel, mode 3, over a zero base; no host
-sync). Otherwise a loop over the routed experts with ``index_add`` (differentiable: routers, steps, dense deltas).
+sync). Otherwise a loop over the routed experts with ``index_add`` (differentiable: routers, steps, dense deltas);
+there frozen 2-bit grids are decoded by one Triton pass per expert (``triton_kernels/decode.py``) and rebuilt for the
+backward rather than kept (``ops.recompute_saved``).
 """
 
 import threading
@@ -26,6 +28,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from ..constants import HAS_TRITON
+from ..ops import recompute_saved
 from .grid import code_bits, grid_delta
 
 
@@ -105,6 +108,22 @@ class RoutedDeltaLinear(nn.Linear):
         return grid_delta(self.codes[e], self.steps[e], None if self.symmetric else self.lows[e], self.levels,
                           self.bits)  # fmt: skip
 
+    def _decodable(self, x: Tensor) -> bool:
+        """Frozen 2-bit grids with a power-of-2 group on CUDA: the loop decodes them in Triton (``_decoded``)."""
+        if not (HAS_TRITON and x.is_cuda and self.levels is not None and code_bits(self.levels) == 2):
+            return False
+        frozen = not any(p.requires_grad for p in (self.steps, getattr(self, "lows", self.steps)))
+        return frozen and self.group & (self.group - 1) == 0
+
+    def _decoded(self, e: int) -> Tensor:
+        """:math:`\\Delta_e` as ``delta(e)``, decoded in one Triton pass (no gradient)."""
+        from ..triton_kernels.decode import decode_grid
+        from ..triton_kernels.fused import Delta
+
+        s = self.steps[e : e + 1].detach()
+        z = -s * ((self.levels - 1) / 2) if self.symmetric else self.lows[e : e + 1].detach()  # type: ignore[operator]
+        return decode_grid(Delta(3, self.codes[e : e + 1], s, z, self.group))[0]
+
     FUSED_MAX_ENTRIES = 1 << 28  # (pairs, out) the down kernel writes before the slot sum: 512 MiB in bf16
 
     def _fused(self, x: Tensor, r: Tensor, pairs: int) -> bool:
@@ -145,11 +164,18 @@ class RoutedDeltaLinear(nn.Linear):
         xs, ys = x.reshape(-1, x.shape[-1]), y.reshape(-1, y.shape[-1])
         if self._fused(x, r, idx.numel()):
             return (ys + self._fused_deltas(xs, idx, r)).view(y.shape)
+        dec = self._decodable(x)
         for e in idx.unique().tolist():
             if e >= self.n_delta:
                 continue
             hit = idx == e  # one row per token, its slots on e summed (several slots share a set)
             rows = hit.any(-1).nonzero(as_tuple=True)[0]
             w = (r * hit).sum(-1)[rows, None]
-            ys = ys.index_add(0, rows, (w * F.linear(xs[rows], self.delta(e))).to(ys.dtype))
+            if dec:
+                d = self._decoded(e)
+                with recompute_saved([d], lambda e=e: [self._decoded(e)]):
+                    ys = ys.index_add(0, rows, (w * F.linear(xs[rows], d)).to(ys.dtype))
+                del d
+            else:
+                ys = ys.index_add(0, rows, (w * F.linear(xs[rows], self.delta(e))).to(ys.dtype))
         return ys.view(y.shape)

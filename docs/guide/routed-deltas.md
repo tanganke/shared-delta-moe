@@ -51,7 +51,10 @@ no gradient needed anywhere, the deltas take one fused Triton launch: the MoE do
 `triton_kernels/fused.py`) over a zero base, decoding $\ell + s q$ tile by tile, with no host sync. Otherwise, or past
 $2^{28}$ (pair, output) entries (e.g. `lm_head` over a whole sequence), a loop over the routed experts: `index_add` of
 $r \cdot \Delta_e x$ over that expert's rows, differentiable in the routing weights, the grid steps and lowest
-levels, and dense deltas.
+levels, and dense deltas. In the loop, frozen 2-bit grids with a power-of-2 group (router training) are decoded on
+CUDA by one Triton pass per expert (`triton_kernels/decode.py`). They are then rebuilt for the backward rather than
+kept (`ops.recompute_saved`), which saves about 2.5 GiB per set for a 27B `lm_head`. Trainable grids are unpacked in
+PyTorch.
 
 ## Routing
 
@@ -176,5 +179,5 @@ This is 0.0002-0.0004 above the offline estimate for the same storage. The cause
 $W_b + \Delta_e$ first instead of the two products gives the same numbers.
 
 Inference with 2-bit grids uses the fused kernels (MLP and routed deltas); the timing above is from the earlier
-loop. Training goes through the differentiable loop. [vLLM](vllm.md) serves routed 2-bit deltas, sets included,
+loop. Training goes through the differentiable loop, with frozen grids decoded in Triton (see the forward above). [vLLM](vllm.md) serves routed 2-bit deltas, sets included,
 with tensor parallelism.

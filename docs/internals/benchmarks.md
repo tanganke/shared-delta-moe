@@ -223,6 +223,45 @@ The "none" column predates `DeltaMoE._mlp_remat`. With it (the materialised weig
 
 Compressed experts trained (kept DARE values or BitDelta row scales) with the routers, base frozen, checkpointing, top-2, same model and batch: peak 32.7 GiB (DARE) and 21.3 GiB (BitDelta). Unpacking dominated the step (DARE's `masked_scatter` scan over the dense matrix; BitDelta's `repeat_interleave` of the scales plus several elementwise passes); block scatter and a one-pass sign select (2026-11-27) cut it: DARE trained 1.1 → 0.8 s/step, DARE frozen 0.9 → 0.7, BitDelta 1.1 → 0.9 (top-1 1.0 → 0.8); peaks unchanged.
 
+**2-bit grid deltas, router only** (`GridDeltaMoE._forward_decoded`, [grids](../guide/grid.md#router-training)).
+Setup:
+
+- One Qwen3.5-27B MoE layer: H 5120, I 17408; 14 deltas + 1 zero expert; RTN 2-bit, group 128, asymmetric.
+- bf16 autocast, fp32 router, no checkpointing. H200, 2026-11-27; ms of forward / backward.
+- Configurations: B is one group of 14 deltas at top-2. A is 4 groups of [4, 4, 4, 2] deltas, each with a zero
+  expert, at group top-2; A-top2 picks 2 experts per group and A-soft all 5.
+
+Columns:
+
+- Materialised: each routed expert unpacked in PyTorch, then F.linear.
+- Fused Triton: the mode 3 forward plus `train.py`'s backward extended to read the codes. It was tried and not kept:
+  its backward was the slowest of the three.
+- Decoded: one Triton decode pass, then grouped GEMMs. The decode alone takes 4.9–5.2 ms.
+
+Script: `benchmarks/bench_grid_train.py` (the fused Triton column came from an earlier version of it, with that path).
+
+Whole model: moe27-14-B (Qwen3.5-27B, the MLP grids above, routed 2-bit attention and `lm_head` deltas in 4 sets),
+router-only training with `qwen3-vl-moe/scripts/train_hier_router.py`, about 8.5k tokens per step, activation
+checkpointing, bf16 autocast, 4 H200 (layers split across them), 2026-11-27.
+
+| | s / step | forward s | backward s | peak GiB, GPU 3 (`lm_head`) |
+|---|---:|---:|---:|---:|
+| 6424fe3 (materialised, PyTorch unpack) | 16.5–17.5 | 6.3–7.0 | 10.2–10.6 | 87.3 |
+| decoded (MLP and routed deltas) | 10.2–11.3 | 3.6–4.3 | 6.6–7.1 | 70.5 |
+
+Per-step losses agree to three or four digits. With synchronised per-module timing and random routers (8192 tokens),
+the MoE blocks' forward goes from 3.83 to 0.61 s. The routed deltas (`RoutedDeltaLinear`, a loop over sets with
+host syncs) are then the largest part: 1.3 s forward and about 1.1 s more in the recompute.
+
+| configuration, tokens (pairs) | materialised | fused Triton | **decoded** | peak GiB, materialised / decoded |
+|---|---:|---:|---:|---:|
+| B, 2048 (4096) | 47.3 / 36.5 | 16.1 / 36.9 | **10.7 / 10.3** | 5.1 / 10.0 |
+| B, 10240 (20480) | 60.6 / 61.3 | 60.9 / 143.2 | **23.7 / 24.4** | 5.6 / 13.8 |
+| A-top2, 2048 (8192) | 51.3 / 50.7 | 26.4 / 60.8 | **12.9 / 13.4** | 4.1 / 11.1 |
+| A-top2, 10240 (40960) | 76.1 / 76.9 | 111.6 / 262.5 | **41.8 / 43.2** | 7.8 / 17.3 |
+| A-soft, 2048 (20480) | 59.4 / 59.7 | 55.7 / 129.5 | **22.4 / 23.1** | 5.5 / 13.2 |
+| A-soft, 10240 (102400) | 129.2 / 126.2 | 268.2 / 629.0 | **97.9 / 103.4** | 14.9 / 27.6 |
+
 ## Per implementation, previous kernel (single MoE layer, bf16, eager, ms)
 
 The per-implementation tables below were measured with the previous kernel (5522b23; one launch per projection). Its "param Triton" column is superseded by the section above.

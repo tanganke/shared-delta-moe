@@ -108,13 +108,7 @@ class MoE(nn.Module):
 
     def _forward_grouped(self, x: Tokens) -> Tokens:
         """All (token, slot) pairs sorted by expert, one grouped GEMM per projection."""
-        idx, r = self.topk(x)
-        tok = torch.arange(idx.numel(), device=x.device) // self.top_k  # pair -> token
-        rows, offs = sort_rows(idx.flatten(), self.n_experts)
-        xs = x[tok[rows]]
-        h = F.silu(gmm(xs, self.gate, offs)) * gmm(xs, self.up, offs)
-        o = torch.empty(idx.numel(), x.shape[-1], dtype=x.dtype, device=x.device).index_copy(0, rows, gmm(h, self.down, offs))
-        return (o.view(-1, self.top_k, x.shape[-1]) * r.to(x.dtype)[..., None]).sum(1)
+        return grouped_moe(x, *self.topk(x), self.gate, self.up, self.down)
 
     def forward(self, x: Tensor) -> Tensor:
         """The MoE over tokens of any leading shape: grouped GEMM when ``use_grouped``, else the expert loop.
@@ -128,6 +122,29 @@ class MoE(nn.Module):
         t = x.reshape(-1, x.shape[-1])
         y = self._forward_grouped(t) if use_grouped(t, self.top_k) else self._forward_loop(t)
         return y.view(x.shape)
+
+
+def grouped_moe(x: Tokens, idx: Tensor, r: Tensor, gate: Tensor, up: Tensor, down: Tensor) -> Tokens:
+    """The MoE over (token, slot) pairs sorted by expert, one grouped GEMM per projection.
+
+    Args:
+        x: (T, H) tokens.
+        idx: (T, k) expert per slot, < E.
+        r: (T, k) routing weights.
+        gate: (E, I, H) gate weights.
+        up: (E, I, H) up weights.
+        down: (E, H, I) down weights.
+
+    Returns:
+        (T, H) in x's dtype.
+    """
+    k = idx.shape[1]
+    tok = torch.arange(idx.numel(), device=x.device) // k  # pair -> token
+    rows, offs = sort_rows(idx.flatten(), gate.shape[0])
+    xs = x[tok[rows]]
+    h = F.silu(gmm(xs, gate, offs)) * gmm(xs, up, offs)
+    o = torch.empty(idx.numel(), x.shape[-1], dtype=x.dtype, device=x.device).index_copy(0, rows, gmm(h, down, offs))
+    return (o.view(-1, k, x.shape[-1]) * r.to(x.dtype)[..., None]).sum(1)
 
 
 @functools.cache

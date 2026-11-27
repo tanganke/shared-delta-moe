@@ -12,6 +12,7 @@ from test_delta_moe import make
 
 from shared_delta_moe import DareDeltaMoE
 from shared_delta_moe.constants import HAS_TRITON
+from shared_delta_moe.models.grid import GridDeltaMoE
 
 GPU = torch.cuda.is_available() and HAS_TRITON
 
@@ -29,7 +30,8 @@ def grads(m, x, f, dy):
     return y.detach(), x.grad, named
 
 
-def check(m, t, router_only=False, tol=5e-2, fwd=lambda mod, xx: mod.forward_param(xx)):
+def check(m, t, router_only=False, tol=5e-2, fwd=lambda mod, xx: mod.forward_param(xx), triton=True):
+    """triton False: a grid module's decoded router-training path (GridDeltaMoE._forward_decoded) instead."""
     m.triton_train = True
     torch.manual_seed(1)
     x = torch.randn(t, m.gate.shape[1], dtype=torch.bfloat16, device="cuda")
@@ -40,7 +42,7 @@ def check(m, t, router_only=False, tol=5e-2, fwd=lambda mod, xx: mod.forward_par
     # the reference runs in the same dtype: a float32 router can pick another expert for a token near a tie
     ref_m = copy.deepcopy(m)
     with torch.enable_grad():
-        assert m._use_triton(x.requires_grad_()), "takes the Triton backward"
+        assert m._use_triton(x.requires_grad_()) if triton else m._use_decoded(x.requires_grad_()), "takes the path"
     y, gx, gp = grads(m, x, fwd, dy)
     y0, gx0, gp0 = grads(ref_m, x, lambda mod, xx: mod._forward_param(xx), dy)
     assert rel(y, y0) < tol, ("y", rel(y, y0))
@@ -107,6 +109,50 @@ def test_dare_trains_materialised():
     assert not d._use_triton(x)
     with torch.no_grad():
         assert d._use_triton(x)
+
+
+def test_grid_router_only():
+    """2-bit grid deltas (flat and Hier, asymmetric / symmetric, groups 32 .. 128) with frozen weights train through
+    the decoded experts and grouped GEMMs (GridDeltaMoE._forward_decoded, also under checkpointing): output, dL/dx and
+    the router's gradient match the materialised path; trainable grids or base keep the materialised path."""
+    if not GPU:
+        print("skipped: no CUDA/Triton")
+        return
+
+    def soft(m):  # make's randn router saturates the softmax (router gradients ~1e-24, all rounding)
+        with torch.no_grad():
+            m.router.weight.mul_(0.05)
+        return m
+
+    from torch.utils.checkpoint import checkpoint
+
+    ckpt = lambda mod, xx: checkpoint(mod.forward_param, xx, use_reentrant=False)
+    for z, k in ((1, 2), (3, 6)):
+        m, _, _ = make(z, k, 256, 384, torch.bfloat16, "cuda")
+        soft(m)
+        for levels, group, sym in ((4, 128, False), (4, 32, False), (3, 64, True)):
+            g = GridDeltaMoE.from_delta_moe(m, levels, group, sym)
+            for t in (1, 300):
+                assert list(check(g, t, router_only=True, triton=False)) == ["router.weight"]
+        check(g, 300, router_only=True, triton=False, fwd=ckpt)
+    for k1, k0 in ((2, None), (5, 2)):
+        h, _, _ = hier.make(k1, k0, torch.bfloat16, "cuda", 256, 384, [4, 4, 4, 2], [1, 1, 1, 1])
+        check(GridDeltaMoE.from_delta_moe(soft(h), 4, 128), 300, router_only=True, triton=False)
+    g = GridDeltaMoE.from_delta_moe(m, 4, 128)
+    for n, p in g.named_parameters():
+        p.requires_grad_(n == "router.weight")
+    x = torch.randn(64, 256, device="cuda", requires_grad=True)  # an fp32 residual stream under bf16 autocast
+    with torch.autocast("cuda", torch.bfloat16):
+        assert g._use_decoded(x)
+        y = g(x)
+        with torch.no_grad():
+            y0 = g._forward_param(x)
+    assert y.dtype == torch.float32 and rel(y, y0) < 2e-2
+    y.square().sum().backward()
+    assert x.grad is not None and g.router.weight.grad is not None
+    assert not g._use_decoded(x.detach().requires_grad_())  # fp32 without autocast: the materialised path
+    g.gate.requires_grad_(True)  # trainable base (or grids): the materialised path
+    assert not g._use_decoded(torch.randn(8, 256, dtype=torch.bfloat16, device="cuda", requires_grad=True))
 
 
 def test_hier():

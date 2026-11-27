@@ -52,7 +52,7 @@ from ..constants import (
     TRITON_MAX_PAIRS_OLDER,
     TRITON_MIN_PAIRS,
 )
-from ..ops import gmm, groups, mlp, pow2, replay, softmax_topk, sort_rows, use_grouped
+from ..ops import gmm, groups, mlp, pow2, recompute_saved, replay, softmax_topk, sort_rows, use_grouped
 from ..type_hints import (
     Experts,
     Group,
@@ -294,30 +294,9 @@ class DeltaMoE(nn.Module):
         with ``remat`` False or without torch's (private) hook query. Saves nothing under autocast: F.linear then
         saves its own cast copy, which is kept. Values and gradients are unchanged: the recomputed sum is the same sum."""
         w = self.weights(e)
-        top = getattr(torch._C._autograd, "_top_saved_tensors_default_hooks", None)
-        if not self.remat or e < 0 or not torch.is_grad_enabled() or top is None or top(False) is not None:
+        if not self.remat or e < 0:
             return mlp(x, *w)
-        # metadata only: autograd keeps the hooks with every saved tensor, so a closure over w would keep it alive
-        ptr = {t.untyped_storage().data_ptr(): (i, t.dtype, t.untyped_storage().nbytes()) for i, t in enumerate(w)}
-        cache: dict[int, Tensor] = {}
-
-        def pack(t: Tensor) -> "Tensor | tuple":
-            # the weight itself or a view of it (F.linear may save W.t()); w[i] is contiguous, so offset 0 = same start
-            i, dtype, nbytes = ptr.get(t.untyped_storage().data_ptr(), (-1, None, 0))
-            if i < 0 or t.dtype != dtype or t.untyped_storage().nbytes() != nbytes:
-                return t
-            return i, t.shape, t.stride(), t.storage_offset()
-
-        def unpack(p: "Tensor | tuple") -> Tensor:
-            if isinstance(p, Tensor):
-                return p
-            i, shape, stride, offset = p
-            if i not in cache:
-                with torch.no_grad():
-                    cache.update(enumerate(self.weights(e)))
-            return cache.pop(i).as_strided(shape, stride, offset)
-
-        with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+        with recompute_saved(w, lambda: self.weights(e)):
             return mlp(x, *w)  # w (the only reference left) is freed on return
 
     def _forward_param(self, x: Tokens, min_rows: int = 0) -> Tokens:

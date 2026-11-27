@@ -49,6 +49,23 @@ entry.
 
 Without a gradient, 2-bit grids (3 or 4 levels) with a power-of-2 group run the fused Triton forward, which reads the
 codes directly ([fused Triton kernel](../internals/fused-triton.md), mode 3); other grids, and every forward that
-needs a gradient, run the materialised one. No CUDA (`packed_ops`) kernel reads the codes, and the vLLM plugin takes
+needs a gradient apart from router training (below), run the materialised one. No CUDA (`packed_ops`) kernel reads the codes, and the vLLM plugin takes
 dense deltas only. For tensor parallelism over the intermediate dimension, the group must divide each rank's share of
 it (Qwen3.5-27B, I = 17408 over 8 ranks: 2176 columns, so group 128 or 64, not 256).
+
+## Router training
+
+When a gradient is needed and every parameter except `router.weight` is frozen (2-bit codes, power-of-2 group, CUDA,
+bf16/fp16), `forward_param` runs `_forward_decoded` in two steps:
+
+- One Triton pass (`triton_kernels/decode.py`) decodes every expert into full weights, $W_b + (\ell + s q)$, with
+  the base added as the last expert for the zero experts. Each entry is rounded as the materialised path rounds it.
+- cuBLAS grouped GEMMs (`moe.grouped_moe`) then run over the sorted (token, slot) pairs.
+
+The decoded weights are not kept for the backward. Outside activation checkpointing, `ops.recompute_saved` rebuilds
+them there. Under checkpointing, the recompute decodes again and that layer keeps them until its backward. So a
+training step decodes twice per layer, whatever the number of tokens.
+
+Decoding takes about 5 ms for a 27B layer: 15 experts × 3 projections, 7.5 GiB of bf16 on H200. While a layer runs,
+those weights add to peak memory. A step with trainable grids or base takes the materialised path. Measurements are
+in [benchmarks](../internals/benchmarks.md#training).

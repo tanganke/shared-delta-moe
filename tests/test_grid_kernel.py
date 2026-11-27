@@ -103,6 +103,48 @@ def test_cuda_graph_and_compile():
         assert rel(f(x[:37]), g._forward_param(x[:37])) < 2e-2
 
 
+def test_routed_linear_decoded_loop():
+    """Frozen grids under a gradient: the loop decodes each expert in Triton (and rebuilds it for the backward) and
+    matches the PyTorch-unpacked loop in output and in the x and routing-weight gradients."""
+    if not GPU:
+        print("skipped: no CUDA/Triton")
+        return
+    from torch.utils.checkpoint import checkpoint
+
+    torch.manual_seed(0)
+    for levels, group, sym in ((4, 128, False), (3, 64, True)):
+        Cn, R, N, K, T = 512, 384, 4, 3, 300
+        lin = RoutedDeltaLinear(Cn, R, N, levels, group, sym, device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad():
+            lin.weight.normal_(std=0.05)
+            for e in range(N):
+                q, lo, st = C.quantize(torch.randn(R, Cn, device="cuda") * 0.01, None, levels, group, sym)
+                lin.codes[e], lin.steps[e] = Gd.pack_codes(q, 2), st.bfloat16()
+                if not sym:
+                    lin.lows[e] = lo.bfloat16()
+        lin.requires_grad_(False)
+        idx = torch.randint(0, N + 2, (T, K), device="cuda")
+        r0 = torch.rand(T, K, device="cuda").softmax(-1)
+        x0 = torch.randn(T, Cn, device="cuda", dtype=torch.bfloat16)
+        dy = torch.randn(T, R, device="cuda", dtype=torch.bfloat16)
+        outs = []
+        for dec, ck in ((False, False), (True, False), (True, True)):
+            lin._decodable = (lambda x, d=dec: d) if not dec else RoutedDeltaLinear._decodable.__get__(lin)
+            x, r = x0.clone().requires_grad_(True), r0.clone().requires_grad_(True)
+
+            def f(x, r):
+                lin.route = (idx, r)
+                return lin(x)
+
+            y = checkpoint(f, x, r, use_reentrant=False) if ck else f(x, r)
+            assert lin._decodable(x) == dec
+            y.backward(dy)
+            outs.append((y.detach(), x.grad, r.grad))
+        for got in outs[1:]:
+            for a, b in zip(got, outs[0]):
+                assert rel(a.float(), b.float()) < 1e-2, (levels, rel(a.float(), b.float()))
+
+
 def test_routed_linear_fused():
     if not GPU:
         print("skipped: no CUDA/Triton")
