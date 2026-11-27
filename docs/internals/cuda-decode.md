@@ -63,6 +63,7 @@ kernels instead rebuild $W_b + \Delta_g$ for every routed group.
   even number of them per row, the grid kernels below run instead.
 - Routed deltas ([per-expert attention and lm_head deltas](../guide/routed-deltas.md)), 2-bit grids: the down kernel
   alone, over a zero base product (`packed_ops.routed_matrix`), up to 64 pairs; beyond that the Triton down kernel.
+  For few tokens, `routed_small` instead (below).
 
 ### Grid kernels (`grid_gate_up`, `grid_down`)
 
@@ -111,6 +112,36 @@ block and pass, and DRAM at 10–17% of its bandwidth. On 2B it is at
 `/data/apps/nvhpc/26.3/Linux_x86_64/26.3/profilers/13.1/Nsight_Compute/ncu` and also runs in the Glutton container.
 Moving the address arithmetic out of the block loop gave the last 20%. With many pairs, the per-pair `mma` and fold
 instructions set the time, not DRAM. Past 32 pairs per group, each further pass also decodes the codes again.
+
+### Routed deltas for few tokens (`routed_small`)
+
+A decode step of the 27B model makes about 300 routed-delta calls, one per projection (attention, linear attention,
+`lm_head`), each reading only a few MB of codes. Through `routed_matrix`, each pays about 25 µs of small kernels
+(routing sort, activation gather and interleave, block sums, zero base, slot sum) on top of its own kernel.
+`routed_small` is a single launch without routing. A CTA takes 16 rows of one token and reads the token's slots
+itself. It stages $x_t$ (interleaved) and its block sums in shared memory, and runs the grid kernels' arithmetic
+with the token as B column 0. The other 7 columns are zero, since tensor-core throughput is not the limit here.
+Each slot's routing weight is folded into its scales, so all slots share one accumulator:
+
+$$
+\sum_i r_i \Delta_{e_i} x_t = \sum_i \sum_b \big( 4 r_i s \, P_b + r_i (\ell - 4s) X_b \big) .
+$$
+
+Since every token reads its own experts' codes again, the cost grows with the tokens. `routed_auto` takes it for
+one token, or up to `ROUTED_SMALL_MAX_WORK` (32768) tokens × rows, with groups of 128k and rows a multiple of 16.
+Per call, top-2 over 4 sets, 27B TP=2 shards on H200, CUDA graph timing:
+
+| layer (rows × inputs) | tokens | `routed_matrix` + routing | `routed_small` |
+|---|---:|---:|---:|
+| `lm_head` (124160 × 5120) | 1 | 276 µs | 207 µs |
+| linear attention `in_proj` (8192 × 5120) | 1 | 37.6 µs | 19.2 µs |
+| | 4 | 64.0 µs | 58.7 µs |
+| `out_proj` (5120 × 3072) | 1 | 28.8 µs | 10.7 µs |
+| | 8 | 36.7 µs | 42.2 µs |
+| 64 rows × 5120 | 1–32 | 25–72 µs | 12–13 µs |
+
+A CUDA-core version (one FMA per entry) reached only about 0.9 TB/s on `lm_head`, bound by instruction issue even
+with the 1 + q/4 trick (no int-to-float conversion) and 16-byte code loads.
 
 Qwen3.8-27B shapes at TP=2 on H200 (moe27-14-B: 14 experts top-2 plus one zero expert; routed deltas in 4 sets), per
 decode step, summed over the 64 layers:

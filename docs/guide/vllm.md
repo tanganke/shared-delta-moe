@@ -60,11 +60,11 @@ All are at the base model's own bf16 difference. Checked with vLLM 0.32.0 on H20
 Qwen3.8-27B moe27-14-B (14 experts, top-2, 2-bit grid MLP deltas and 2-bit routed deltas in 4 sets), TP=2 on two
 H200, greedy decode of 256 tokens, answers coherent:
 
-| batch | eager, Triton only | compiled, CUDA graphs, CUDA matrix kernels | same, grid kernels (128-entry groups) |
-|---:|---:|---:|---:|
-| 1 | 7.1 tok/s | 36.5 tok/s | 39.6 tok/s |
-| 16 | 50.3 tok/s | 340 tok/s | 385 tok/s |
-| 64 | 215 tok/s | 527 tok/s | 681 tok/s |
+| batch | eager, Triton only | compiled, CUDA graphs, CUDA matrix kernels | + grid kernels (128-entry groups) | + `routed_small` |
+|---:|---:|---:|---:|---:|
+| 1 | 7.1 tok/s | 36.5 tok/s | 39.6 tok/s | 44.8 tok/s |
+| 16 | 50.3 tok/s | 340 tok/s | 385 tok/s | 418 tok/s |
+| 64 | 215 tok/s | 527 tok/s | 681 tok/s | 688 tok/s |
 
 Run with `SHARED_DELTA_MOE_CUDA_DIR` set (the prebuilt kernels, [CUDA decode kernels](../internals/cuda-decode.md))
 and, at TP > 1, `VLLM_DISABLE_COMPILE_CACHE=1`: a cached compiled artifact had device 0 baked in and failed on rank 1.

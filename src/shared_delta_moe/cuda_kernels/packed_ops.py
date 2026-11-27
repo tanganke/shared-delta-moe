@@ -312,6 +312,43 @@ def matrix_moe_grid(x: Tensor, idx: Tensor, rw: Tensor, wg: Tensor, wu: Tensor, 
     return _matrix(x, idx, rw, n_delta, (wg, wu, wd), deltas)
 
 
+def routed_small_ok(x: Tensor, n_delta: int, d) -> bool:
+    """``routed_small`` takes these: bf16 / fp16 on sm_90 with the library loaded, x_t fitting in shared memory, a
+    2-bit grid (mode 3) of a power-of-2 group of at least 128, rows a multiple of 16, ``n_delta`` deltas, steps and
+    lowest levels in x's dtype, all contiguous."""
+    if not (x.is_cuda and x.dtype in (torch.bfloat16, torch.float16) and x.dim() == 2 and available()):
+        return False
+    cap, smax = _device(x.device.index if x.device.index is not None else torch.cuda.current_device())
+    K = x.shape[1]
+    if cap != (9, 0) or 2 * K + (K // 128 + 3) // 4 * 16 + 2048 > smax:  # sm_90 builds only; x_t in shared memory
+        return False
+    c = d.d
+    if d.mode != 3 or d.block < 128 or d.block & (d.block - 1) or x.shape[1] % d.block or c.shape[0] != n_delta:
+        return False
+    if c.dtype != torch.int32 or c.shape[2] * 16 != x.shape[1] or c.shape[1] % 16:
+        return False
+    if not (c.is_contiguous() and _aligned(c)):
+        return False
+    return all(t is not None and t.dtype == x.dtype and t.is_contiguous() for t in (d.p, d.m))
+
+
+def routed_small(x: Tensor, idx: Tensor, rw: Tensor, d) -> Tensor:
+    r"""Routed deltas of one linear layer for few tokens: :math:`\sum_i r_i \Delta_{e_i} x` per token in one launch that
+    reads the slots itself (no routing sort, gather or slot sum; ``routed_small_kernel``).
+
+    Args:
+        x: (T, C) tokens.
+        idx: (T, k) delta per slot (outside [0, G): none).
+        rw: (T, k) routing weight per slot.
+        d: The (G, R, C) deltas as a mode-3 ``Delta`` for which ``routed_small_ok`` holds.
+
+    Returns:
+        (T, R) in x's dtype.
+    """
+    return torch.ops.sdm_packed.routed_small(x.contiguous(), idx.long().contiguous(), rw.float().contiguous(), d.d,
+                                             d.p, d.m, d.block)  # fmt: skip
+
+
 def routed_matrix(x: Tensor, idx: Tensor, rw: Tensor, n_delta: int, d) -> Tensor:
     r"""Routed deltas of one linear layer, no base (``triton_kernels.fused.routed_deltas``), on the matrix down
     kernel: :math:`\sum_i r_i \Delta_{e_i} x` per token, the deltas' products for the sorted pairs over a zero base

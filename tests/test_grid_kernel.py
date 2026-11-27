@@ -212,7 +212,7 @@ def test_cuda_matrix_matches_triton():
 def test_grid_ops_match_fp32():
     """grid_gate_up / grid_down (packed_ops.matrix_moe, routed_matrix: 2-bit grids factored per 128-entry block)
     against fp32 on the decoded deltas: grid_small_kernel (few pairs) and grid_kernel (2 and 4 pair tiles), bf16
-    and fp16, groups 128 and 256, and routed rows not a multiple of 64."""
+    and fp16, groups 128 and 256, and routed rows not a multiple of 64, also by routed_small (no routing sort)."""
     import torch.nn.functional as F
 
     from shared_delta_moe.cuda_kernels import packed_ops
@@ -256,7 +256,10 @@ def test_grid_ops_match_fp32():
                 idx[:, 0] %= G  # every token some delta (want != 0)
                 rw = torch.rand(T, 2, device=dev)
                 x = torch.randn(T, H, device=dev, dtype=dt)
-                got = packed_ops.routed_matrix(x, idx, rw, G, Delta(3, c, s_, z, group))
+                d = Delta(3, c, s_, z, group)
+                got = packed_ops.routed_matrix(x, idx, rw, G, d)
+                assert packed_ops.routed_small_ok(x, G, d)
+                small = packed_ops.routed_small(x, idx, rw, d)  # no-sort kernel, same sums
                 want = torch.zeros(T, R, device=dev)
                 for t in range(T):
                     for j in range(2):
@@ -264,6 +267,7 @@ def test_grid_ops_match_fp32():
                         if e < G:
                             want[t] += rw[t, j] * (grid_delta(c[e], s_[e], z[e], 4, 2).float() @ x[t].float())
                 assert rel(got, want) < 2e-2, (dt, group, "routed", T, rel(got, want))
+                assert rel(small, want) < 2e-2, (dt, group, "routed_small", T, rel(small, want))
 
 if __name__ == "__main__":
     for name, f in list(globals().items()):

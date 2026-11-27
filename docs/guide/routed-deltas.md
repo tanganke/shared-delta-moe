@@ -48,7 +48,9 @@ The deltas are stored in one of two ways:
 
 The forward is $W_b x$ for all tokens (cuBLAS) plus the routed deltas. With 2-bit grids on CUDA in bf16 / fp16 and
 no gradient needed anywhere, the deltas take one fused Triton launch: the MoE down kernel (mode 3 of
-`triton_kernels/fused.py`) over a zero base, decoding $\ell + s q$ tile by tile, with no host sync. Otherwise, or past
+`triton_kernels/fused.py`) over a zero base, decoding $\ell + s q$ tile by tile, with no host sync. For one token or a
+few, and on H200 with the prebuilt CUDA kernels, one CUDA launch without the routing sort replaces it
+(`routed_small`, [CUDA decode kernels](../internals/cuda-decode.md)). Otherwise, or past
 $2^{28}$ (pair, output) entries (e.g. `lm_head` over a whole sequence), a loop over the routed experts: `index_add` of
 $r \cdot \Delta_e x$ over that expert's rows, differentiable in the routing weights, the grid steps and lowest
 levels, and dense deltas. In the loop, frozen 2-bit grids with a power-of-2 group (router training) are decoded on

@@ -808,15 +808,21 @@ def routed_deltas(x: Tensor, idx: Tensor, rw: Tensor, n_delta: int, d: Delta) ->
 
 
 def routed_auto(x: Tensor, idx: Tensor, rw: Tensor, n_delta: int, d: Delta) -> Tensor:
-    """``routed_deltas``, chosen per call at run time: up to ``ROUTED_MATRIX_MAX_PAIRS`` pairs (decode) the CUDA
-    matrix kernel (``packed_ops.routed_matrix``) where it runs, else the Triton down kernel."""
+    """``routed_deltas``, chosen per call at run time: for few tokens (one, or tokens x rows up to
+    ``ROUTED_SMALL_MAX_WORK``) the no-sort CUDA kernel (``packed_ops.routed_small``); up to
+    ``ROUTED_MATRIX_MAX_PAIRS`` pairs the CUDA matrix kernel (``packed_ops.routed_matrix``); where neither runs, or
+    beyond, the Triton down kernel."""
     from ..cuda_kernels import packed_ops
 
+    T = x.shape[0]
+    if (T == 1 or T * d.d.shape[1] <= ROUTED_SMALL_MAX_WORK) and packed_ops.routed_small_ok(x, n_delta, d):
+        return packed_ops.routed_small(x, idx, rw, d)
     if idx.numel() <= ROUTED_MATRIX_MAX_PAIRS and packed_ops.supports(x, idx.numel(), (None,), (d,), matrix=True):
         return packed_ops.routed_matrix(x, idx, rw, n_delta, d)
     return routed_deltas(x, idx, rw, n_delta, d)
 
 
+ROUTED_SMALL_MAX_WORK = 32768  # tokens x rows; H200, Qwen3.8-27B shards: routed_small wins to here (and at 1 token)
 ROUTED_MATRIX_MAX_PAIRS = 64  # H200, Qwen3.8-27B shards: the matrix kernel wins to 32 pairs, ties at 128 (lm_head loses)
 
 

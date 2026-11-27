@@ -1330,6 +1330,117 @@ at::Tensor grid_down(const at::Tensor& h, const at::Tensor& hs, const at::Tensor
   return o;
 }
 
+// routed_small_kernel: routed deltas (no base) for few tokens, without routing: CTA (16 rows, token t) reads t's slots
+// itself; its 4 warps split K. The arithmetic of grid_kernel (2-bit grids factored per 128-entry block, v = 1 + q / 4
+// on the tensor cores) with t as B column 0 (the other 7 columns zero: tensor-core throughput is not the limit here)
+// and each slot's routing weight r folded into its scales: sum_j r_j Delta_{e_j} x_t in one accumulator. x_t goes to
+// shared memory interleaved as packed_ops._prep does, with its block sums X_b. Out (T, N).
+template <typename T>
+__global__ void __launch_bounds__(128) routed_small_kernel(const T* __restrict__ x, const int64_t* __restrict__ idx,
+                                                           const float* __restrict__ rw, const int* __restrict__ codes,
+                                                           const T* __restrict__ steps, const T* __restrict__ lows,
+                                                           T* __restrict__ out, int N, int K, int G, int k, int sbs) {
+  extern __shared__ __align__(16) unsigned char rsm[];
+  constexpr int KS = 4;
+  const int t = blockIdx.y, nb = K >> 7, nsb = K >> sbs, W = K / 16;
+  T* xp = reinterpret_cast<T*>(rsm);                   // (K) x_t, x'[16 w + 2 i + j] = x[16 w + i + 8 j]
+  float* xb = reinterpret_cast<float*>(rsm + 2 * K);   // (nb) X_b
+  float4* red = reinterpret_cast<float4*>(xb + nb + (-(nb) & 3));  // (KS, 32) partials
+  for (int c = threadIdx.x; c < K; c += 128) {
+    const int w = c >> 4, i = (c & 15) >> 1, jj = c & 1;
+    xp[c] = x[(long long)t * K + 16 * w + i + 8 * jj];
+  }
+  for (int b = threadIdx.x / 32; b < nb; b += 4) {  // a warp per block sum
+    float v = 0.f;
+    for (int c = threadIdx.x % 32; c < 128; c += 32) v += to_f(x[(long long)t * K + (b << 7) + c]);
+#pragma unroll
+    for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    if (threadIdx.x % 32 == 0) xb[b] = v;
+  }
+  __syncthreads();
+  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, r0 = lane >> 2, q = lane & 3, n0 = blockIdx.x * 16;
+  const int per = (nb + KS - 1) / KS, b_lo = min(nb, warp * per), b_hi = min(nb, b_lo + per);
+  const bool col0 = r0 == 0;  // B column 0 (the token) is lanes 0..3's
+  float acc[4] = {};
+  for (int j = 0; j < k; j++) {
+    const int64_t e = idx[(long long)t * k + j];
+    if (e < 0 || e >= G) continue;  // no delta (uniform)
+    const float r = rw[(long long)t * k + j];
+    const long long row0 = e * N + n0 + r0, row1 = row0 + 8;
+    const uint2* cw = reinterpret_cast<const uint2*>(codes);
+    for (int b = b_lo; b < b_hi; b++) {
+      const uint2 w0 = __ldg(cw + ((row0 * W + 8 * b) >> 1) + q), w1 = __ldg(cw + ((row1 * W + 8 * b) >> 1) + q);
+      const int si = (b << 7) >> sbs;
+      const float s0 = 4.f * r * to_f(steps[row0 * nsb + si]), s1 = 4.f * r * to_f(steps[row1 * nsb + si]);
+      const float z0 = r * to_f(lows[row0 * nsb + si]) - s0, z1 = r * to_f(lows[row1 * nsb + si]) - s1;
+      unsigned a0[16], a1[16];
+      dec8<T>(w0.x, a0), dec8<T>(w0.y, a0 + 8), dec8<T>(w1.x, a1), dec8<T>(w1.y, a1 + 8);
+      unsigned bx[16] = {};
+      if (col0) {
+        const uint4* v = reinterpret_cast<const uint4*>(xp + (b << 7) + 32 * q);
+#pragma unroll
+        for (int u = 0; u < 4; u++) {
+          const uint4 vv = v[u];
+          bx[4 * u] = vv.x, bx[4 * u + 1] = vv.y, bx[4 * u + 2] = vv.z, bx[4 * u + 3] = vv.w;
+        }
+      }
+      float P[4] = {};
+#pragma unroll
+      for (int m = 0; m < 8; m++) {
+        const int w = m >> 2, i0 = 2 * (m & 3), i1 = i0 + 1;
+        Ty<T>::mma(P, a0[8 * w + i0], a1[8 * w + i0], a0[8 * w + i1], a1[8 * w + i1], bx[8 * w + i0], bx[8 * w + i1]);
+      }
+      const float X = xb[b];
+      acc[0] += s0 * P[0] + z0 * X, acc[2] += s1 * P[2] + z1 * X;  // (column 0: q == 0's c0, c2)
+    }
+  }
+  red[warp * 32 + lane] = make_float4(acc[0], 0.f, acc[2], 0.f);
+  __syncthreads();
+  if (warp == 0 && q == 0) {
+    float y0 = 0.f, y1 = 0.f;
+    for (int w = 0; w < KS; w++) y0 += red[w * 32 + lane].x, y1 += red[w * 32 + lane].z;  // fixed order
+    out[(long long)t * N + n0 + r0] = Ty<T>::of(y0), out[(long long)t * N + n0 + r0 + 8] = Ty<T>::of(y1);
+  }
+}
+
+at::Tensor routed_small(const at::Tensor& x, const at::Tensor& idx, const at::Tensor& rw, const at::Tensor& codes,
+                        const at::Tensor& steps, const at::Tensor& lows, int64_t block) {
+  c10::cuda::CUDAGuard guard(x.device());
+  const bool bf = x.scalar_type() == at::kBFloat16;
+  TORCH_CHECK(bf || x.scalar_type() == at::kHalf, "sdm_packed: routed_small x bf16 / fp16");
+  TORCH_CHECK(x.dim() == 2 && x.is_contiguous() && idx.dim() == 2 && idx.size(0) == x.size(0) &&
+                  idx.scalar_type() == at::kLong && idx.is_contiguous() && rw.sizes() == idx.sizes() &&
+                  rw.scalar_type() == at::kFloat && rw.is_contiguous(), "sdm_packed: routed_small x, idx, rw");
+  const int64_t K = x.size(1), G = codes.size(0), N = codes.size(1);
+  TORCH_CHECK(block % 128 == 0 && (block & (block - 1)) == 0 && K % block == 0 && N % 16 == 0,
+              "sdm_packed: routed_small groups a power of 2 >= 128, N % 16");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(codes.data_ptr()) % 16 == 0, "sdm_packed: routed_small codes aligned");
+  TORCH_CHECK(codes.dim() == 3 && codes.size(2) * 16 == K && codes.scalar_type() == at::kInt && codes.is_contiguous(),
+              "sdm_packed: routed_small codes (G, N, K / 16) int32");
+  for (const at::Tensor* s : {&steps, &lows})
+    TORCH_CHECK(s->sizes() == at::IntArrayRef({G, N, K / block}) && s->scalar_type() == x.scalar_type() &&
+                    s->is_contiguous(), "sdm_packed: routed_small steps / lows (G, N, K / group)");
+  for (const at::Tensor* a : {&idx, &rw, &codes, &steps, &lows})
+    TORCH_CHECK(a->is_cuda() && a->device() == x.device(), "sdm_packed: routed_small tensors on x's device");
+  at::Tensor o = at::empty({x.size(0), N}, x.options());
+  if (!o.numel()) return o;
+  const int smem = int(2 * K + (K / 128 + 3) / 4 * 16 + 4 * 32 * 16);
+  const dim3 grid(N / 16, x.size(0));
+  const int sbs = __builtin_ctzll(block);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto go = [&](auto* tag) {
+    using T = std::remove_pointer_t<decltype(tag)>;
+    C10_CUDA_CHECK(cudaFuncSetAttribute(routed_small_kernel<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    routed_small_kernel<T><<<grid, 128, smem, stream>>>(
+        reinterpret_cast<const T*>(x.data_ptr()), idx.data_ptr<int64_t>(), rw.data_ptr<float>(), codes.data_ptr<int>(),
+        reinterpret_cast<const T*>(steps.data_ptr()), reinterpret_cast<const T*>(lows.data_ptr()),
+        reinterpret_cast<T*>(o.data_ptr()), int(N), int(K), int(G), int(idx.size(1)), sbs);
+  };
+  bf ? go((__nv_bfloat16*)nullptr) : go((__half*)nullptr);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return o;
+}
+
 }  // namespace
 
 TORCH_LIBRARY(sdm_packed, lib) {
@@ -1357,4 +1468,6 @@ TORCH_LIBRARY(sdm_packed, lib) {
       "grid_down(Tensor h, Tensor hs, Tensor perm, Tensor gstart, Tensor rw, Tensor d0, Tensor d, Tensor p, Tensor m, "
       "int block, int topk) -> Tensor",
       &grid_down);
+  lib.def("routed_small(Tensor x, Tensor idx, Tensor rw, Tensor codes, Tensor steps, Tensor lows, int block) -> Tensor",
+          &routed_small);
 }
