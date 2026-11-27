@@ -86,7 +86,8 @@ main (pull requests build only).
 - User guide (`docs/guide/`): [deltamoe.md](docs/guide/deltamoe.md) (the delta form, zero experts, storage),
   [hier.md](docs/guide/hier.md) (two-level routing), [moe.md](docs/guide/moe.md) (the plain MoE / HierMoE, `to_moe()`), [delta-formats.md](docs/guide/delta-formats.md) with
   [dare.md](docs/guide/dare.md) and [bitdelta.md](docs/guide/bitdelta.md), [qwen3_5.md](docs/guide/qwen3_5.md)
-  (converting Qwen3.5 models), [vllm.md](docs/guide/vllm.md), [training.md](docs/guide/training.md)
+  (converting Qwen3.5 models), [vllm.md](docs/guide/vllm.md), [training.md](docs/guide/training.md),
+  [router-training.md](docs/guide/router-training.md) (what worked when training routers)
 - Internals (`docs/internals/`): [dispatch.md](docs/internals/dispatch.md) (which forward runs when),
   [kernels.md](docs/internals/kernels.md) with [fused-triton.md](docs/internals/fused-triton.md),
   [cuda-decode.md](docs/internals/cuda-decode.md) and [dense-prefill.md](docs/internals/dense-prefill.md),
