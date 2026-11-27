@@ -48,7 +48,9 @@ class HierDeltaMoE(DeltaMoE):
         inter: :math:`I`, the MLP intermediate width.
         group_sizes: :math:`E_i`, the number of delta experts in each group (:math:`G` = ``len(group_sizes)``, :math:`G > 0`).
         group_zeros: :math:`Z_i \ge 0`, the number of zero experts in each group (same length as ``group_sizes``).
-        top_k: :math:`k_1`, experts picked per group, :math:`1 \le k_1 \le \min_i (E_i + Z_i)`.
+        top_k: :math:`k_1`, experts picked per group, :math:`1 \le k_1 \le \max_i (E_i + Z_i)`; in a group narrower
+            than :math:`k_1` the extra slots are padding, a base slot of weight 0 (:math:`k_1 = \max_i (E_i + Z_i)`:
+            dense routing within every group).
         group_top_k: :math:`k_0`, groups picked per token, :math:`1 \le k_0 \le G`; None = dense (soft) routing over
             all groups.
         device: device of the parameters.
@@ -68,7 +70,7 @@ class HierDeltaMoE(DeltaMoE):
     ) -> None:
         G = len(group_sizes)
         assert G == len(group_zeros) and G > 0 and min(group_zeros) >= 0
-        assert 1 <= top_k <= min(e + z for e, z in zip(group_sizes, group_zeros))
+        assert 1 <= top_k <= max(e + z for e, z in zip(group_sizes, group_zeros))
         assert group_top_k is None or 1 <= group_top_k <= G
         super().__init__(hidden, inter, sum(group_sizes), 1, 1, device, dtype)  # router replaced below
         factory: dict[str, Any] = {"device": device, "dtype": dtype}

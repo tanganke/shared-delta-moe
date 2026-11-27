@@ -215,7 +215,7 @@ class HierMoE(MoE):
         dtype: torch.dtype | None = None,
     ) -> None:
         G = len(group_sizes)
-        assert G > 0 and 1 <= top_k <= min(group_sizes)
+        assert G > 0 and 1 <= top_k <= max(group_sizes)  # narrower groups pad (weight 0), as HierDeltaMoE
         assert group_top_k is None or 1 <= group_top_k <= G
         super().__init__(hidden, inter, sum(group_sizes), top_k, device, dtype)  # router replaced below
         self.group_sizes, self.k1, self.group_top_k = list(group_sizes), top_k, group_top_k

@@ -47,6 +47,8 @@ class VllmHierDeltaMoeBlock(HierDeltaMoE):
 
         tp, rank = get_tensor_model_parallel_world_size(), get_tensor_model_parallel_rank()
         c, inter = config.hier_delta_moe, config.intermediate_size
+        assert c.get("levels") is None, "vllm_plugin: grid MLP deltas (hier_delta_moe.levels) not supported yet"
+        assert getattr(config, "routed_deltas", None) is None, "vllm_plugin: routed_deltas not supported yet"
         assert inter % tp == 0, f"intermediate_size {inter} does not split over {tp} ranks"
         super().__init__(config.hidden_size, inter // tp, c["group_sizes"], c["group_zeros"], c["top_k"],
                          c.get("group_top_k"))  # fmt: skip

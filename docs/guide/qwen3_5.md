@@ -77,7 +77,8 @@ on three Qwen3.8-27B experts, a shared attention, linear attention and `lm_head`
 
 ```bash
 python -m shared_delta_moe.models.qwen3_5.qwen3_5_hier_delta_moe.convert BASE DST --group ... \
-    --routed-deltas [--routed-levels 4 --routed-group 128 [--routed-symmetric]]
+    --routed-deltas [--routed-levels 4 --routed-group 128 [--routed-symmetric]] [--routed-sets 4,4,4,2] \
+    [--levels 4 --grid-group 128 [--symmetric]]
 ```
 
 Every attention projection (`q_proj`, `k_proj`, `v_proj`, `o_proj`), linear-attention projection (`in_proj_qkv`,
@@ -98,7 +99,21 @@ routers start at zero, like the MLP's.
 
 Embeddings, norms and the linear attention's `conv1d`, `A_log` and `dt_bias` stay shared (`--merge`; the base itself
 with `--merge task_arithmetic --merge-arg scaling_factor=0`): on the 27B experts sharing them costs little, sharing
-`lm_head` does not. The text config gets `routed_deltas` (`levels`, null for dense; `group`; `symmetric`), which
-both Qwen3.5 integrations read. The forward loops over the routed experts (no fused kernel yet).
+`lm_head` does not. The text config gets `routed_deltas` (`levels`, null for dense; `group`; `symmetric`; `sets`),
+which both Qwen3.5 integrations read.
+
+`--routed-sets` gives consecutive experts (in expert order) one routed delta, the mean of theirs, e.g. one per data
+domain when each domain has several fine-tunes: $S$ sets store $S$ deltas instead of $N$. A token's routing weight on
+a set is the sum of its slots' weights on the set's experts,
+
+$$
+y_t = W_b x_t + \sum_i r_i \, \bar\Delta_{s(e_i)} x_t ,
+$$
+
+with $s(e)$ the set of expert $e$ and $\bar\Delta_s$ its mean delta.
+
+`--levels` stores the MLP deltas as group grids too (round to nearest, [group grids](grid.md)); the config's
+`hier_delta_moe` gets `levels`, `group`, `symmetric`, and the model builds `Qwen3_5GridHierDeltaMoeBlock`
+(a `GridHierDeltaMoE`; no fused kernel reads the codes yet, every forward is the materialised one). The forward loops over the routed experts (no fused kernel yet).
 `tests/test_routed_linear.py` checks the layer against per-token weight mixing, and a converted tiny model routed to
 one expert against that fine-tune.

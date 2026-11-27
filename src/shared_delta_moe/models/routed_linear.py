@@ -57,6 +57,7 @@ class RoutedDeltaLinear(nn.Linear):
         super().__init__(in_features, out_features, bias=False, device=device, dtype=dtype)
         f: dict[str, Any] = {"device": device, "dtype": dtype}
         self.n_delta, self.levels, self.group, self.symmetric, self.route = n_delta, levels, group, symmetric, None
+        self.sets: list[int] | None = None  # set by models/qwen3_5/common.py when routed deltas are shared by sets
         shape = (n_delta, out_features, in_features)
         if levels is None:
             self.deltas = nn.Parameter(torch.empty(shape, **f))

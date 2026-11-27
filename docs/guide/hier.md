@@ -8,7 +8,8 @@ group may hold only zero experts. "Shared" is the storage: $W_b$ once per layer,
 - Group router: $h = \mathrm{softmax}(R_0 x)$ over the $G$ groups; dense / soft (`group_top_k=None`: every group,
   weight $h_i$) or top-$k_0$ renormalised over the chosen groups.
 - Within group $i$: softmax over its $E_i+Z_i$ logits, top-$k_1$ (`top_k`), renormalised within the group; zero
-  experts compete like the others.
+  experts compete like the others. $k_1$ may reach the widest group's $E_i+Z_i$: a narrower group's extra slots are
+  padding (the base, weight 0), and $k_1 = \max_i (E_i+Z_i)$ is dense routing within every group.
 
 $$
 y = \sum_{i \in S(x)} h_i(x) \sum_{j \in \text{top-}k_1} \tilde p_{ij}(x)\, \mathrm{MLP}(x; W_b+\Delta_{ij}),

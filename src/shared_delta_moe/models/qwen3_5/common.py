@@ -2,11 +2,12 @@
 transformers decoder-layer patch, and safetensors checkpoint I/O for the converters. (vLLM's decoder layer has another
 constructor; ``vllm_plugin.py`` patches it on its own.)
 
-A text config with ``routed_deltas: {levels, group, symmetric}`` (levels null = dense deltas) also gives every
+A text config with ``routed_deltas: {levels, group, symmetric, sets}`` (levels null = dense deltas) also gives every
 attention and linear-attention projection and ``lm_head`` per-expert deltas (``routed_linear.RoutedDeltaLinear``):
 each attention block gets a ``delta_router`` (shaped like its layer's MoE router, routed the same way), ``lm_head``
-one routed like the last layer's MoE. Embeddings, norms and the linear attention's conv1d / ``A_log`` / ``dt_bias``
-stay shared."""
+one routed like the last layer's MoE. ``sets`` (optional): consecutive counts of the MoE's delta experts, in order,
+that share one routed delta (the converter stores their mean); a token's slots then map expert -> set, and slots on
+one set add up. Embeddings, norms and the linear attention's conv1d / ``A_log`` / ``dt_bias`` stay shared."""
 
 import functools
 import json
@@ -52,15 +53,26 @@ def patch_decoder_layer(layer: type, field: str, block: Callable[[Any], Any]) ->
 
 def _routed(old: nn.Linear, n_delta: int, c: dict[str, Any]) -> RoutedDeltaLinear:
     assert old.bias is None, "routed deltas on a biased projection"
+    sets = c.get("sets")
+    assert sets is None or sum(sets) == n_delta, f"routed sets {sets} for {n_delta} delta experts"
     w = old.weight
-    return RoutedDeltaLinear(old.in_features, old.out_features, n_delta, c.get("levels"), c.get("group", 128),
+    lin = RoutedDeltaLinear(old.in_features, old.out_features, len(sets) if sets else n_delta, c.get("levels"),
+                             c.get("group", 128),
                              c.get("symmetric", False), w.device, w.dtype)  # fmt: skip
+    lin.sets = sets
+    return lin
 
 
 def _set_route(layer: Any, lins: list[RoutedDeltaLinear], module: nn.Module, args: tuple, kwargs: dict) -> None:
     x = kwargs["hidden_states"] if "hidden_states" in kwargs else args[0]
     x = x.reshape(-1, x.shape[-1]).to(module.delta_router.weight.device)  # (accelerate moves inputs after the hook)
-    route = layer.mlp.topk(x, module.delta_router)  # the layer's MoE at call time
+    idx, r = layer.mlp.topk(x, module.delta_router)  # the layer's MoE at call time
+    if lins[0].n_delta != layer.mlp.n_delta:  # sets: delta expert -> its set; zero experts / base stay >= n_delta
+        n = layer.mlp.n_delta
+        table = torch.repeat_interleave(torch.arange(lins[0].n_delta, device=idx.device),
+                                        torch.tensor(lins[0].sets, device=idx.device))  # fmt: skip
+        idx = torch.where(idx < n, table[idx.clamp(max=n - 1)], lins[0].n_delta)
+    route = idx, r
     for lin in lins:
         lin.route = route
 
