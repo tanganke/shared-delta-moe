@@ -312,7 +312,8 @@ def _pruner(tiles: int):
 _KEY = ["N", "K", "P_BUCKET", "TOPK", "MODE", "B", "S", "TMA"]
 
 
-@triton.autotune(configs=GATE_UP_CONFIGS, key=_KEY, prune_configs_by={"early_config_prune": _pruner(4)})
+@triton.autotune(configs=GATE_UP_CONFIGS, key=_KEY, prune_configs_by={"early_config_prune": _pruner(4)},
+                 cache_results=True)  # fmt: skip
 @triton.jit
 def _gate_up_kernel(
     x_ptr, perm_ptr, gstart_ptr, wg_ptr, wu_ptr, dg_ptr, du_ptr, pg_ptr, pu_ptr, mg_ptr, mu_ptr, h_ptr,
@@ -394,7 +395,7 @@ def _gate_up_kernel(
 
 
 @triton.autotune(configs=DOWN_CONFIGS, key=_KEY, prune_configs_by={"early_config_prune": _pruner(2)},
-                 reset_to_zero=["o_ptr"])  # fmt: skip
+                 reset_to_zero=["o_ptr"], cache_results=True)  # fmt: skip
 @triton.jit
 def _down_kernel(
     h_ptr, perm_ptr, gstart_ptr, rw_ptr, w_ptr, d_ptr, p_ptr, m_ptr, o_ptr,
@@ -570,7 +571,12 @@ def _desc(t: Tensor) -> TensorDescriptor:
 
 
 def _bucket(P: int) -> int:
-    return triton.next_power_of_2(P)
+    """Autotune key for P pairs: powers of 4 from 16, so a server meets few new keys after its warmup (each new key
+    tunes every config, seconds to minutes per projection shape)."""
+    b = 16
+    while b < P:
+        b *= 4
+    return b
 
 
 def _launch(kernel, grid, config: triton.Config | None, *args, **kw):

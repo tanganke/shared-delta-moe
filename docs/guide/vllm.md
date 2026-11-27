@@ -68,3 +68,9 @@ H200, greedy decode of 256 tokens, answers coherent:
 
 Run with `SHARED_DELTA_MOE_CUDA_DIR` set (the prebuilt kernels, [CUDA decode kernels](../internals/cuda-decode.md))
 and, at TP > 1, `VLLM_DISABLE_COMPILE_CACHE=1`: a cached compiled artifact had device 0 baked in and failed on rank 1.
+
+The fused Triton kernels autotune on the first batch of each new size class (pair count rounded up to a power of
+4), which takes minutes for a large model; results then stay in `TRITON_CACHE_DIR` for later runs. vLLM's warmup
+covers the decode sizes, but a first long prefill can still tune past `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` (300 s),
+which kills the engine: set it to 3600 for a first run, or set `SHARED_DELTA_MOE_AUTOTUNE=0` (first fitting config,
+no tuning).
