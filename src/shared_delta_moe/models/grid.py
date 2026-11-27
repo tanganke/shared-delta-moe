@@ -155,10 +155,10 @@ class GridDeltaMoE(PackedDeltaMoE):
             out.append(Delta(3, getattr(self, f"c_{n}"), s, z, self.group))
         return tuple(out)  # type: ignore[return-value]
 
-    # no CUDA (packed_ops) kernel reads the codes
+    MATRIX_FORWARD_PAIRS = 1024  # the CUDA matrix kernel (mode 3) up to packed_ops.MATRIX_MAX_PAIRS
 
     def _matrix_cuda(self, x: Tensor) -> bool:
-        return False
+        return self.kernel_ok() and super()._matrix_cuda(x)
 
     @classmethod
     @torch.no_grad()

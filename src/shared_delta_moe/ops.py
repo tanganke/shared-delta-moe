@@ -1,5 +1,10 @@
 """Stateless building blocks: the SwiGLU MLP, grouping routed rows, one grouped GEMM, and bit packing."""
 
+import inspect
+import weakref
+from collections.abc import Callable
+from typing import Any
+
 import torch
 import torch.nn.functional as F
 
@@ -67,18 +72,89 @@ def mlp(x: Tokens, gate: InWeight, up: InWeight, down: OutWeight) -> Tokens:
     return F.linear(F.silu(F.linear(x, gate)) * F.linear(x, up), down)
 
 
-def softmax_topk(logits: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+def softmax_topk(logits: torch.Tensor, k: int, pick: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     """Top-k routing: float32 softmax (as transformers' MoE routers; bf16 can flip near-ties), top-k, renormalised.
 
     Args:
         logits: (T, E) router output.
         k: experts picked per token.
+        pick: (T, k) indices to use instead of the top-k (``replay``); None = the top-k.
 
     Returns:
         (idx, r): idx (T, k) int64 expert indices; r (T, k) float32 weights, rows summing to 1.
     """
-    r, i = logits.softmax(-1, dtype=torch.float).topk(k, dim=-1)
+    p = logits.softmax(-1, dtype=torch.float)
+    i = p.topk(k, dim=-1).indices if pick is None else pick
+    r = p.gather(-1, i)
     return i, r / r.sum(-1, keepdim=True)
+
+
+_PICKS: "weakref.WeakKeyDictionary[Any, dict[Any, Any]]" = weakref.WeakKeyDictionary()
+
+
+def _checkpoint_frame() -> tuple[Any, Any] | None:
+    """The non-reentrant ``torch.utils.checkpoint`` call this code runs in, from torch's own saved-tensor hooks
+    (private: the forward's pack hook closes over ``frame``, the recompute's over ``target_frame_ref`` and ``gid``,
+    its graph task): (frame, None) in the forward, (frame, gid) in a recompute; None outside one (or when torch's
+    internals differ)."""
+    top = getattr(torch._C._autograd, "_top_saved_tensors_default_hooks", None)
+    hooks = top(False) if top is not None else None
+    if not hooks:
+        return None
+    pack = inspect.unwrap(hooks[0])  # the recompute's is wrapped by torch._dynamo.disable
+    if not getattr(pack, "__qualname__", "").startswith(("_checkpoint_hook.", "_recomputation_hook.")):
+        return None  # another library's hooks
+    cells = dict(zip(pack.__code__.co_freevars, pack.__closure__ or ()))
+    if "frame" in cells:
+        return cells["frame"].cell_contents, None
+    if "target_frame_ref" in cells and "gid" in cells:
+        frame = cells["target_frame_ref"].cell_contents()
+        return (frame, cells["gid"].cell_contents) if frame is not None else None
+    return None
+
+
+def replay(router: torch.nn.Module, logits: torch.Tensor, pick: Callable[[], Any]) -> Any:
+    """The routing decision ``pick()`` (indices, no gradient), recompute-safe under activation checkpointing.
+
+    A checkpointed block recomputes its forward during backward, from inputs that need not be bitwise equal (atomic
+    adds, non-deterministic kernels); a near-tie can then flip a top-k pick, change how many tokens an expert gets
+    and fail the recompute (``CheckpointError``) or silently mismatch the gradients. So inside a non-reentrant
+    checkpoint the forward keeps each router's picks on the checkpoint's own frame (freed with it), and every
+    recompute (one per backward, ``retain_graph`` included) replays them in call order, whatever order the backwards
+    run in; the weights are still recomputed from the logits, so the router gets its gradient. Elsewhere (no
+    checkpoint, reentrant checkpoints, inference, torch.compile) it is ``pick()``.
+
+    Args:
+        router: The router module.
+        logits: Its output for these tokens.
+        pick: Computes the picks from the logits.
+
+    Returns:
+        The picks: this forward's, or in a recompute the forward's.
+
+    Raises:
+        RuntimeError: For a checkpoint nested in a recomputed checkpoint (not supported).
+    """
+    if torch.compiler.is_compiling() or not torch.is_grad_enabled():
+        return pick()
+    at = _checkpoint_frame()
+    if at is None:
+        return pick()
+    frame, gid = at
+    state = _PICKS.setdefault(frame, {"calls": {}, "read": {}})
+    calls = state["calls"].setdefault(id(router), [])
+    if gid is None:
+        if torch._C._current_graph_task_id() != -1:
+            raise RuntimeError("ops.replay: a checkpoint nested in a recomputed checkpoint would route afresh")
+        calls.append((logits.shape[0], pick()))
+        return calls[-1][1]
+    key = (gid, id(router))
+    n = state["read"].get(key, 0)
+    if n >= len(calls):
+        return pick()
+    state["read"][key] = n + 1
+    t, p = calls[n]
+    return p if t == logits.shape[0] else pick()
 
 
 def use_grouped(x: Tokens, top_k: int) -> bool:

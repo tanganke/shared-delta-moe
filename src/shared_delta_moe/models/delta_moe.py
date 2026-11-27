@@ -52,7 +52,7 @@ from ..constants import (
     TRITON_MAX_PAIRS_OLDER,
     TRITON_MIN_PAIRS,
 )
-from ..ops import gmm, groups, mlp, pow2, softmax_topk, sort_rows, use_grouped
+from ..ops import gmm, groups, mlp, pow2, replay, softmax_topk, sort_rows, use_grouped
 from ..type_hints import (
     Experts,
     Group,
@@ -214,7 +214,8 @@ class DeltaMoE(nn.Module):
         """Route tokens: top-k router indices and their renormalised weights.
 
         Float32 softmax and renormalisation, as transformers' MoE routers do (bf16 can flip near-ties). Every forward
-        routes through this one call, so they all pick the same experts, ties included.
+        routes through this one call, so they all pick the same experts, ties included; an activation-checkpoint
+        recompute reuses the forward's picks (``ops.replay``).
 
         Args:
             x: (T, H) tokens.
@@ -225,7 +226,10 @@ class DeltaMoE(nn.Module):
             A tuple (idx, r): idx (T, K) int64 router index per slot (>= ``n_delta``: a zero expert); r (T, K) float32
             routing weights, each row renormalised to sum to 1.
         """
-        return softmax_topk((self.router if router is None else router)(x), self.top_k)
+        router = self.router if router is None else router
+        logits = router(x)
+        pick = replay(router, logits, lambda: softmax_topk(logits.detach(), self.top_k)[0])
+        return softmax_topk(logits, self.top_k, pick)
 
     def route(self, x: Tokens) -> tuple[Experts, RouteWeights]:
         """``topk`` with every zero expert as -1 and the weights in the model dtype (used by the PyTorch forwards).

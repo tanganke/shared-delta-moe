@@ -157,7 +157,8 @@ def hier_tables(group_sizes: tuple[int, ...], group_zeros: tuple[int, ...], devi
         return tuple(torch.tensor(v, device=device) for v in (col, delta, pad))  # type: ignore[return-value]
 
 
-def hier_topk(logits: Tensor, col: Tensor, pad: Tensor, k1: int, k0: int | None) -> tuple[Tensor, Tensor, Tensor]:
+def hier_topk(logits: Tensor, col: Tensor, pad: Tensor, k1: int, k0: int | None,
+              pick: tuple[Tensor, Tensor] | None = None) -> tuple[Tensor, Tensor, Tensor]:  # fmt: skip
     r"""Two-level routing: softmax over the G groups (dense, or top-:math:`k_0` renormalised), then within each kept
     group softmax over its experts, top-:math:`k_1` renormalised; slot weight :math:`h_i \tilde p_{ij}`.
 
@@ -167,6 +168,7 @@ def hier_topk(logits: Tensor, col: Tensor, pad: Tensor, k1: int, k0: int | None)
         pad: (G, M) padding table from ``hier_tables``.
         k1: :math:`k_1`, experts picked per group.
         k0: :math:`k_0`, groups picked per token; None = every group.
+        pick: (gi, pj) to use instead of the top-k picks (``ops.replay``); None = the top-k.
 
     Returns:
         (gi, pj, w): gi (T, S) kept groups, pj (T, S, k1) group-local picks, w (T, S * k1) float32 slot weights.
@@ -175,14 +177,17 @@ def hier_topk(logits: Tensor, col: Tensor, pad: Tensor, k1: int, k0: int | None)
     logits = logits.float()
     h = logits[:, :G].softmax(-1)
     p = logits[:, G:][:, col].masked_fill(pad, float("-inf")).softmax(-1)  # T G M
-    pv, pj = p.topk(k1, dim=-1)
-    pv = pv / pv.sum(-1, keepdim=True)
-    gi = torch.arange(G, device=logits.device).expand(len(logits), G)
+    if pick is None:
+        pj = p.topk(k1, dim=-1).indices  # T G k1
+        gi = torch.arange(G, device=logits.device).expand(len(logits), G) if k0 is None else h.topk(k0, dim=-1).indices
+        pick = (gi, pj if k0 is None else pj.gather(1, gi[..., None].expand(-1, -1, k1)))
+    gi, pj = pick
     if k0 is not None:
-        h, gi = h.topk(k0, dim=-1)
+        h = h.gather(1, gi)
         h = h / h.sum(-1, keepdim=True)
-        pick = gi[..., None].expand(-1, -1, k1)
-        pv, pj = pv.gather(1, pick), pj.gather(1, pick)
+        p = p.gather(1, gi[..., None].expand(-1, -1, p.shape[-1]))
+    pv = p.gather(-1, pj)
+    pv = pv / pv.sum(-1, keepdim=True)
     return gi, pj, (h[..., None] * pv).flatten(1)
 
 

@@ -735,7 +735,27 @@ def fused_moe_grid(x: Tensor, idx: Tensor, rw: Tensor, wg: Tensor, wu: Tensor, w
                    cd: Tensor, sg: Tensor, su: Tensor, sd: Tensor, zg: Tensor, zu: Tensor, zd: Tensor, n_delta: int,
                    group: int) -> Tensor:  # fmt: skip
     deltas = tuple(Delta(3, c, s, z, group) for c, s, z in ((cg, sg, zg), (cu, su, zu), (cd, sd, zd)))
-    return fused_moe(x, idx, rw, n_delta, (wg, wu, wd), deltas)  # type: ignore[arg-type]
+    return grid_moe(x, idx, rw, n_delta, (wg, wu, wd), deltas)  # type: ignore[arg-type]
+
+
+def grid_moe(x: Tensor, idx: Tensor, rw: Tensor, n_delta: int, base: tuple[Tensor, Tensor, Tensor],
+             deltas: tuple[Delta, Delta, Delta]) -> Tensor:  # fmt: skip
+    """The 2-bit grid MoE forward, chosen per call at run time (inside ``fused_moe_grid`` under torch.compile, so
+    a trace at one batch size does not fix it): up to ``packed_ops.MATRIX_MAX_PAIRS`` pairs the CUDA matrix kernels
+    where they run (decode: :math:`W_b` read once), else ``fused_moe``. Same arguments as ``fused_moe``."""
+    from ..cuda_kernels import packed_ops
+
+    if packed_ops.supports(x, idx.numel(), base, deltas, matrix=True):
+        return packed_ops._matrix(x, idx, rw, n_delta, base, deltas)
+    return fused_moe(x, idx, rw, n_delta, base, deltas)
+
+
+def grid_moe_any(x: Tensor, idx: Tensor, rw: Tensor, n_delta: int, base: tuple[Tensor, Tensor, Tensor],
+                 deltas: tuple[Delta, Delta, Delta]) -> Tensor:  # fmt: skip
+    """``grid_moe``, through ``fused_moe_grid`` while ``torch.compile`` traces."""
+    if not torch.compiler.is_compiling():
+        return grid_moe(x, idx, rw, n_delta, base, deltas)
+    return fused_moe_any(x, idx, rw, n_delta, base, deltas)
 
 
 @fused_moe_grid.register_fake
@@ -756,6 +776,61 @@ def _(x, *args, **kwargs):
 @fused_moe_bit.register_fake
 def _(x, *args, **kwargs):
     return x.new_empty(x.shape)
+
+
+def routed_deltas(x: Tensor, idx: Tensor, rw: Tensor, n_delta: int, d: Delta) -> Tensor:
+    r"""Routed deltas of one linear layer, no base: :math:`\sum_i r_i \Delta_{e_i} x` per token
+    (``models/routed_linear.py``), by ``route`` and the down kernel over a stride-0 zero base weight (every base load
+    the same cached zero); pairs with ``idx >= n_delta`` contribute 0.
+
+    Args:
+        x: (T, C) tokens.
+        idx: (T, k) delta per slot.
+        rw: (T, k) routing weight per slot.
+        n_delta: :math:`G`, deltas.
+        d: The deltas, (G, R, C) as a Delta.
+
+    Returns:
+        (T, R) in x's dtype.
+    """
+    R = d.d.shape[1]
+    if x.shape[0] == 0:
+        return x.new_empty(0, R)
+    r = route(idx, rw, n_delta)
+    zero = x.new_zeros(1, 1).expand(R, x.shape[1])
+    return down(x[r.perm // r.top_k], r, zero, d)
+
+
+def routed_auto(x: Tensor, idx: Tensor, rw: Tensor, n_delta: int, d: Delta) -> Tensor:
+    """``routed_deltas``, chosen per call at run time: up to ``ROUTED_MATRIX_MAX_PAIRS`` pairs (decode) the CUDA
+    matrix kernel (``packed_ops.routed_matrix``) where it runs, else the Triton down kernel."""
+    from ..cuda_kernels import packed_ops
+
+    if idx.numel() <= ROUTED_MATRIX_MAX_PAIRS and packed_ops.supports(x, idx.numel(), (None,), (d,), matrix=True):
+        return packed_ops.routed_matrix(x, idx, rw, n_delta, d)
+    return routed_deltas(x, idx, rw, n_delta, d)
+
+
+ROUTED_MATRIX_MAX_PAIRS = 64  # H200, Qwen3.8-27B shards: the matrix kernel wins to 32 pairs, ties at 128 (lm_head loses)
+
+
+@torch.library.custom_op("shared_delta_moe::routed_deltas_grid", mutates_args=())
+def routed_deltas_grid(x: Tensor, idx: Tensor, rw: Tensor, codes: Tensor, steps: Tensor, lows: Tensor, n_delta: int,
+                       group: int) -> Tensor:  # fmt: skip
+    return routed_auto(x, idx, rw, n_delta, Delta(3, codes, steps, lows, group))
+
+
+@routed_deltas_grid.register_fake
+def _(x, idx, rw, codes, *args, **kwargs):
+    return x.new_empty(x.shape[0], codes.shape[1])
+
+
+def routed_deltas_any(x: Tensor, idx: Tensor, rw: Tensor, n_delta: int, d: Delta) -> Tensor:
+    """``routed_auto`` (2-bit grids, mode 3), through the registered op ``routed_deltas_grid`` while
+    ``torch.compile`` traces (the choice is made inside, per call)."""
+    if not torch.compiler.is_compiling():
+        return routed_auto(x, idx, rw, n_delta, d)
+    return routed_deltas_grid(x.contiguous(), idx, rw, d.d, d.p, d.m, n_delta, d.block)  # type: ignore[arg-type]
 
 
 def fused_moe_any(x: Tensor, idx: Tensor, rw: Tensor, n_delta: int, base: tuple[Tensor, Tensor, Tensor],

@@ -22,7 +22,7 @@ from safetensors.torch import save_file
 from torch import nn
 from transformers.models.qwen3_5 import modeling_qwen3_5 as M
 
-from ..routed_linear import RoutedDeltaLinear
+from ..routed_linear import RoutedDeltaLinear, set_table, to_sets
 
 ROUTED = {"self_attn": ("q_proj", "k_proj", "v_proj", "o_proj"),
           "linear_attn": ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj")}  # fmt: skip
@@ -68,10 +68,7 @@ def _set_route(layer: Any, lins: list[RoutedDeltaLinear], module: nn.Module, arg
     x = x.reshape(-1, x.shape[-1]).to(module.delta_router.weight.device)  # (accelerate moves inputs after the hook)
     idx, r = layer.mlp.topk(x, module.delta_router)  # the layer's MoE at call time
     if lins[0].n_delta != layer.mlp.n_delta:  # sets: delta expert -> its set; zero experts / base stay >= n_delta
-        n = layer.mlp.n_delta
-        table = torch.repeat_interleave(torch.arange(lins[0].n_delta, device=idx.device),
-                                        torch.tensor(lins[0].sets, device=idx.device))  # fmt: skip
-        idx = torch.where(idx < n, table[idx.clamp(max=n - 1)], lins[0].n_delta)
+        idx = to_sets(idx, layer.mlp.n_delta, set_table(lins[0].sets, idx.device), lins[0].n_delta)
     route = idx, r
     for lin in lins:
         lin.route = route

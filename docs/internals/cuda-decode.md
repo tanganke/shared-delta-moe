@@ -1,6 +1,6 @@
 # CUDA decode kernels
 
-Prebuilt CUDA kernels for DARE and BitDelta deltas at decode sizes, on sm_90 (H100 / H200). Two families: parameter aggregation inside `forward_param`, and output aggregation behind `forward_matrix`. Speed tables: [Benchmarks](benchmarks.md).
+Prebuilt CUDA kernels for DARE, BitDelta and (output aggregation) 2-bit grid deltas at decode sizes, on sm_90 (H100 / H200). Two families: parameter aggregation inside `forward_param`, and output aggregation behind `forward_matrix`. Speed tables: [Benchmarks](benchmarks.md).
 
 ## Parameter aggregation (`forward_param`)
 
@@ -56,6 +56,25 @@ kernels instead rebuild $W_b + \Delta_g$ for every routed group.
   tensor-core kernel below runs, with zeros for the dropped blocks and a running popcount to find the kept values.
 - BitDelta: a CTA takes 16 rows and its warps split K, with the pairs as the N side of `mma.m16n8k16`. A byte of sign
   bits indexes a table of sign-flip masks XORed into the scale, as in the parameter-aggregation kernel.
+- 2-bit group grids (mode 3, `GridDeltaMoE`): the same tensor-core kernel. Each lane's 8 entries of a 32-wide chunk
+  are half a code word, decoded in registers to $\ell + s\,q$ (the group's lowest level and step, $q \in \{0, \dots, 3\}$)
+  and packed into bf16 pairs. Groups of 32 or more (a power of 2), rows a multiple of 16. `GridDeltaMoE` takes this
+  path up to `MATRIX_MAX_PAIRS` pairs, and so does the vLLM plugin's grid MLP.
+- Routed deltas ([per-expert attention and lm_head deltas](../guide/routed-deltas.md)), 2-bit grids: the down kernel
+  alone, over a zero base product (`packed_ops.routed_matrix`), up to 64 pairs; beyond that the Triton down kernel.
+
+Qwen3.8-27B shapes at TP=2 on H200 (moe27-14-B: 14 experts top-2 plus one zero expert; routed deltas in 4 sets), per
+decode step, summed over the 64 layers:
+
+| batch | grid MLP MoE, Triton | grid MLP MoE, CUDA matrix | dense MLP | routed deltas, Triton | routed deltas, CUDA matrix (to 64 pairs) | base projections |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 21.3 ms | 14.2 ms | 5.7 ms | 22.1 ms | 11.5 ms | 2.9 ms |
+| 16 | 103.5 ms | 48.4 ms | 5.9 ms | 37.0 ms | 15.1 ms | 2.9 ms |
+| 64 | 122.0 ms | 72.4 ms | 5.7 ms | 39.6 ms | 33.7 ms | 3.0 ms |
+
+The Triton MoE kernel rebuilds $W_b + \Delta_e$ for each routed expert, so at 16 tokens it reads the 267 MB base once
+for each of the 11 experts the batch touches; the matrix path reads it once. The remaining gap is in the delta kernels
+(about 0.7 TB/s from the codes) and a fixed 0.06 ms per routed call (routing sort and launches).
 
 Rounding is that of `_forward_matrix_grouped`: $x W_b^T$ and $x \Delta^T$ are each rounded to the model dtype before
 their sum, and so are $h$ and $r_i y_i$. `tests/test_packed_matrix.py` checks these kernels against `_forward_matrix`

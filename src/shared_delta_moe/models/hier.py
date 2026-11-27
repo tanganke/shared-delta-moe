@@ -32,6 +32,7 @@ from torch import Tensor, nn
 
 from ..type_hints import MLPWeights, RouterWeight, Tokens
 from .delta_moe import DeltaMoE
+from ..ops import replay
 from .moe import HierMoE, hier_tables, hier_topk
 
 
@@ -153,6 +154,9 @@ class HierDeltaMoE(DeltaMoE):
             ``weight`` the float32 routing weight per slot.
         """
         col, delta, pad = self._tables(x.device)
-        gi, pj, w = hier_topk((self.router if router is None else router)(x), col, pad, self.k1, self.group_top_k)
+        router = self.router if router is None else router
+        logits = router(x)
+        pick = replay(router, logits, lambda: hier_topk(logits.detach(), col, pad, self.k1, self.group_top_k)[:2])
+        gi, pj, w = hier_topk(logits, col, pad, self.k1, self.group_top_k, pick)
         e = delta[gi[..., None], pj].flatten(1)  # T S*k1
         return torch.where(e < 0, self.n_delta, e), w

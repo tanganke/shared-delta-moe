@@ -82,6 +82,10 @@ struct Ty<__nv_bfloat16> {
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
   }
   __device__ static __nv_bfloat16 of(float f) { return __float2bfloat16_rn(f); }
+  __device__ static unsigned pack(float lo, float hi) {
+    __nv_bfloat162 r = __floats2bfloat162_rn(lo, hi);
+    return *reinterpret_cast<unsigned*>(&r);
+  }
   __device__ static float rnd(float f) { return __bfloat162float(__float2bfloat16_rn(f)); }
 };
 template <>
@@ -96,6 +100,10 @@ struct Ty<__half> {
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
   }
   __device__ static __half of(float f) { return __float2half_rn(f); }
+  __device__ static unsigned pack(float lo, float hi) {
+    __half2 r = __floats2half2_rn(lo, hi);
+    return *reinterpret_cast<unsigned*>(&r);
+  }
   __device__ static float rnd(float f) { return __half2float(__float2half_rn(f)); }
 };
 
@@ -599,7 +607,7 @@ struct MParams {
   const void* b0[2];  // x W_b^T: gate_up (T, N) gate and up; down (P, N) sorted
   const void* d[2];   // DARE kept values; BitDelta (G, N, K / 32) sign words
   const void* p[2];   // DARE (G, N) int64 row starts; BitDelta (G, N, nsb) scales
-  const int* m[2];    // DARE (G, N, mw) keep bitmap
+  const int* m[2];    // DARE (G, N, mw) keep bitmap; grid (G, N, nsb) lowest levels (as T)
   void* out;          // gate_up: (P, N) h sorted; down: (P, N) r y by pair
   int N, K, G, topk, mw, nsb, bs, sbs, gather;
 };
@@ -784,6 +792,25 @@ __global__ void __launch_bounds__(WARPS * 32) mma_kernel(const MParams p) {
             Ty<T>::mma(acc[mat], a[0].z, a[1].z, a[0].w, a[1].w, b.z, b.w);
             continue;
           }
+          if (MODE == 3) {  // 2-bit grid: entries 32c + 8q .. + 7 are the 8 codes in half word q & 1 of word 2c + q / 2
+            const unsigned* cw3 = reinterpret_cast<const unsigned*>(p.d[mat]);
+            const T* st = reinterpret_cast<const T*>(p.p[mat]);
+            const T* lw = reinterpret_cast<const T*>(p.m[mat]);
+            const int wi = 2 * c + (q >> 1), sh = 16 * (q & 1), si = (32 * c) >> p.sbs;
+            const unsigned w[2] = {__ldg(cw3 + rw0 * p.mw + wi) >> sh, __ldg(cw3 + rw1 * p.mw + wi) >> sh};
+            const float sv[2] = {to_f(st[rw0 * p.nsb + si]), to_f(st[rw1 * p.nsb + si])};
+            const float lv[2] = {to_f(lw[rw0 * p.nsb + si]), to_f(lw[rw1 * p.nsb + si])};
+            unsigned a[2][4];
+#pragma unroll
+            for (int h = 0; h < 2; h++)
+#pragma unroll
+              for (int j = 0; j < 4; j++)  // entries 2j, 2j + 1: low, high half
+                a[h][j] = Ty<T>::pack(lv[h] + sv[h] * float((w[h] >> (4 * j)) & 3u),
+                                      lv[h] + sv[h] * float((w[h] >> (4 * j + 2)) & 3u));
+            Ty<T>::mma(acc[mat], a[0][0], a[1][0], a[0][1], a[1][1], b.x, b.y);
+            Ty<T>::mma(acc[mat], a[0][2], a[1][2], a[0][3], a[1][3], b.z, b.w);
+            continue;
+          }
           const unsigned* bits = reinterpret_cast<const unsigned*>(p.d[mat]);
           const unsigned short* sc = reinterpret_cast<const unsigned short*>(p.p[mat]);
           const int si = p.sbs >= 0 ? (32 * c) >> p.sbs : 0;
@@ -822,9 +849,12 @@ void matrix_launch(int mode, MParams& p, const at::Tensor& like, int64_t P) {
   const bool bf = like.scalar_type() == at::kBFloat16;
   auto stream = at::cuda::getCurrentCUDAStream();
   // DARE on the tensor cores from about 5 pairs per group (H200: CUDA cores win below, the mma kernel above)
-  if (mode == 2 || P >= 5 * (p.G + 1)) {
+  if (mode != 1 || P >= 5 * (p.G + 1)) {
     const dim3 grid(p.N / 16, p.G + 1);
-    if (mode == 2)
+    if (mode == 3)
+      bf ? mma_kernel<3, MATS, __nv_bfloat16><<<grid, WARPS * 32, 0, stream>>>(p)
+         : mma_kernel<3, MATS, __half><<<grid, WARPS * 32, 0, stream>>>(p);
+    else if (mode == 2)
       bf ? mma_kernel<2, MATS, __nv_bfloat16><<<grid, WARPS * 32, 0, stream>>>(p)
          : mma_kernel<2, MATS, __half><<<grid, WARPS * 32, 0, stream>>>(p);
     else
@@ -852,7 +882,7 @@ void matrix_launch(int mode, MParams& p, const at::Tensor& like, int64_t P) {
 
 MParams mmake(int64_t mode, int64_t block, int64_t topk, const at::Tensor& x, const at::Tensor& perm,
               const at::Tensor& gstart, int64_t N, const at::Tensor& d, const at::Tensor& pp, const at::Tensor& m) {
-  TORCH_CHECK(mode == 1 || mode == 2, "sdm_packed: mode 1 (DARE) or 2 (BitDelta)");
+  TORCH_CHECK(mode >= 1 && mode <= 3, "sdm_packed: matrix mode 1 (DARE), 2 (BitDelta) or 3 (2-bit grid)");
   TORCH_CHECK(x.scalar_type() == at::kBFloat16 || x.scalar_type() == at::kHalf, "sdm_packed: bf16 or fp16");
   TORCH_CHECK(x.dim() == 2 && x.size(1) % 32 == 0, "sdm_packed: K a multiple of 32");
   TORCH_CHECK(perm.scalar_type() == at::kInt && gstart.scalar_type() == at::kInt && perm.is_contiguous() &&
@@ -867,6 +897,12 @@ MParams mmake(int64_t mode, int64_t block, int64_t topk, const at::Tensor& x, co
                     pp.is_contiguous(), "sdm_packed: DARE");
     p.bs = log2i(block), p.mw = m.size(-1), p.sbs = -1;
     TORCH_CHECK((p.K >> p.bs) <= 65535 && (p.K & (block - 1)) == 0, "sdm_packed: DARE blocks");
+  } else if (mode == 3) {
+    TORCH_CHECK(block >= 32 && (block & (block - 1)) == 0 && p.K % block == 0, "sdm_packed: grid group a power of 2 >= 32");
+    TORCH_CHECK(d.scalar_type() == at::kInt && d.size(-1) == p.K / 16 && pp.scalar_type() == x.scalar_type() &&
+                    m.scalar_type() == x.scalar_type() && pp.is_contiguous() && m.is_contiguous() &&
+                    pp.size(-1) == p.K / block && m.sizes() == pp.sizes() && N % 16 == 0, "sdm_packed: grid");
+    p.sbs = log2i(block), p.mw = d.size(-1), p.nsb = pp.size(-1);
   } else {
     TORCH_CHECK(block == 0 || block >= 32, "sdm_packed: BitDelta scale block 0 or >= 32");
     TORCH_CHECK(d.size(-1) == p.K / 32 && pp.scalar_type() == x.scalar_type() && pp.is_contiguous() &&
@@ -889,7 +925,8 @@ at::Tensor matrix_gate_up(const at::Tensor& x, const at::Tensor& perm, const at:
   check(du, "du");
   MParams p = mmake(mode, block, topk, x, perm, gstart, g0.size(1), dg, pg, mg);
   p.d[0] = dg.data_ptr(), p.d[1] = du.data_ptr(), p.p[0] = pg.data_ptr(), p.p[1] = pu.data_ptr();
-  p.m[0] = mode == 1 ? mg.data_ptr<int>() : nullptr, p.m[1] = mode == 1 ? mu.data_ptr<int>() : nullptr;
+  p.m[0] = mode != 2 ? static_cast<const int*>(mg.data_ptr()) : nullptr;
+  p.m[1] = mode != 2 ? static_cast<const int*>(mu.data_ptr()) : nullptr;
   p.b0[0] = g0.data_ptr(), p.b0[1] = u0.data_ptr(), p.gather = 1;
   at::Tensor h = at::empty({perm.numel(), p.N}, x.options());
   p.out = h.data_ptr();
@@ -907,7 +944,7 @@ at::Tensor matrix_down(const at::Tensor& h, const at::Tensor& perm, const at::Te
   check(d0, "d0");
   MParams p = mmake(mode, block, topk, h, perm, gstart, d0.size(1), d, pp, m);
   p.d[0] = p.d[1] = d.data_ptr(), p.p[0] = p.p[1] = pp.data_ptr();
-  p.m[0] = p.m[1] = mode == 1 ? m.data_ptr<int>() : nullptr;
+  p.m[0] = p.m[1] = mode != 2 ? static_cast<const int*>(m.data_ptr()) : nullptr;
   p.rw = rw.data_ptr<float>(), p.b0[0] = d0.data_ptr(), p.gather = 0;
   at::Tensor o = at::empty({perm.numel(), p.N}, h.options());
   p.out = o.data_ptr();

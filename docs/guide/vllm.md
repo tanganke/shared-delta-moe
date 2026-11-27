@@ -1,15 +1,58 @@
 # Serving with vLLM
 
-`vllm_plugin.py` is a vLLM general plugin (entry point in `pyproject.toml`): with the package installed in vLLM's
-environment, vLLM serves a converted checkpoint as it is, with no materialisation, every decoder MLP a
-`HierDeltaMoE` on the fused Triton kernel:
+`vllm_plugin.py` is a vLLM general plugin (entry point in `pyproject.toml`). With the package installed in vLLM's
+environment, vLLM serves a converted HierDeltaMoE checkpoint as it is, with no materialisation:
 
 ```bash
 vllm serve DST --tensor-parallel-size 2
 ```
 
-Tensor parallelism splits the intermediate dimension ($W_g$, $W_u$ and their deltas by rows, $W_d$ and its deltas by
-columns), the router is replicated, and an all-reduce sums the down projections. torch.compile and CUDA graphs work
-(the kernel is one custom op). Dense MLP deltas only: checkpoints with grid MLP deltas (`hier_delta_moe.levels`)
-or [per-expert attention and lm_head deltas](routed-deltas.md) (`routed_deltas`) are refused at load. Checked with vLLM 0.29.0 on the synthetic Qwen3.8-27B upscale (3
-fine-tunes in 2 groups, random routers), TP=2 on H200: coherent greedy output; per rank 74.6 GiB of weights.
+Without installing, put `src` on `PYTHONPATH` together with a directory holding a `*.dist-info` with the entry
+point (`[vllm.general_plugins]` `shared_delta_moe = shared_delta_moe.vllm_plugin:register` in `entry_points.txt`):
+vLLM finds plugins only through package metadata, in every process, workers included.
+
+## What runs
+
+- **Decoder MLPs:** every one is a `HierDeltaMoE` on the fused Triton kernel, with dense deltas or, with
+  `hier_delta_moe.levels`, 2-bit [group grids](grid.md) (mode 3 of the kernel, decoded tile by tile).
+- **[Routed attention and `lm_head` deltas](routed-deltas.md)** (`routed_deltas`, 2-bit grids only): they ride on
+  vLLM's own projections, `qkv_proj` and `o_proj` in attention, `in_proj_qkvz`, `in_proj_ba` and `out_proj` in
+  linear attention, and `lm_head`. Each projection's `quant_method.apply` adds, after the base product $W_b x$,
+
+  $$
+  \sum_i r_i \, \Delta_{e_i} x
+  $$
+
+  for this rank's shard, with one more fused launch. The block's `delta_router` routes the block input in its
+  first projection, and the block's other projections reuse that routing.
+
+## Tensor parallelism
+
+- **MLPs:** split along the intermediate dimension I, as vLLM's own MLP. $W_g$, $W_u$ and their deltas are split
+  by rows, $W_d$ and its deltas by columns. Grid codes, steps and lowest levels are split along the same dimension,
+  so the grid group must divide I / tp (Qwen3.8-27B: 17408 / 8 = 2176, which 128 divides). An all-reduce sums the down
+  projections.
+- **Routed deltas:** `codes`, `steps` and `lows` get the expert dimension in front and are loaded by the
+  projection's own weight loader. They are therefore sharded exactly as the weight: the merged shards of
+  `qkv_proj`, `in_proj_qkvz` and `in_proj_ba`, replicated KV heads, and `lm_head`'s padded vocabulary (padding rows
+  stay zero). Row-parallel projections need their per-rank input width divisible by the group.
+- **Routers:** replicated, so every rank routes alike.
+
+torch.compile and CUDA graphs work: the MLP and the routed deltas are registered custom ops.
+
+## Checks
+
+A tiny Qwen3.5 (4 layers, 3 fine-tunes in 2 groups, random routers), converted as dense, grid MLP, routed, and grid
+MLP + routed with sets. vLLM's prompt log-probabilities against the HF model:
+
+| variant | TP | mode | mean abs. diff | max abs. diff |
+|---|---|---|---:|---:|
+| the base, no plugin | 1 | eager | 0.0039 | 0.013 |
+| dense | 1 | eager | 0.0031 | 0.009 |
+| grid MLP | 1 | eager | 0.0036 | 0.010 |
+| routed | 1 | eager | 0.0047 | 0.017 |
+| grid MLP + routed, sets | 1 | eager | 0.0041 | 0.016 |
+| grid MLP + routed, sets | 2 | eager | 0.0043 | 0.023 |
+| grid MLP + routed, sets | 2 | compiled, CUDA graphs | 0.0050 | 0.017 |
+
+All are at the base model's own bf16 difference. Checked with vLLM 0.32.0 on H200.

@@ -144,7 +144,11 @@ the routing weights.
 
 - `nn.DataParallel` replicas are not supported: the hooks hold the original modules. DDP and FSDP wrap the model in
   place, so they work.
-- Gradient checkpointing and the KV cache work.
+- Gradient checkpointing and the KV cache work. A checkpointed block recomputes its forward in backward from
+  inputs that need not be bitwise equal (atomic adds, non-deterministic kernels), and a near-tie could then flip a
+  top-k pick. So inside a non-reentrant checkpoint (the transformers default) every router's picks are kept on the
+  checkpoint and reused in the recompute (`ops.replay`); the routing weights are still recomputed, so the routers
+  get their gradients. Reentrant checkpoints get no such protection.
 
 ## Size at 27B
 
@@ -172,5 +176,5 @@ This is 0.0002-0.0004 above the offline estimate for the same storage. The cause
 $W_b + \Delta_e$ first instead of the two products gives the same numbers.
 
 Inference with 2-bit grids uses the fused kernels (MLP and routed deltas); the timing above is from the earlier
-loop. Training goes through the differentiable loop. The vLLM plugin refuses `routed_deltas` and grid MLP
-checkpoints ([vLLM](vllm.md)).
+loop. Training goes through the differentiable loop. [vLLM](vllm.md) serves routed 2-bit deltas, sets included,
+with tensor parallelism.

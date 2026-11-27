@@ -18,6 +18,7 @@ Deltas are dense (``deltas``) or group-grid codes as in ``grid.py`` (``codes``, 
 sync). Otherwise a loop over the routed experts with ``index_add`` (differentiable: routers, steps, dense deltas).
 """
 
+import threading
 from typing import Any
 
 import torch
@@ -26,6 +27,20 @@ from torch import Tensor, nn
 
 from ..constants import HAS_TRITON
 from .grid import code_bits, grid_delta
+
+
+def set_table(sets: list[int], device: torch.device | str | None = None) -> Tensor:
+    """Delta expert -> its set (``routed_deltas.sets``: consecutive expert counts), (sum(sets),) int64."""
+    return torch.repeat_interleave(torch.arange(len(sets), device=device), torch.tensor(sets, device=device))
+
+
+def to_sets(idx: Tensor, n_delta: int, table: Tensor, n_sets: int) -> Tensor:
+    """Map routing slots from the MoE's delta experts (``>= n_delta``: zero experts / the base) to sets (``n_sets``:
+    no delta); no host sync."""
+    return torch.where(idx < n_delta, table[idx.clamp(min=0, max=max(n_delta - 1, 0))], n_sets)
+
+
+_tls = threading.local()  # routes are per thread: forwards may run in parallel threads (one micro-batch each)
 
 
 class RoutedDeltaLinear(nn.Linear):
@@ -44,7 +59,7 @@ class RoutedDeltaLinear(nn.Linear):
 
     Attributes:
         route: (idx, r), both (T, K): delta index per slot (:math:`\ge N`: none) and routing weight, for the T tokens
-            of the next forward in order; set before each forward.
+            of the next forward in order; set before each forward, per thread.
         weight: (R, C) :math:`W_b`.
         deltas: (N, R, C) dense deltas (``levels`` None).
         codes: (N, R, C b / 32) int32 packed codes (grids).
@@ -52,7 +67,13 @@ class RoutedDeltaLinear(nn.Linear):
         lows: (N, R, C / g) lowest levels (asymmetric grids).
     """
 
-    route: tuple[Tensor, Tensor] | None
+    @property
+    def route(self) -> tuple[Tensor, Tensor] | None:
+        return getattr(_tls, "routes", {}).get(id(self))
+
+    @route.setter
+    def route(self, v: tuple[Tensor, Tensor] | None) -> None:
+        _tls.__dict__.setdefault("routes", {})[id(self)] = v
 
     def __init__(self, in_features: int, out_features: int, n_delta: int, levels: int | None = None, group: int = 128,
                  symmetric: bool = False, device: torch.device | str | None = None,
@@ -98,15 +119,12 @@ class RoutedDeltaLinear(nn.Linear):
                                                  or any(p.requires_grad for p in self.parameters())))
 
     def _fused_deltas(self, x: Tensor, idx: Tensor, r: Tensor) -> Tensor:
-        r""":math:`\sum_i r_i \Delta_{e_i} x` per token: the fused down kernel over a zero base (a stride-0 view, every
-        load the same cached zero), the grids decoded tile by tile; pairs of no delta contribute 0."""
-        from ..triton_kernels.fused import Delta, down, route
+        r""":math:`\sum_i r_i \Delta_{e_i} x` per token (``triton_kernels.fused.routed_deltas``)."""
+        from ..triton_kernels.fused import Delta, routed_deltas_any
 
-        rt = route(idx, r, self.n_delta)
         s = self.steps.detach()
         z = -s * ((self.levels - 1) / 2) if self.symmetric else self.lows.detach()  # type: ignore[operator]
-        zero = x.new_zeros(1, 1).expand(self.out_features, self.in_features)
-        return down(x[rt.perm // rt.top_k], rt, zero, Delta(3, self.codes, s, z, self.group))
+        return routed_deltas_any(x, idx, r, self.n_delta, Delta(3, self.codes, s, z, self.group))
 
     def forward(self, x: Tensor) -> Tensor:
         """``x @ weight.T`` plus each token's routed deltas.
@@ -130,6 +148,8 @@ class RoutedDeltaLinear(nn.Linear):
         for e in idx.unique().tolist():
             if e >= self.n_delta:
                 continue
-            rows, slots = (idx == e).nonzero(as_tuple=True)
-            ys = ys.index_add(0, rows, (r[rows, slots, None] * F.linear(xs[rows], self.delta(e))).to(ys.dtype))
+            hit = idx == e  # one row per token, its slots on e summed (several slots share a set)
+            rows = hit.any(-1).nonzero(as_tuple=True)[0]
+            w = (r * hit).sum(-1)[rows, None]
+            ys = ys.index_add(0, rows, (w * F.linear(xs[rows], self.delta(e))).to(ys.dtype))
         return ys.view(y.shape)

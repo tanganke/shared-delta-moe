@@ -90,6 +90,8 @@ def supports(x: Tensor, pairs: int, base: tuple[Tensor, Tensor, Tensor], deltas,
         16-byte aligned, the layout within the device's shared memory, and the library loaded.
     """
     d = deltas[0]
+    if d.mode == 3:
+        return matrix and _grid_ok(x, pairs, base, deltas)
     if not (d.mode in (1, 2) and 0 < pairs <= (MATRIX_MAX_PAIRS if matrix else MAX_PAIRS) and x.is_cuda and x.dtype in (torch.bfloat16, torch.float16)):
         return False
     if not available():  # first: unbuilt or disabled costs nothing more per call
@@ -114,6 +116,28 @@ def supports(x: Tensor, pairs: int, base: tuple[Tensor, Tensor, Tensor], deltas,
         h, i = x.shape[1], base[0].shape[0]
         return d.mode == 2 or 8 * 2 * (h // d.block) * 2 <= smax and 8 * (i // deltas[2].block) * 2 <= smax
     return _smem(d.mode, 2, g, pairs, d.block) <= smax and _smem(d.mode, 1, g, pairs, deltas[2].block) <= smax
+
+
+def _grid_ok(x: Tensor, pairs: int, base: tuple[Tensor | None, ...], deltas) -> bool:
+    """``supports`` for 2-bit grids (mode 3, matrix kernels only): groups a power of 2 of at least 32, rows a
+    multiple of 16, codes (int32), steps and lowest levels (x's dtype) contiguous and aligned. A base of None (the
+    routed deltas: no base) is not checked."""
+    if not (0 < pairs <= MATRIX_MAX_PAIRS and x.is_cuda and x.dtype in (torch.bfloat16, torch.float16)):
+        return False
+    if not available():
+        return False
+    cap, _ = _device(x.device.index if x.device.index is not None else torch.cuda.current_device())
+    if cap != (9, 0) or x.shape[1] % 64 or not _aligned(x.contiguous()):
+        return False
+    if any(w is not None and (w.dtype != x.dtype or not w.is_contiguous() or not _aligned(w)) for w in base):
+        return False
+    for dl in deltas:
+        if dl.mode != 3 or dl.block < 32 or dl.block & (dl.block - 1) or dl.d.shape[1] % 16:
+            return False
+        for t, dt in ((dl.d, torch.int32), (dl.p, x.dtype), (dl.m, x.dtype)):
+            if t is None or t.dtype != dt or not t.is_contiguous() or not _aligned(t):
+                return False
+    return True
 
 
 def _aligned(t: Tensor) -> bool:
@@ -179,7 +203,7 @@ def matrix_moe(x: Tensor, r, base: tuple[Tensor, Tensor, Tensor], deltas) -> Ten
         x: (T, H) tokens.
         r: The sorted routing (``triton_kernels.fused.Routing``).
         base: (:math:`W_g` (I, H), :math:`W_u` (I, H), :math:`W_d` (H, I)).
-        deltas: (:math:`D_g`, :math:`D_u`, :math:`D_d`) as ``Delta``, mode 1 or 2.
+        deltas: (:math:`D_g`, :math:`D_u`, :math:`D_d`) as ``Delta``, mode 1, 2 or 3.
 
     Returns:
         (T, H) MoE output in x's dtype.
@@ -188,7 +212,7 @@ def matrix_moe(x: Tensor, r, base: tuple[Tensor, Tensor, Tensor], deltas) -> Ten
     x = x.contiguous()
 
     def extra(d):
-        return (d.p, d.m) if d.mode == 1 else (d.p, d.d)
+        return (d.p, d.d) if d.mode == 2 else (d.p, d.m)
 
     (pg, mg), (pu, mu), (pd, md) = extra(dg), extra(du), extra(dd)
     g0, u0 = F.linear(x, base[0]), F.linear(x, base[1])
@@ -217,6 +241,9 @@ def matrix_moe_any(x: Tensor, idx: Tensor, rw: Tensor, n_delta: int, base: tuple
     """
     if not torch.compiler.is_compiling():
         return _matrix(x, idx, rw, n_delta, base, deltas)
+    if deltas[0].mode == 3:
+        return matrix_moe_grid(x, idx, rw, *base, *(d.d for d in deltas), *(d.p for d in deltas),
+                               *(d.m for d in deltas), n_delta, deltas[0].block, deltas[2].block)  # fmt: skip
     if deltas[0].mode == 2:
         return matrix_moe_bit(x, idx, rw, *base, *(d.d for d in deltas), *(d.p for d in deltas), n_delta,
                               deltas[0].block, deltas[2].block)  # fmt: skip
@@ -251,6 +278,49 @@ def matrix_moe_bit(x: Tensor, idx: Tensor, rw: Tensor, wg: Tensor, wu: Tensor, w
 
     deltas = tuple(Delta(2, b, s, block=k) for b, s, k in ((bg, sg, block_gu), (bu, su, block_gu), (bd, sd, block_d)))
     return _matrix(x, idx, rw, n_delta, (wg, wu, wd), deltas)
+
+
+@torch.library.custom_op("shared_delta_moe::matrix_moe_grid", mutates_args=())
+def matrix_moe_grid(x: Tensor, idx: Tensor, rw: Tensor, wg: Tensor, wu: Tensor, wd: Tensor, cg: Tensor, cu: Tensor,
+                    cd: Tensor, sg: Tensor, su: Tensor, sd: Tensor, zg: Tensor, zu: Tensor, zd: Tensor, n_delta: int,
+                    block_gu: int, block_d: int) -> Tensor:  # fmt: skip
+    from ..triton_kernels import Delta
+
+    deltas = tuple(Delta(3, c, s, z, k) for c, s, z, k in ((cg, sg, zg, block_gu), (cu, su, zu, block_gu),
+                                                            (cd, sd, zd, block_d)))  # fmt: skip
+    return _matrix(x, idx, rw, n_delta, (wg, wu, wd), deltas)
+
+
+def routed_matrix(x: Tensor, idx: Tensor, rw: Tensor, n_delta: int, d) -> Tensor:
+    r"""Routed deltas of one linear layer, no base (``triton_kernels.fused.routed_deltas``), on the matrix down
+    kernel: :math:`\sum_i r_i \Delta_{e_i} x` per token, the deltas' products for the sorted pairs over a zero base
+    product.
+
+    Args:
+        x: (T, C) tokens.
+        idx: (T, k) delta per slot (``>= n_delta``: none).
+        rw: (T, k) routing weight per slot.
+        n_delta: :math:`G`, deltas.
+        d: The (G, R, C) deltas as a mode-3 ``Delta`` for which ``_grid_ok`` holds.
+
+    Returns:
+        (T, R) in x's dtype.
+    """
+    from ..triton_kernels.fused import route
+
+    x = x.contiguous()
+    if x.data_ptr() % 16:
+        x = x.clone()
+    r = route(idx, rw, n_delta)
+    h = x[r.perm // r.top_k]  # sorted pairs
+    zero = h.new_zeros(h.shape[0], d.d.shape[1])
+    o = torch.ops.sdm_packed.matrix_down(h, r.perm, r.gstart, r.weight, zero, d.d, d.p, d.m, 3, d.block, r.top_k)
+    return o.view(r.tokens, r.top_k, -1).sum(1).to(x.dtype)
+
+
+@matrix_moe_grid.register_fake
+def _(x, *args, **kwargs):
+    return x.new_empty(x.shape)
 
 
 @matrix_moe_dare.register_fake

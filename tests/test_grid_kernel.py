@@ -134,6 +134,38 @@ def test_routed_linear_fused():
             assert rel(got, want.detach()) < 2e-2, (levels, T, rel(got, want.detach()))
 
 
+def test_cuda_matrix_matches_triton():
+    """The CUDA matrix kernels (mode 3, decode sizes: ``packed_ops.matrix_moe_any``, ``routed_matrix``) against the
+    fused Triton kernels, where the library is built (sm_90)."""
+    if not GPU:
+        print("skipped: no CUDA/Triton")
+        return
+    from shared_delta_moe.cuda_kernels import packed_ops
+    from shared_delta_moe.triton_kernels import fused as F
+
+    for case in CASES:
+        g, x = _module(*case)
+        base, deltas = (g.gate, g.up, g.down), g._kernel_deltas()
+        if not packed_ops.supports(x[:4], 4 * g.top_k, base, deltas, matrix=True):
+            print("skipped: CUDA library not built / not sm_90, or group < 32")
+            continue
+        for t in (1, 3, 37, 200):
+            with torch.no_grad():
+                idx, r = g.topk(x[:t])
+                got = packed_ops.matrix_moe_any(x[:t], idx, r, g.n_delta, base, deltas)
+                want = F.fused_moe(x[:t], idx, r, g.n_delta, base, deltas)
+            assert rel(got, want) < 2e-2, (case, t, rel(got, want))
+        with torch.no_grad():
+            assert g._matrix_cuda(x[:8]) and rel(g(x[:8]), g._forward_param(x[:8])) < 2e-2
+        d = deltas[0]
+        for t in (1, 5, 64):
+            idx = torch.randint(0, g.n_delta + 1, (t, 2), device="cuda")
+            r = torch.rand(t, 2, device="cuda")
+            got = packed_ops.routed_matrix(x[:t], idx, r, g.n_delta, d)
+            want = F.routed_deltas(x[:t], idx, r, g.n_delta, d)
+            assert rel(got, want) < 2e-2, (case, t, rel(got, want))
+
+
 if __name__ == "__main__":
     for name, f in list(globals().items()):
         if name.startswith("test_"):
