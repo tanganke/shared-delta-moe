@@ -201,7 +201,7 @@ class DeltaMoE(nn.Module):
             dst.copy_(torch.stack([w[i] for w in experts]) - b)
         return m
 
-    def topk(self, x: Tokens) -> tuple[Tensor, Tensor]:
+    def topk(self, x: Tokens, router: nn.Module | None = None) -> tuple[Tensor, Tensor]:
         """Route tokens: top-k router indices and their renormalised weights.
 
         Float32 softmax and renormalisation, as transformers' MoE routers do (bf16 can flip near-ties). Every forward
@@ -209,12 +209,14 @@ class DeltaMoE(nn.Module):
 
         Args:
             x: (T, H) tokens.
+            router: Another router of the same shape as ``self.router``, routed the same way (``routed_linear``: the
+                attention and lm_head deltas); None = ``self.router``.
 
         Returns:
             A tuple (idx, r): idx (T, K) int64 router index per slot (>= ``n_delta``: a zero expert); r (T, K) float32
             routing weights, each row renormalised to sum to 1.
         """
-        r, i = self.router(x).softmax(-1, dtype=torch.float).topk(self.top_k, dim=-1)
+        r, i = (self.router if router is None else router)(x).softmax(-1, dtype=torch.float).topk(self.top_k, dim=-1)
         return i, r / r.sum(-1, keepdim=True)
 
     def route(self, x: Tokens) -> tuple[Experts, RouteWeights]:

@@ -1,7 +1,14 @@
 """Shared by the two Qwen3.5 integrations (``qwen3_5_delta_moe``, ``qwen3_5_hier_delta_moe``): the
 transformers decoder-layer patch, and safetensors checkpoint I/O for the converters. (vLLM's decoder layer has another
-constructor; ``vllm_plugin.py`` patches it on its own.)"""
+constructor; ``vllm_plugin.py`` patches it on its own.)
 
+A text config with ``routed_deltas: {levels, group, symmetric}`` (levels null = dense deltas) also gives every
+attention and linear-attention projection and ``lm_head`` per-expert deltas (``routed_linear.RoutedDeltaLinear``):
+each attention block gets a ``delta_router`` (shaped like its layer's MoE router, routed the same way), ``lm_head``
+one routed like the last layer's MoE. Embeddings, norms and the linear attention's conv1d / ``A_log`` / ``dt_bias``
+stay shared."""
+
+import functools
 import json
 import shutil
 from collections.abc import Callable
@@ -11,6 +18,13 @@ from typing import Any
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
+from torch import nn
+from transformers.models.qwen3_5 import modeling_qwen3_5 as M
+
+from ..routed_linear import RoutedDeltaLinear
+
+ROUTED = {"self_attn": ("q_proj", "k_proj", "v_proj", "o_proj"),
+          "linear_attn": ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj")}  # fmt: skip
 
 
 def patch_decoder_layer(layer: type, field: str, block: Callable[[Any], Any]) -> None:
@@ -28,8 +42,68 @@ def patch_decoder_layer(layer: type, field: str, block: Callable[[Any], Any]) ->
         init(self, config, layer_idx)
         if getattr(config, field, None) is not None:
             self.mlp = block(config)
+            if getattr(config, "routed_deltas", None) is not None:
+                for name, projs in ROUTED.items():
+                    if hasattr(self, name):
+                        route_through(getattr(self, name), projs, self, config.routed_deltas)
 
     layer.__init__ = _init  # type: ignore[method-assign]
+
+
+def _routed(old: nn.Linear, n_delta: int, c: dict[str, Any]) -> RoutedDeltaLinear:
+    assert old.bias is None, "routed deltas on a biased projection"
+    w = old.weight
+    return RoutedDeltaLinear(old.in_features, old.out_features, n_delta, c.get("levels"), c.get("group", 128),
+                             c.get("symmetric", False), w.device, w.dtype)  # fmt: skip
+
+
+def _set_route(layer: Any, lins: list[RoutedDeltaLinear], module: nn.Module, args: tuple, kwargs: dict) -> None:
+    x = kwargs["hidden_states"] if "hidden_states" in kwargs else args[0]
+    x = x.reshape(-1, x.shape[-1]).to(module.delta_router.weight.device)  # (accelerate moves inputs after the hook)
+    route = layer.mlp.topk(x, module.delta_router)  # the layer's MoE at call time
+    for lin in lins:
+        lin.route = route
+
+
+def route_through(module: nn.Module, projs: tuple[str, ...], layer: Any, c: dict[str, Any]) -> None:
+    """Replace ``module``'s projections ``projs`` with RoutedDeltaLinears, add ``module.delta_router`` and a forward
+    pre-hook that routes ``module``'s input with it (``layer.mlp.topk``) for all of them.
+
+    Args:
+        module: The attention block (input ``hidden_states``), or ``lm_head`` itself.
+        projs: Attribute names of its linear layers; ``()`` = ``module`` is the linear layer (already replaced).
+        layer: The decoder layer whose ``mlp`` (a DeltaMoE) routes.
+        c: The ``routed_deltas`` config entry.
+    """
+    moe = layer.mlp
+    lins = []
+    for p in projs:
+        setattr(module, p, _routed(getattr(module, p), moe.n_delta, c))
+        lins.append(getattr(module, p))
+    w = moe.router.weight
+    module.delta_router = nn.Linear(w.shape[1], w.shape[0], bias=False, device=w.device, dtype=w.dtype)
+    module.register_forward_pre_hook(functools.partial(_set_route, layer, lins or [module]), with_kwargs=True)
+
+
+def _patch_lm_head(model: type) -> None:
+    init = model.__init__
+
+    def _init(self: Any, config: Any) -> None:
+        init(self, config)
+        text = getattr(config, "text_config", config)
+        c = getattr(text, "routed_deltas", None)
+        if c is None:
+            return
+        assert not getattr(config, "tie_word_embeddings", False), "routed lm_head deltas need an untied lm_head"
+        last = [m for m in self.modules() if isinstance(m, M.Qwen3_5DecoderLayer)][-1]
+        self.lm_head = _routed(self.lm_head, last.mlp.n_delta, c)
+        route_through(self.lm_head, (), last, c)
+
+    model.__init__ = _init  # type: ignore[method-assign]
+
+
+for _m in (M.Qwen3_5ForCausalLM, M.Qwen3_5ForConditionalGeneration):
+    _patch_lm_head(_m)
 
 
 class Checkpoint:

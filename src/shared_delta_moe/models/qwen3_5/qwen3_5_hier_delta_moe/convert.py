@@ -3,7 +3,10 @@ r"""Upscale a dense Qwen3.5 / Qwen3.8 base and its domain fine-tunes into the Hi
 One group per domain; each fine-tune's decoder MLP becomes an expert :math:`\theta_{ij}` of its group, stored as
 :math:`W_b` (the base MLP) and :math:`\Delta_{ij} = \theta_{ij} - W_b` (subtracted in float32, stored in the checkpoint
 dtype). Every other tensor (attention, linear attention, norms, embeddings, ``lm_head``, vision tower, MTP) is merged
-from the fine-tunes with a ``merging.MERGE`` method (``fusion_bench``, extra ``merging``; default ``simple_average``). Routers start at zero: uniform over
+from the fine-tunes with a ``merging.MERGE`` method (``fusion_bench``, extra ``merging``; default ``simple_average``),
+except with ``--routed-deltas``: then every attention and linear-attention projection and ``lm_head`` keeps
+:math:`W_b` and each fine-tune's delta, dense or rounded to a grid (``--routed-levels``, ``compress.quantize`` round
+to nearest), routed per token (``models/routed_linear.py``). Routers start at zero: uniform over
 groups and within each group. With one expert per group, no zero experts and dense group routing, each layer's MLP is
 then the plain average of the fine-tunes' MLPs; a zero expert is the base MLP.
 
@@ -11,7 +14,8 @@ Usage::
 
     python -m shared_delta_moe.models.qwen3_5.qwen3_5_hier_delta_moe.convert BASE DST \
         --group medical=FT1,FT2 --group code=FT3 [--zeros 0] [--top-k 1] [--group-top-k K] \
-        [--merge ties_merging --merge-arg scaling_factor=0.3 --merge-arg threshold=20]
+        [--merge ties_merging --merge-arg scaling_factor=0.3 --merge-arg threshold=20] \
+        [--routed-deltas [--routed-levels 4 --routed-group 128 [--routed-symmetric]]]
 
 Tensors are streamed one at a time from the safetensors shards and written in shards of ``--shard-gb``.
 """
@@ -26,10 +30,15 @@ from typing import Any, Protocol
 
 import torch
 
+from .... import compress as C
 from ....merging import MERGE
+from ...grid import code_bits, pack_codes
 from ..common import Checkpoint, ShardWriter, copy_config
 
 MLP = re.compile(r"(model\.(?:language_model\.)?layers\.\d+\.mlp)\.(gate|up|down)_proj\.weight")
+# the RoutedDeltaLinears of models/qwen3_5/common.py; group 1 or 2: the module whose delta_router routes them
+ROUTED = re.compile(r"(model\.(?:language_model\.)?layers\.\d+\.(?:self_attn|linear_attn))\."
+                    r"(?:[qkvo]_proj|in_proj_(?:qkv|z|b|a)|out_proj)\.weight|(lm_head)\.weight")
 
 
 class Source(Protocol):
@@ -56,7 +65,8 @@ class Mean:
 def convert(base: Source, groups: dict[str, Sequence[Source]], dst: Path, zeros: Sequence[int], top_k: int = 1,
             group_top_k: int | None = None, merge: str = "simple_average",
             merge_args: dict[str, Any] | None = None, shard_gb: float = 5.0,
-            log: Callable[[str], None] = print, router_std: float = 0.0) -> dict[str, Any]:  # fmt: skip
+            log: Callable[[str], None] = print, router_std: float = 0.0,
+            routed: dict[str, Any] | None = None) -> dict[str, Any]:  # fmt: skip
     r"""Write the converted tensors to ``dst`` (config and tokenizer files are ``main``'s job, ``copy_config``).
 
     Args:
@@ -73,6 +83,8 @@ def convert(base: Source, groups: dict[str, Sequence[Source]], dst: Path, zeros:
         log: progress messages.
         router_std: > 0 draws the routers from :math:`\mathcal{N}(0, \sigma^2)`, :math:`\sigma` = ``router_std``
             (seeded per layer) instead of zero, for tests.
+        routed: The ``routed_deltas`` config entry (``levels``: None = dense, ``group``, ``symmetric``); None = merge
+            the attention and ``lm_head`` too.
 
     Returns:
         The ``hier_delta_moe`` config entry.
@@ -99,8 +111,38 @@ def convert(base: Source, groups: dict[str, Sequence[Source]], dst: Path, zeros:
     dst.mkdir(parents=True, exist_ok=True)
     w = ShardWriter(dst, int(shard_gb * 2**30))
     done: set[str] = set()
+    rows = len(names) + sum(len(groups[n]) + z for n, z in zip(names, zeros))
+
+    def router(key: str, cols: int, dtype: torch.dtype) -> None:
+        rt = torch.zeros(rows, cols)
+        if router_std:
+            rt.normal_(std=router_std, generator=torch.Generator().manual_seed(len(done)))
+        w.add(key, rt.to(dtype))
+
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    hidden = base.get(next(k for k in keys if MLP.fullmatch(k) and "gate" in k)).shape[1]  # every router's input
     for i, k in enumerate(sorted(keys)):
         m = MLP.fullmatch(k)
+        r = ROUTED.fullmatch(k) if routed is not None else None
+        if r is not None:
+            b = base.get(k)
+            w.add(k, b)
+            d = torch.stack([s.get(k).float() - b.float() for s in tuned])
+            stem = k[: -len("weight")]
+            if routed.get("levels") is None:
+                w.add(stem + "deltas", d.to(b.dtype))
+            else:
+                L, g, sym = routed["levels"], routed.get("group", 128), routed.get("symmetric", False)
+                qs = [C.quantize(de.to(dev), None, L, g, sym) for de in d]  # round to nearest, no data
+                w.add(stem + "codes", torch.stack([pack_codes(q, code_bits(L)) for q, _, _ in qs]).cpu())
+                w.add(stem + "steps", torch.stack([st for _, _, st in qs]).to(b.dtype).cpu())
+                if not sym:
+                    w.add(stem + "lows", torch.stack([lo for _, lo, _ in qs]).to(b.dtype).cpu())
+            block = r[1] or r[2]
+            if block not in done:
+                done.add(block)
+                router(f"{block}.delta_router.weight", hidden, b.dtype)  # routes the block input, width H
+            continue
         if m is None:
             b = base.get(k)
             ts = [s.get(k) for s, h in zip(uniq, have) if k in h]
@@ -116,11 +158,7 @@ def convert(base: Source, groups: dict[str, Sequence[Source]], dst: Path, zeros:
             d = torch.stack([s.get(f"{prefix}.{p}_proj.weight").float() - b.float() for s in tuned])
             w.add(f"{prefix}.d_{p}", d.to(b.dtype))
             if p == "gate":
-                rows = len(names) + sum(len(groups[n]) + z for n, z in zip(names, zeros))
-                rt = torch.zeros(rows, b.shape[1])
-                if router_std:
-                    rt.normal_(std=router_std, generator=torch.Generator().manual_seed(len(done)))
-                w.add(f"{prefix}.router.weight", rt.to(b.dtype))
+                router(f"{prefix}.router.weight", b.shape[1], b.dtype)
         log(f"{prefix}: {len(tuned)} experts in {len(names)} groups")
     w.close()
     return {"groups": names, "group_sizes": [len(groups[n]) for n in names], "group_zeros": list(zeros),
@@ -146,7 +184,13 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--merge", default="simple_average", choices=sorted(MERGE))
     ap.add_argument("--merge-arg", action="append", default=[], help="KEY=VALUE for the merge method")
     ap.add_argument("--shard-gb", type=float, default=5.0)
+    ap.add_argument("--routed-deltas", action="store_true", help="per-expert attention / lm_head deltas, routed per token")
+    ap.add_argument("--routed-levels", type=int, help="grid values of those deltas (default: dense)")
+    ap.add_argument("--routed-group", type=int, default=128)
+    ap.add_argument("--routed-symmetric", action="store_true")
     a = ap.parse_args(argv)
+    if not a.routed_deltas and (a.routed_levels or a.routed_symmetric):
+        ap.error("--routed-levels / --routed-symmetric need --routed-deltas")
     groups, ckpt = {}, functools.cache(lambda d: Checkpoint(Path(d).resolve()))  # one source per directory
     for g in a.group:
         name, dirs = g.split("=", 1)
@@ -156,9 +200,11 @@ def main(argv: list[str] | None = None) -> None:
     zeros = zeros * len(groups) if len(zeros) == 1 else zeros
     merge_args = {k: _value(v) for k, v in (s.split("=", 1) for s in a.merge_arg)}
     a.dst.mkdir(parents=True)
+    routed = None if not a.routed_deltas else {"levels": a.routed_levels, "group": a.routed_group,
+                                                "symmetric": a.routed_symmetric}  # fmt: skip
     entry = convert(Checkpoint(a.base), groups, a.dst, zeros, a.top_k, a.group_top_k, a.merge,
-                    merge_args, a.shard_gb)  # fmt: skip
-    copy_config(a.base, a.dst, lambda text: text.update(hier_delta_moe=entry))
+                    merge_args, a.shard_gb, routed=routed)  # fmt: skip
+    copy_config(a.base, a.dst, lambda text: text.update(hier_delta_moe=entry, **({"routed_deltas": routed} if routed else {})))
     print(f"{sum(entry['group_sizes'])} experts in groups {dict(zip(entry['groups'], entry['group_sizes']))}, "
           f"zeros {zeros}, top-{a.top_k} per group, groups {'dense' if a.group_top_k is None else a.group_top_k}, "
           f"merge {a.merge} {merge_args}")  # fmt: skip

@@ -67,6 +67,26 @@ def unpack_codes(w: Tensor, bits: int) -> Tensor:
     return ((w[..., None] >> shift) & (2**bits - 1)).flatten(-2)
 
 
+def grid_delta(codes: Tensor, step: Tensor, low: Tensor | None, levels: int, bits: int) -> Tensor:
+    r"""One dense delta from its grid storage, :math:`\ell + s q` per group; differentiable in ``step`` and ``low``.
+
+    Args:
+        codes: (R, C b / 32) int32 packed codes (``pack_codes``).
+        step: (R, C / g) steps.
+        low: (R, C / g) lowest levels; None = symmetric grids (:math:`\ell = -s (L - 1) / 2`).
+        levels: :math:`L`.
+        bits: :math:`b`, code bits.
+
+    Returns:
+        (R, C) in ``step``'s dtype.
+    """
+    R, n = step.shape
+    s = step[..., None]
+    z = -s * ((levels - 1) / 2) if low is None else low[..., None]
+    q = unpack_codes(codes, bits).view(R, n, -1)
+    return torch.addcmul(z, q.to(s.dtype), s).view(R, -1)  # one fma, the grids broadcast over each group
+
+
 class GridDeltaMoE(PackedDeltaMoE):
     """DeltaMoE whose deltas are group-grid codes (see the module docstring).
 
@@ -109,11 +129,8 @@ class GridDeltaMoE(PackedDeltaMoE):
     def _unpack(self, name: str, e: int) -> Tensor:
         r"""Dense :math:`\Delta_e` of one projection, :math:`\ell + s q` per group; differentiable in the steps and
         lowest levels."""
-        _, R, Cn = self.shapes[name]
-        s = getattr(self, f"s_{name}")[e][..., None]
-        z = -s * ((self.levels - 1) / 2) if self.symmetric else getattr(self, f"z_{name}")[e][..., None]
-        q = unpack_codes(getattr(self, f"c_{name}")[e], self.bits).view(R, -1, self.group)
-        return torch.addcmul(z, q.to(s.dtype), s).view(R, Cn)  # one fma, the grids broadcast over each group
+        return grid_delta(getattr(self, f"c_{name}")[e], getattr(self, f"s_{name}")[e],
+                          None if self.symmetric else getattr(self, f"z_{name}")[e], self.levels, self.bits)
 
     def bits_per_entry(self) -> float:
         """Storage per delta entry: code bits plus the steps (and lowest levels) in the model dtype."""

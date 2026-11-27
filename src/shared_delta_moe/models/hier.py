@@ -132,7 +132,7 @@ class HierDeltaMoE(DeltaMoE):
             dst.copy_(torch.stack([w[i] for w in experts]) - b if experts else dst)
         return m
 
-    def topk(self, x: Tokens) -> tuple[Tensor, Tensor]:
+    def topk(self, x: Tokens, router: nn.Module | None = None) -> tuple[Tensor, Tensor]:
         r"""Route tokens to the flattened DeltaMoE slots.
 
         Per token :math:`S \cdot k_1` slots (:math:`S = G` if ``group_top_k`` is None, else :math:`k_0`) weighted
@@ -140,6 +140,7 @@ class HierDeltaMoE(DeltaMoE):
 
         Args:
             x: (T, H) tokens.
+            router: Another router shaped like ``self.router`` (``DeltaMoE.topk``); None = ``self.router``.
 
         Returns:
             (idx, weight), both (T, ``top_k``): ``idx`` is the int64 delta index per slot (``n_delta``: the base),
@@ -147,7 +148,7 @@ class HierDeltaMoE(DeltaMoE):
         """
         G = len(self.group_sizes)
         col, delta, pad = self._tables(x.device)
-        logits = self.router(x).float()
+        logits = (self.router if router is None else router)(x).float()
         h = logits[:, :G].softmax(-1)
         p = logits[:, G:][:, col].masked_fill(pad, float("-inf")).softmax(-1)  # T G M
         pv, pj = p.topk(self.k1, dim=-1)

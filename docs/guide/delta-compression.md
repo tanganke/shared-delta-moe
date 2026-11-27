@@ -320,6 +320,31 @@ Adding the uncompressed deltas back gives KL 0.0000: the numbers are compression
   9-13%. Each expert keeps its own, at 2 bits.
 - Clipping still hurts round to nearest (textbook 0.0017), and a Hadamard rotation does not help (0.0007).
 
+Merging the non-MLP deltas of the three experts into one shared copy instead (MLP deltas dense, same KL):
+
+| shared non-MLP weights | literature | textbook | drugs |
+|---|---:|---:|---:|
+| mean | 0.0028 | 0.0118 | 0.038 |
+| task arithmetic, $\lambda = 0.5$ | 0.0037 | 0.0068 | 0.0173 |
+| TIES, top 50% kept, $\lambda = 1$ | 0.0061 | 0.0052 | 0.0094 |
+| DARE (drop 90%) then TIES | 0.0128 | 0.0099 | 0.0335 |
+| none: each expert's own, RTN 2 bit | 0.0005 | 0.0007 | 0.0014 |
+
+The best merge stays 7-12 times worse than per-expert 2-bit deltas, so the 27B MoE keeps them per expert, routed per
+token ([Qwen3.5](qwen3_5.md), `--routed-deltas`). Within that, some weights can still be shared (every delta 2-bit,
+then the named ones taken from the base):
+
+| shared from the base | literature | textbook | drugs |
+|---|---:|---:|---:|
+| nothing | 0.0005 | 0.0008 | 0.0015 |
+| embedding | 0.0005 | 0.0008 | 0.0016 |
+| `lm_head` | 0.0010 | 0.0033 | 0.0024 |
+| every non-matrix tensor (norms, `conv1d`, `A_log`, `dt_bias`) and the embedding | 0.0012 | 0.0009 | 0.0017 |
+
+The embedding and the non-matrix tensors are shared; `lm_head` is not. On the literature expert the shared `conv1d`
+alone raises its KL from 0.0005 to 0.0012 (general text 0.0005 to 0.0028): that expert, from another training
+recipe, changed it more.
+
 ### Accuracy
 
 Accuracy in % (4 samples per question, 500 questions per set), against the dense-delta model; in parentheses the paired

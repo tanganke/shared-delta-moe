@@ -67,3 +67,38 @@ merge). Tensors are streamed from the safetensors shards and written in shards (
 few tensors. `tests/test_qwen3_5_hier_delta_moe.py` converts a tiny model with perturbed fine-tunes and compares its
 logits with the stock dense model running the ensemble of the fine-tunes' full MLPs.
 
+
+### Per-expert attention and `lm_head` deltas
+
+Full fine-tunes (continued pretraining) change every weight, and a merged attention loses much of what they learned:
+on three Qwen3.8-27B experts, a shared attention, linear attention and `lm_head` (mean, task arithmetic or TIES) is
+7-12 times further from each expert than giving each expert its own 2-bit delta
+([delta compression](delta-compression.md)). `--routed-deltas` keeps them per expert:
+
+```bash
+python -m shared_delta_moe.models.qwen3_5.qwen3_5_hier_delta_moe.convert BASE DST --group ... \
+    --routed-deltas [--routed-levels 4 --routed-group 128 [--routed-symmetric]]
+```
+
+Every attention projection (`q_proj`, `k_proj`, `v_proj`, `o_proj`), linear-attention projection (`in_proj_qkv`,
+`in_proj_z`, `in_proj_b`, `in_proj_a`, `out_proj`) and `lm_head` becomes a `RoutedDeltaLinear`
+(`models/routed_linear.py`): the base weight $W_b$ plus each expert's $\Delta_e$, dense or on a group grid
+([group grids](grid.md); `--routed-levels` rounds to nearest, no data). Token $t$ with routing slots $(e_i, r_i)$,
+$\sum_i r_i = 1$, gets
+
+$$
+y_t = W_b x_t + \sum_i r_i \, \Delta_{e_i} x_t = \Big(W_b + \sum_i r_i \Delta_{e_i}\Big) x_t ,
+$$
+
+the routed experts' weights mixed per token; the layer is linear, so mixing outputs and mixing weights agree. A zero
+expert adds no delta. Each attention block has its own router `delta_router`, shaped like its layer's MoE router and
+routed the same way (`DeltaMoE.topk(x, router)`: groups, zero experts and top-k as in the MLP), on the block's input;
+`lm_head`'s router is routed like the last layer's MoE. Expert $e$ is the same fine-tune in every routed weight. The
+routers start at zero, like the MLP's.
+
+Embeddings, norms and the linear attention's `conv1d`, `A_log` and `dt_bias` stay shared (`--merge`; the base itself
+with `--merge task_arithmetic --merge-arg scaling_factor=0`): on the 27B experts sharing them costs little, sharing
+`lm_head` does not. The text config gets `routed_deltas` (`levels`, null for dense; `group`; `symmetric`), which
+both Qwen3.5 integrations read. The forward loops over the routed experts (no fused kernel yet).
+`tests/test_routed_linear.py` checks the layer against per-token weight mixing, and a converted tiny model routed to
+one expert against that fine-tune.
