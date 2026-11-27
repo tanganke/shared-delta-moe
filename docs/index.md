@@ -21,6 +21,7 @@ guide/moe
 guide/delta-formats
 guide/qwen3_5
 guide/routed-deltas
+guide/looped
 guide/vllm
 guide/training
 guide/router-training

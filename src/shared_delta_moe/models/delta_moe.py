@@ -227,7 +227,7 @@ class DeltaMoE(nn.Module):
             routing weights, each row renormalised to sum to 1.
         """
         router = self.router if router is None else router
-        logits = router(x)
+        logits = router(x.to(router.weight.dtype))  # an fp32 router (trained in full precision) on bf16 x
         pick = replay(router, logits, lambda: softmax_topk(logits.detach(), self.top_k)[0])
         return softmax_topk(logits, self.top_k, pick)
 

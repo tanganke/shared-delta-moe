@@ -155,7 +155,7 @@ class HierDeltaMoE(DeltaMoE):
         """
         col, delta, pad = self._tables(x.device)
         router = self.router if router is None else router
-        logits = router(x)
+        logits = router(x.to(router.weight.dtype))
         pick = replay(router, logits, lambda: hier_topk(logits.detach(), col, pad, self.k1, self.group_top_k)[:2])
         gi, pj, w = hier_topk(logits, col, pad, self.k1, self.group_top_k, pick)
         e = delta[gi[..., None], pj].flatten(1)  # T S*k1
