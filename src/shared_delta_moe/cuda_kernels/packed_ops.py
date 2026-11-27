@@ -131,6 +131,8 @@ def _grid_ok(x: Tensor, pairs: int, base: tuple[Tensor | None, ...], deltas) -> 
         return False
     if any(w is not None and (w.dtype != x.dtype or not w.is_contiguous() or not _aligned(w)) for w in base):
         return False
+    if len(deltas) == 3 and deltas[0].block != deltas[1].block:  # gate and up share the kernels' group
+        return False
     for dl in deltas:
         if dl.mode != 3 or dl.block < 32 or dl.block & (dl.block - 1) or dl.d.shape[1] % 16:
             return False
@@ -216,11 +218,30 @@ def matrix_moe(x: Tensor, r, base: tuple[Tensor, Tensor, Tensor], deltas) -> Ten
 
     (pg, mg), (pu, mu), (pd, md) = extra(dg), extra(du), extra(dd)
     g0, u0 = F.linear(x, base[0]), F.linear(x, base[1])
+    if all(_grid_fast(d, k) for d, k in ((dg, x.shape[1]), (dd, g0.shape[1]))):  # grid_kernel (factored, faster)
+        h = torch.ops.sdm_packed.grid_gate_up(*_prep(x), r.perm, r.gstart, g0, u0, dg.d, du.d, pg, pu, mg, mu,
+                                              dg.block, r.top_k)  # fmt: skip
+        o = torch.ops.sdm_packed.grid_down(*_prep(h), r.perm, r.gstart, r.weight, F.linear(h, base[2]), dd.d, pd, md,
+                                           dd.block, r.top_k)  # fmt: skip
+        return o if r.top_k == 1 else o.view(r.tokens, r.top_k, -1).sum(1).to(x.dtype)
     h = torch.ops.sdm_packed.matrix_gate_up(x, r.perm, r.gstart, g0, u0, dg.d, du.d, pg, pu, mg, mu, dg.mode, dg.block,
                                             r.top_k)  # fmt: skip  # (P, I), sorted pairs
     o = torch.ops.sdm_packed.matrix_down(h, r.perm, r.gstart, r.weight, F.linear(h, base[2]), dd.d, pd, md, dd.mode,
                                          dd.block, r.top_k)  # fmt: skip  # (P, H) r_i y_i by pair
     return o if r.top_k == 1 else o.view(r.tokens, r.top_k, -1).sum(1).to(x.dtype)
+
+
+def _grid_fast(d, K: int) -> bool:
+    """The grid ops (``grid_gate_up`` / ``grid_down``: 2-bit grids factored per 128-entry block) take this Delta of
+    input width K: groups a multiple of 128 and an even number of them per row."""
+    return d.mode == 3 and d.block % 128 == 0 and (K // d.block) % 2 == 0
+
+
+def _prep(v: Tensor) -> tuple[Tensor, Tensor]:
+    """The grid ops' activations: v with each 16-entry chunk interleaved (entries i, i + 8 adjacent, as the kernel
+    pairs the codes) and v's fp32 sums over 128-entry blocks."""
+    rows, K = v.shape
+    return v.view(rows, K // 16, 2, 8).transpose(2, 3).reshape(rows, K), v.float().view(rows, K // 128, 128).sum(-1)
 
 
 def matrix_moe_any(x: Tensor, idx: Tensor, rw: Tensor, n_delta: int, base: tuple[Tensor, Tensor, Tensor],
@@ -312,9 +333,15 @@ def routed_matrix(x: Tensor, idx: Tensor, rw: Tensor, n_delta: int, d) -> Tensor
     if x.data_ptr() % 16:
         x = x.clone()
     r = route(idx, rw, n_delta)
-    h = x[r.perm // r.top_k]  # sorted pairs
-    zero = h.new_zeros(h.shape[0], d.d.shape[1])
-    o = torch.ops.sdm_packed.matrix_down(h, r.perm, r.gstart, r.weight, zero, d.d, d.p, d.m, 3, d.block, r.top_k)
+    zero = x.new_zeros(r.perm.shape[0], d.d.shape[1])
+    if _grid_fast(d, x.shape[1]):
+        xp, xs = _prep(x)
+        tok = r.perm // r.top_k  # sorted pairs
+        o = torch.ops.sdm_packed.grid_down(xp[tok], xs[tok], r.perm, r.gstart, r.weight, zero, d.d, d.p, d.m, d.block,
+                                           r.top_k)  # fmt: skip
+    else:
+        h = x[r.perm // r.top_k]  # sorted pairs
+        o = torch.ops.sdm_packed.matrix_down(h, r.perm, r.gstart, r.weight, zero, d.d, d.p, d.m, 3, d.block, r.top_k)
     return o.view(r.tokens, r.top_k, -1).sum(1).to(x.dtype)
 
 

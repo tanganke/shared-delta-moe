@@ -208,6 +208,63 @@ def test_cuda_matrix_matches_triton():
             assert rel(got, want) < 2e-2, (case, t, rel(got, want))
 
 
+
+def test_grid_ops_match_fp32():
+    """grid_gate_up / grid_down (packed_ops.matrix_moe, routed_matrix: 2-bit grids factored per 128-entry block)
+    against fp32 on the decoded deltas: grid_small_kernel (few pairs) and grid_kernel (2 and 4 pair tiles), bf16
+    and fp16, groups 128 and 256, and routed rows not a multiple of 64."""
+    import torch.nn.functional as F
+
+    from shared_delta_moe.cuda_kernels import packed_ops
+    from shared_delta_moe.models.grid import grid_delta
+    from shared_delta_moe.triton_kernels import Delta
+    from shared_delta_moe.triton_kernels.fused import route
+
+    if not (torch.cuda.is_available() and packed_ops.available() and torch.cuda.get_device_capability() == (9, 0)):
+        print("skipped: CUDA library not built / not sm_90")
+        return
+    torch.manual_seed(0)
+    G, H, I, dev = 3, 512, 1024, "cuda"
+    rel = lambda a, b: ((a.float() - b).abs().max() / b.abs().max()).item()
+    for dt in (torch.bfloat16, torch.float16):
+        for group in (128, 256):
+            def grids(n, k):
+                return (torch.randint(-2**31, 2**31 - 1, (G, n, k // 16), device=dev, dtype=torch.int32),
+                        (torch.rand(G, n, k // group, device=dev) * 0.02).to(dt),
+                        (torch.rand(G, n, k // group, device=dev) * -0.03).to(dt))
+            cs = (grids(I, H), grids(I, H), grids(H, I))
+            deltas = tuple(Delta(3, c, s_, z, group) for c, s_, z in cs)
+            dec = [[grid_delta(c[e], s_[e], z[e], 4, 2).float() for e in range(G)] for c, s_, z in cs]
+            base = tuple((torch.randn(*sh, device=dev) * 0.05).to(dt) for sh in ((I, H), (I, H), (H, I)))
+            for T, k in ((1, 2), (6, 2), (20, 2), (40, 3)):  # small kernel; 2 and 4 pair tiles
+                idx = torch.stack([torch.randperm(G + 1, device=dev)[:k] for _ in range(T)])  # G: a zero expert
+                rw = torch.rand(T, k, device=dev).softmax(-1)
+                x = torch.randn(T, H, device=dev, dtype=dt)
+                got = packed_ops.matrix_moe(x, route(idx, rw, G), base, deltas)
+                want = torch.zeros(T, H, device=dev)
+                for t in range(T):
+                    for j in range(k):
+                        e, xf = int(idx[t, j]), x[t].float()
+                        w = [b.float() + (dec[m][e] if e < G else 0) for m, b in enumerate(base)]
+                        h = F.silu(w[0] @ xf) * (w[1] @ xf)
+                        want[t] += rw[t, j] * (w[2] @ h)
+                assert rel(got, want) < 2e-2, (dt, group, T, k, rel(got, want))
+            R = 48  # routed rows: not a multiple of 64
+            c, s_, z = grids(R, H)
+            for T in (1, 9, 30):
+                idx = torch.randint(0, G + 1, (T, 2), device=dev)
+                idx[:, 0] %= G  # every token some delta (want != 0)
+                rw = torch.rand(T, 2, device=dev)
+                x = torch.randn(T, H, device=dev, dtype=dt)
+                got = packed_ops.routed_matrix(x, idx, rw, G, Delta(3, c, s_, z, group))
+                want = torch.zeros(T, R, device=dev)
+                for t in range(T):
+                    for j in range(2):
+                        e = int(idx[t, j])
+                        if e < G:
+                            want[t] += rw[t, j] * (grid_delta(c[e], s_[e], z[e], 4, 2).float() @ x[t].float())
+                assert rel(got, want) < 2e-2, (dt, group, "routed", T, rel(got, want))
+
 if __name__ == "__main__":
     for name, f in list(globals().items()):
         if name.startswith("test_"):

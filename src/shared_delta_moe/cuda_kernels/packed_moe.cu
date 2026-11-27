@@ -609,6 +609,7 @@ struct MParams {
   const void* p[2];   // DARE (G, N) int64 row starts; BitDelta (G, N, nsb) scales
   const int* m[2];    // DARE (G, N, mw) keep bitmap; grid (G, N, nsb) lowest levels (as T)
   void* out;          // gate_up: (P, N) h sorted; down: (P, N) r y by pair
+  const float* xs;    // grid_kernel: (rows of x, K / 128) sums of x over each 128-entry block
   int N, K, G, topk, mw, nsb, bs, sbs, gather;
 };
 
@@ -952,6 +953,383 @@ at::Tensor matrix_down(const at::Tensor& h, const at::Tensor& perm, const at::Te
   return o;
 }
 
+// grid_kernel (2-bit group grids, groups a multiple of 128): a CTA owns 16 rows, its 4 warps split K (128-entry
+// blocks; the next block's codes load while one computes), the group's pairs in passes of 8 NT. Per 128-entry block b of a row (one group: step s, lowest level l), with
+// X_b = sum of the pair's activations over b (xs, precomputed): delta . x = s sum q x + l X_b. The tensor cores take
+// v = 1 + q / 4 (exact: q in the top mantissa bits of 1.0), so the block's mma gives P = X_b + (sum q x) / 4 and
+// delta . x = 4 s P + (l - 4 s) X_b, folded in fp32. Unlike mma_kernel the delta entries are not rounded to the
+// model dtype first (exact s q + l).
+// k permutation: lane q takes entries 32q .. 32q + 31 of the block (words 8b + 2q, 8b + 2q + 1: one uint2 per row);
+// register i of word w holds entries 16w + i and 16w + i + 8 (codes at bits 2i and 2i + 16: a shift and a lop3), and
+// the activations come pre-permuted alike (grid_prep in packed_ops: x' [16w + 2i + j] = x[16w + i + 8j]). The mma's k slots 2q, 2q + 1 take register i0 = 2 (m % 4) of
+// word m / 4, slots 2q + 8, 2q + 9 register i0 + 1, for both operands.
+template <typename T>
+struct Magic;
+template <>
+struct Magic<__nv_bfloat16> {
+  static constexpr int SH = 5;                  // q / 4 in mantissa bits 5, 6 of bf16 1.0
+  static constexpr unsigned ONE = 0x3F803F80u;
+};
+template <>
+struct Magic<__half> {
+  static constexpr int SH = 8;
+  static constexpr unsigned ONE = 0x3C003C00u;
+};
+
+template <typename T, int I>
+__device__ __forceinline__ unsigned qv(unsigned w) {  // codes at bits 2I, 2I + 16 -> 1 + q / 4 in both halves
+  constexpr int s = 2 * I - Magic<T>::SH;
+  unsigned t;
+  if constexpr (s >= 0) t = w >> s;
+  else t = w << (-s);
+  return (t & (0x00030003u << Magic<T>::SH)) | Magic<T>::ONE;
+}
+template <typename T>
+__device__ __forceinline__ void dec8(unsigned w, unsigned* a) {
+  a[0] = qv<T, 0>(w), a[1] = qv<T, 1>(w), a[2] = qv<T, 2>(w), a[3] = qv<T, 3>(w);
+  a[4] = qv<T, 4>(w), a[5] = qv<T, 5>(w), a[6] = qv<T, 6>(w), a[7] = qv<T, 7>(w);
+}
+
+// Shared-memory layout of one pipeline stage (one 128-entry block b): the codes of the CTA's 64 rows, the steps and
+// lowest levels of b's group si and its neighbour (si & ~1, si | 1: cp.async needs 4-byte pieces), the pass's
+// activations (rows padded to 272 bytes: the lanes' 8-byte reads of 8 pairs fall in distinct banks) and their block
+// sums X_b.
+template <int MATS, int NT>
+struct GridStage {
+  static constexpr int XR = 272, CB = MATS * 64 * 32, SB = MATS * 2 * 64 * 4, XB = NT * 8 * XR, XS = NT * 8 * 4;
+  static constexpr int BYTES = CB + SB + XB + XS;
+  static constexpr int STAGES = NT == 2 ? 4 : 3;
+};
+
+template <int MATS, int NT, typename T>
+__global__ void __launch_bounds__(128) grid_kernel(const MParams p) {
+  using L = GridStage<MATS, NT>;
+  constexpr int S = L::STAGES;
+  extern __shared__ __align__(16) unsigned char sm[];
+  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, r0 = lane >> 2, q = lane & 3;
+  int g = 0;  // the blockIdx.y-th group with pairs (the grid has min(P, G + 1) of them)
+  for (int c = blockIdx.y;; g++) {
+    if (g > p.G) return;
+    if (p.gstart[g + 1] > p.gstart[g] && c-- == 0) break;
+  }
+  const int lo = p.gstart[g], hi = p.gstart[g + 1], N = p.N, K = p.K, nc = blockIdx.x * 64, n0 = nc + warp * 16;
+  const bool delta = g < p.G, rows = n0 < N;  // (rows: uniform per warp)
+  const T* x = reinterpret_cast<const T*>(p.x);
+  const int nb = K >> 7;
+  for (int t0 = lo; t0 < hi; t0 += 8 * NT) {
+    const int nt = min(8 * NT, hi - t0);
+    float acc[MATS][NT][4] = {};
+    if (delta) {
+      // this thread's cp.async sources for block 0 (block b: + b * the per-block stride) and destinations
+      constexpr int NX = (NT * 8 * 16 + 127) / 128;  // activation chunks per thread
+      const char* csrc[MATS];
+      const T* ssrc[MATS];
+      int cdst[MATS], sdst[MATS];
+      bool cok[MATS];
+#pragma unroll
+      for (int i = 0; i < MATS; i++) {
+        const int c = threadIdx.x + 128 * i, mat = c >> 7, row = (c & 127) >> 1, n = min(nc + row, N - 1);
+        csrc[i] = reinterpret_cast<const char*>(p.d[mat]) + ((long long)g * N + n) * p.mw * 4 + (c & 1) * 16;
+        cdst[i] = mat * 2048 + row * 32 + (c & 1) * 16, cok[i] = nc + row < N;
+        ssrc[i] = reinterpret_cast<const T*>((c & 1) ? p.m[mat] : p.p[mat]) + ((long long)g * N + n) * p.nsb;
+        sdst[i] = L::CB + ((mat * 2 + (c & 1)) * 64 + row) * 4;
+      }
+      const T* xsrc[NX];
+      int xdst[NX];
+#pragma unroll
+      for (int i = 0; i < NX; i++) {
+        const int c = threadIdx.x + 128 * i, pr = t0 + min(c >> 4, nt - 1);
+        xsrc[i] = x + (long long)(p.gather ? p.perm[pr] / p.topk : pr) * K + (c & 15) * 8;
+        xdst[i] = c < nt * 16 ? L::CB + L::SB + (c >> 4) * L::XR + (c & 15) * 16 : -1;
+      }
+      const float* ssum = nullptr;
+      if (threadIdx.x < nt) {
+        const int pr = t0 + threadIdx.x;
+        ssum = p.xs + (long long)(p.gather ? p.perm[pr] / p.topk : pr) * nb;
+      }
+      auto issue = [&](int b) {  // block b into its stage (one commit group per block, maybe empty)
+        if (b < nb) {
+          unsigned char* st = sm + (b % S) * L::BYTES;
+#pragma unroll
+          for (int i = 0; i < MATS; i++) {
+            cp16(st + cdst[i], csrc[i] + b * 32, cok[i]);
+            cp4(st + sdst[i], ssrc[i] + (((b << 7) >> p.sbs) & ~1));  // groups si & ~1, si | 1
+          }
+#pragma unroll
+          for (int i = 0; i < NX; i++)
+            if (xdst[i] >= 0) cp16(st + xdst[i], xsrc[i] + (b << 7), true);
+          if (ssum) cp4(st + L::CB + L::SB + L::XB + threadIdx.x * 4, ssum + b);
+        }
+        commit();
+      };
+#pragma unroll
+      for (int u = 0; u < S - 1; u++) issue(u);
+#pragma unroll 1
+      for (int b = 0; b < nb; b++) {
+        wait_async<S - 2>();  // block b landed (every block commits one group)
+        __syncthreads();      // ... for every thread; and block b - 1's stage is free again
+        issue(b + S - 1);
+        if (!rows) continue;
+        const unsigned char* st = sm + (b % S) * L::BYTES;
+        uint2 w[MATS][2];
+        float sv[MATS][2], zv[MATS][2];
+#pragma unroll
+        for (int mat = 0; mat < MATS; mat++)
+#pragma unroll
+          for (int h = 0; h < 2; h++) {
+            const int row = warp * 16 + r0 + 8 * h;
+            w[mat][h] = *reinterpret_cast<const uint2*>(st + mat * 2048 + row * 32 + q * 8);
+            const int si = ((b << 7) >> p.sbs) & 1;  // the block's group (of the two staged)
+            const T* sp = reinterpret_cast<const T*>(st + L::CB + (mat * 2 * 64 + row) * 4) + si;
+            const T* lp = reinterpret_cast<const T*>(st + L::CB + ((mat * 2 + 1) * 64 + row) * 4) + si;
+            sv[mat][h] = 4.f * to_f(*sp), zv[mat][h] = to_f(*lp) - sv[mat][h];
+          }
+        float P[MATS][NT][4] = {};
+        const unsigned char* xb = st + L::CB + L::SB + r0 * L::XR + q * 64;
+#pragma unroll
+        for (int m = 0; m < 8; m++) {
+          const int wd = m >> 2;  // word: entries 0..15 or 16..31 of the lane's 32
+          unsigned a[MATS][2][2];
+#pragma unroll
+          for (int mat = 0; mat < MATS; mat++)
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+              const unsigned v = wd ? w[mat][h].y : w[mat][h].x;
+              switch (m & 3) {  // registers i0 = 2 (m & 3), i0 + 1 of the word
+                case 0: a[mat][h][0] = qv<T, 0>(v), a[mat][h][1] = qv<T, 1>(v); break;
+                case 1: a[mat][h][0] = qv<T, 2>(v), a[mat][h][1] = qv<T, 3>(v); break;
+                case 2: a[mat][h][0] = qv<T, 4>(v), a[mat][h][1] = qv<T, 5>(v); break;
+                default: a[mat][h][0] = qv<T, 6>(v), a[mat][h][1] = qv<T, 7>(v);
+              }
+            }
+#pragma unroll
+          for (int j = 0; j < NT; j++) {
+            if (8 * j >= nt) break;  // (uniform)
+            const uint2 bb = *reinterpret_cast<const uint2*>(xb + j * 8 * L::XR + wd * 32 + (m & 3) * 8);
+#pragma unroll
+            for (int mat = 0; mat < MATS; mat++)
+              Ty<T>::mma(P[mat][j], a[mat][0][0], a[mat][1][0], a[mat][0][1], a[mat][1][1], bb.x, bb.y);
+          }
+        }
+        const float* xsb = reinterpret_cast<const float*>(st + L::CB + L::SB + L::XB);
+#pragma unroll
+        for (int j = 0; j < NT; j++) {
+          if (8 * j >= nt) break;
+          const float X0 = xsb[8 * j + 2 * q], X1 = xsb[8 * j + 2 * q + 1];  // (pairs past nt: unused)
+#pragma unroll
+          for (int mat = 0; mat < MATS; mat++) {
+            acc[mat][j][0] += sv[mat][0] * P[mat][j][0] + zv[mat][0] * X0;
+            acc[mat][j][1] += sv[mat][0] * P[mat][j][1] + zv[mat][0] * X1;
+            acc[mat][j][2] += sv[mat][1] * P[mat][j][2] + zv[mat][1] * X0;
+            acc[mat][j][3] += sv[mat][1] * P[mat][j][3] + zv[mat][1] * X1;
+          }
+        }
+      }
+      wait_async<0>();
+      __syncthreads();  // the next pass reuses the stages
+    }
+    if (!rows) continue;
+#pragma unroll
+    for (int j = 0; j < NT; j++)
+#pragma unroll
+      for (int e = 0; e < 4; e++) {  // C fragment: row r0 + 8 (e >> 1), pair 8j + 2q + (e & 1)
+        const int t = 8 * j + 2 * q + (e & 1);
+        if (t < nt) epilogue<MATS, T>(p, t0 + t, n0 + r0 + 8 * (e >> 1), acc[0][j][e], acc[MATS - 1][j][e]);
+      }
+  }
+}
+
+// grid_small_kernel: grid_kernel's arithmetic for few pairs per group (one pass of <= 8): a CTA owns 16 rows and its
+// 4 warps split K (4x the CTAs: parallelism at batch 1), next block's operands prefetched in registers.
+template <int MATS, typename T>
+__global__ void __launch_bounds__(128) grid_small_kernel(const MParams p) {
+  constexpr int NT = 1, RT = 1, KS = 4;
+  __shared__ float4 red[RT * KS][MATS][NT][32];  // per warp partials (the KS warps of a row tile split K)
+  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, r0 = lane >> 2, q = lane & 3;
+  const int rt = warp % RT, ks = warp / RT;
+  int g = 0;  // the blockIdx.y-th group with pairs (the grid has min(P, G + 1) of them)
+  for (int c = blockIdx.y;; g++) {
+    if (g > p.G) return;
+    if (p.gstart[g + 1] > p.gstart[g] && c-- == 0) break;
+  }
+  const int lo = p.gstart[g], hi = p.gstart[g + 1], N = p.N, K = p.K, n0 = (blockIdx.x * RT + rt) * 16;
+  const T* x = reinterpret_cast<const T*>(p.x);
+  const int nb = K >> 7, per = (nb + KS - 1) / KS, b_lo = min(nb, ks * per), b_hi = g < p.G ? min(nb, b_lo + per) : b_lo;
+  const long long row0 = (long long)g * N + n0 + r0, row1 = row0 + 8;
+  // block b's code words (rows r0, r0 + 8) and 4 s, l - 4 s of both rows, per matrix
+  auto load = [&](int b, uint2 (&w)[MATS][2], float (&sz)[MATS][4]) {
+    const int si = (b << 7) >> p.sbs;
+#pragma unroll
+    for (int mat = 0; mat < MATS; mat++) {
+      const uint2* cw = reinterpret_cast<const uint2*>(p.d[mat]);
+      w[mat][0] = __ldg(cw + ((row0 * p.mw + 8 * b) >> 1) + q);
+      w[mat][1] = __ldg(cw + ((row1 * p.mw + 8 * b) >> 1) + q);
+      const T* st = reinterpret_cast<const T*>(p.p[mat]);
+      const T* lw = reinterpret_cast<const T*>(p.m[mat]);
+      sz[mat][0] = 4.f * to_f(st[row0 * p.nsb + si]), sz[mat][1] = 4.f * to_f(st[row1 * p.nsb + si]);
+      sz[mat][2] = to_f(lw[row0 * p.nsb + si]) - sz[mat][0], sz[mat][3] = to_f(lw[row1 * p.nsb + si]) - sz[mat][1];
+    }
+  };
+  for (int t0 = lo; t0 < hi; t0 += 8 * NT) {
+    const int nt = min(8 * NT, hi - t0);
+    float acc[MATS][NT][4] = {};
+    const T* xr[NT];          // B operand: pair 8j + r0 of the pass
+    const float* xsr[NT][2];  // C fragment: pairs 8j + 2q, 8j + 2q + 1
+#pragma unroll
+    for (int j = 0; j < NT; j++) {
+      const int pr = t0 + min(8 * j + r0, nt - 1);
+      xr[j] = x + (long long)(p.gather ? p.perm[pr] / p.topk : pr) * K + 32 * q;
+#pragma unroll
+      for (int e = 0; e < 2; e++) {
+        const int pc = t0 + min(8 * j + 2 * q + e, nt - 1);
+        xsr[j][e] = p.xs + (long long)(p.gather ? p.perm[pc] / p.topk : pc) * nb;
+      }
+    }
+    // block b's codes, scales, X and activations, loaded one block ahead (NT == 1)
+    uint2 wc[MATS][2];
+    float sc[MATS][4], xc[2];
+    uint4 vc[4];
+    auto loadx = [&](int b, float (&X)[2], uint4 (&v)[4]) {
+      X[0] = __ldg(xsr[0][0] + b), X[1] = __ldg(xsr[0][1] + b);
+      const uint4* xp = reinterpret_cast<const uint4*>(xr[0] + (b << 7));
+      v[0] = __ldg(xp), v[1] = __ldg(xp + 1), v[2] = __ldg(xp + 2), v[3] = __ldg(xp + 3);
+    };
+    if (b_lo < b_hi) load(b_lo, wc, sc), loadx(b_lo, xc, vc);
+#pragma unroll 1
+    for (int b = b_lo; b < b_hi; b++) {
+      uint2 wn[MATS][2];
+      float sn[MATS][4], xn[2];
+      uint4 vn[4];
+      if (b + 1 < b_hi) load(b + 1, wn, sn), loadx(b + 1, xn, vn);  // in flight while block b computes
+      unsigned a[MATS][2][16];  // rows r0, r0 + 8: word 0 registers 0..7, word 1 registers 8..15
+#pragma unroll
+      for (int mat = 0; mat < MATS; mat++)
+#pragma unroll
+        for (int h = 0; h < 2; h++) dec8<T>(wc[mat][h].x, a[mat][h]), dec8<T>(wc[mat][h].y, a[mat][h] + 8);
+      const unsigned r[16] = {vc[0].x, vc[0].y, vc[0].z, vc[0].w, vc[1].x, vc[1].y, vc[1].z, vc[1].w,
+                              vc[2].x, vc[2].y, vc[2].z, vc[2].w, vc[3].x, vc[3].y, vc[3].z, vc[3].w};
+      float P[MATS][4] = {};
+#pragma unroll
+      for (int m = 0; m < 8; m++) {
+        const int w = m >> 2, i0 = 2 * (m & 3), i1 = i0 + 1;
+#pragma unroll
+        for (int mat = 0; mat < MATS; mat++)
+          Ty<T>::mma(P[mat], a[mat][0][8 * w + i0], a[mat][1][8 * w + i0], a[mat][0][8 * w + i1],
+                     a[mat][1][8 * w + i1], r[8 * w + i0], r[8 * w + i1]);
+      }
+#pragma unroll
+      for (int mat = 0; mat < MATS; mat++) {
+        acc[mat][0][0] += sc[mat][0] * P[mat][0] + sc[mat][2] * xc[0];
+        acc[mat][0][1] += sc[mat][0] * P[mat][1] + sc[mat][2] * xc[1];
+        acc[mat][0][2] += sc[mat][1] * P[mat][2] + sc[mat][3] * xc[0];
+        acc[mat][0][3] += sc[mat][1] * P[mat][3] + sc[mat][3] * xc[1];
+#pragma unroll
+        for (int h = 0; h < 2; h++) wc[mat][h] = wn[mat][h];
+#pragma unroll
+        for (int e = 0; e < 4; e++) sc[mat][e] = sn[mat][e];
+      }
+      xc[0] = xn[0], xc[1] = xn[1];
+#pragma unroll
+      for (int u = 0; u < 4; u++) vc[u] = vn[u];
+    }
+#pragma unroll
+    for (int mat = 0; mat < MATS; mat++)
+#pragma unroll
+      for (int j = 0; j < NT; j++) red[warp][mat][j][lane] = make_float4(acc[mat][j][0], acc[mat][j][1], acc[mat][j][2], acc[mat][j][3]);
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < NT; j++) {
+      if (j % KS != ks || 8 * j >= nt) continue;  // n-tile j's epilogue on the row tile's warp j % KS
+      float s[MATS][4] = {};
+      for (int k = 0; k < KS; k++)  // fixed order
+#pragma unroll
+        for (int mat = 0; mat < MATS; mat++) {
+          const float4 v = red[k * RT + rt][mat][j][lane];
+          s[mat][0] += v.x, s[mat][1] += v.y, s[mat][2] += v.z, s[mat][3] += v.w;
+        }
+#pragma unroll
+      for (int e = 0; e < 4; e++) {  // C fragment: row r0 + 8 (e >> 1), pair 8j + 2q + (e & 1)
+        const int t = 8 * j + 2 * q + (e & 1);
+        if (t < nt) epilogue<MATS, T>(p, t0 + t, n0 + r0 + 8 * (e >> 1), s[0][e], s[MATS - 1][e]);
+      }
+    }
+    __syncthreads();
+  }
+}
+
+template <int MATS>
+void grid_launch(MParams& p, const at::Tensor& like, int64_t P) {
+  const bool bf = like.scalar_type() == at::kBFloat16;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const int64_t per = (2 * P + p.G) / (p.G + 1);  // pairs of a busy group, roughly
+  auto go = [&](auto nt) {
+    constexpr int NT = decltype(nt)::value;
+    using L = GridStage<MATS, NT>;
+    const int smem = L::STAGES * L::BYTES;
+    const dim3 grid((p.N + 63) / 64, std::min<int64_t>(P, p.G + 1));  // only groups with pairs
+    auto k = bf ? grid_kernel<MATS, NT, __nv_bfloat16> : grid_kernel<MATS, NT, __half>;
+    C10_CUDA_CHECK(cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    k<<<grid, 128, smem, stream>>>(p);
+  };
+  if (per <= 8) {  // few pairs: grid_small_kernel (4x the CTAs; H200 Qwen3.8-27B shapes: faster to 8)
+    const dim3 grid(p.N / 16, std::min<int64_t>(P, p.G + 1));
+    bf ? grid_small_kernel<MATS, __nv_bfloat16><<<grid, 128, 0, stream>>>(p)
+       : grid_small_kernel<MATS, __half><<<grid, 128, 0, stream>>>(p);
+  } else if (per <= 16) go(std::integral_constant<int, 2>{});
+  else go(std::integral_constant<int, 4>{});
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void grid_check(const MParams& p, const at::Tensor& x, const at::Tensor& xs, int64_t block) {
+  TORCH_CHECK(block % 128 == 0 && p.N % 16 == 0 && p.nsb % 2 == 0, "sdm_packed: grid kernel needs groups of 128k, "
+              "N % 16, an even group count per row");
+  TORCH_CHECK(xs.is_cuda() && xs.device() == x.device() && xs.scalar_type() == at::kFloat && xs.is_contiguous() &&
+                  xs.dim() == 2 && xs.size(0) == x.size(0) && xs.size(1) == p.K / 128,
+              "sdm_packed: xs (rows, K / 128) float32 on x's device");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0, "sdm_packed: x 16-byte aligned");
+}
+
+at::Tensor grid_gate_up(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& perm, const at::Tensor& gstart,
+                        const at::Tensor& g0, const at::Tensor& u0, const at::Tensor& dg, const at::Tensor& du,
+                        const at::Tensor& pg, const at::Tensor& pu, const at::Tensor& mg, const at::Tensor& mu,
+                        int64_t block, int64_t topk) {
+  c10::cuda::CUDAGuard guard(x.device());
+  TORCH_CHECK(g0.dim() == 2 && g0.size(0) == x.size(0) && u0.sizes() == g0.sizes() &&
+                  g0.scalar_type() == x.scalar_type() && u0.scalar_type() == x.scalar_type(),
+              "sdm_packed: grid_gate_up shapes");
+  check(g0, "g0");
+  check(u0, "u0");
+  check(du, "du");
+  MParams p = mmake(3, block, topk, x, perm, gstart, g0.size(1), dg, pg, mg);
+  grid_check(p, x, xs, block);
+  p.d[0] = dg.data_ptr(), p.d[1] = du.data_ptr(), p.p[0] = pg.data_ptr(), p.p[1] = pu.data_ptr();
+  p.m[0] = static_cast<const int*>(mg.data_ptr()), p.m[1] = static_cast<const int*>(mu.data_ptr());
+  p.b0[0] = g0.data_ptr(), p.b0[1] = u0.data_ptr(), p.gather = 1, p.xs = xs.data_ptr<float>();
+  at::Tensor h = at::empty({perm.numel(), p.N}, x.options());
+  p.out = h.data_ptr();
+  if (perm.numel()) grid_launch<2>(p, x, perm.numel());
+  return h;
+}
+
+at::Tensor grid_down(const at::Tensor& h, const at::Tensor& hs, const at::Tensor& perm, const at::Tensor& gstart,
+                     const at::Tensor& rw, const at::Tensor& d0, const at::Tensor& d, const at::Tensor& pp,
+                     const at::Tensor& m, int64_t block, int64_t topk) {
+  c10::cuda::CUDAGuard guard(h.device());
+  TORCH_CHECK(d0.dim() == 2 && d0.size(0) == h.size(0) && d0.scalar_type() == h.scalar_type() &&
+                  rw.scalar_type() == at::kFloat && rw.numel() == h.size(0) && perm.numel() == h.size(0),
+              "sdm_packed: grid_down shapes");
+  check(d0, "d0");
+  MParams p = mmake(3, block, topk, h, perm, gstart, d0.size(1), d, pp, m);
+  grid_check(p, h, hs, block);
+  p.d[0] = p.d[1] = d.data_ptr(), p.p[0] = p.p[1] = pp.data_ptr();
+  p.m[0] = p.m[1] = static_cast<const int*>(m.data_ptr());
+  p.rw = rw.data_ptr<float>(), p.b0[0] = d0.data_ptr(), p.gather = 0, p.xs = hs.data_ptr<float>();
+  at::Tensor o = at::empty({perm.numel(), p.N}, h.options());
+  p.out = o.data_ptr();
+  if (perm.numel()) grid_launch<1>(p, h, perm.numel());
+  return o;
+}
+
 }  // namespace
 
 TORCH_LIBRARY(sdm_packed, lib) {
@@ -971,4 +1349,12 @@ TORCH_LIBRARY(sdm_packed, lib) {
       "matrix_down(Tensor h, Tensor perm, Tensor gstart, Tensor rw, Tensor d0, Tensor d, Tensor p, Tensor m, "
       "int mode, int block, int topk) -> Tensor",
       &matrix_down);
+  lib.def(
+      "grid_gate_up(Tensor x, Tensor xs, Tensor perm, Tensor gstart, Tensor g0, Tensor u0, Tensor dg, Tensor du, "
+      "Tensor pg, Tensor pu, Tensor mg, Tensor mu, int block, int topk) -> Tensor",
+      &grid_gate_up);
+  lib.def(
+      "grid_down(Tensor h, Tensor hs, Tensor perm, Tensor gstart, Tensor rw, Tensor d0, Tensor d, Tensor p, Tensor m, "
+      "int block, int topk) -> Tensor",
+      &grid_down);
 }

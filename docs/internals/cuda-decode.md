@@ -59,9 +59,58 @@ kernels instead rebuild $W_b + \Delta_g$ for every routed group.
 - 2-bit group grids (mode 3, `GridDeltaMoE`): the same tensor-core kernel. Each lane's 8 entries of a 32-wide chunk
   are half a code word, decoded in registers to $\ell + s\,q$ (the group's lowest level and step, $q \in \{0, \dots, 3\}$)
   and packed into bf16 pairs. Groups of 32 or more (a power of 2), rows a multiple of 16. `GridDeltaMoE` takes this
-  path up to `MATRIX_MAX_PAIRS` pairs, and so does the vLLM plugin's grid MLP.
+  path up to `MATRIX_MAX_PAIRS` pairs, and so does the vLLM plugin's grid MLP. With groups a multiple of 128 and an
+  even number of them per row, the grid kernels below run instead.
 - Routed deltas ([per-expert attention and lm_head deltas](../guide/routed-deltas.md)), 2-bit grids: the down kernel
   alone, over a zero base product (`packed_ops.routed_matrix`), up to 64 pairs; beyond that the Triton down kernel.
+
+### Grid kernels (`grid_gate_up`, `grid_down`)
+
+Over a 128-entry block $b$ inside one group, every entry is $\delta_j = \ell + s\,q_j$, so for an activation $x$
+
+$$
+\sum_{j \in b} \delta_j x_j = s \sum_{j \in b} q_j x_j + \ell X_b, \qquad X_b = \sum_{j \in b} x_j .
+$$
+
+The tensor cores then only need $q_j \in \{0, \dots, 3\}$, which needs no arithmetic to decode. The kernel ORs the
+two code bits into the mantissa of 1.0: $v_j = 1 + q_j / 4$ (bf16 bits 5–6 of `0x3F80`, fp16 bits 8–9 of `0x3C00`),
+one shift and one `lop3` for two entries. Since $\sum_j v_j x_j = X_b + \tfrac14 \sum_j q_j x_j$,
+
+$$
+\sum_{j \in b} \delta_j x_j = 4s \, P_b + (\ell - 4s) X_b, \qquad P_b = \sum_{j \in b} v_j x_j ,
+$$
+
+with $P_b$ from `mma.m16n8k16` in fp32 and the fold in fp32. Unlike the kernel above, the deltas are not rounded to
+bf16, and the error against fp32 is the same (one bf16 ulp of the output). The block sums $X_b$ (fp32) come from
+torch. So does a reordering of the activations, `packed_ops._prep`: lane $q$ of a row takes code word $q$ of the
+block (entries $32q \dots 32q + 31$), and register $i$ of its half word $w$ holds entries $16w + i$ and $16w + i + 8$
+(code bits $2i$ and $2i + 16$). The activations are interleaved to match, `x'[16w + 2i + j] = x[16w + i + 8j]`, so
+that a lane's B fragment is two plain 32-bit loads.
+
+There are two kernels, chosen by the pairs of a busy group, about $(2P + G) / (G + 1)$:
+
+- **Up to 8 (`grid_small_kernel`)**, batch 1 to about 16: a CTA owns 16 rows and its 4 warps split K. The next
+  block's codes, scales, $X_b$ and activations are loaded into registers while the current one computes.
+- **More (`grid_kernel`)**: a CTA owns 64 rows (a warp each) and runs 16 or 32 pairs per pass. A `cp.async`
+  pipeline of 3–4 shared-memory stages holds each block's codes, scales, activations and $X_b$. Each thread works out
+  its copy addresses once per pass, and the block loop only adds a stride.
+
+Qwen3.8-27B MLP shapes at TP=2 on H200 (G = 14, H = 5120, I = 8704 per rank, codes 37.6 MB per expert and layer), one
+layer's MoE deltas, CUDA graph timing. The bandwidth is that of the codes read:
+
+| tokens, top-k | experts read | kernel above | grid kernels |
+|---|---:|---:|---:|
+| 1, top-2 | 2 | 0.124 ms (0.61 TB/s) | 0.059 ms (1.27 TB/s) |
+| 16, top-2 | 13 | 0.711 ms (0.69 TB/s) | 0.328 ms (1.49 TB/s) |
+| 64, top-2 | 14 | 1.303 ms (0.40 TB/s) | 0.60 ms (0.87 TB/s) |
+| 16, top-10 | 14 | 1.514 ms (0.35 TB/s) | 0.61 ms (0.87 TB/s) |
+| 64, top-10 | 14 | 4.589 ms (0.11 TB/s) | 1.49 ms (0.35 TB/s) |
+
+Nsight Compute shows `grid_kernel` bound by instruction issue, not memory: about 300 warp instructions per 128-entry
+block and pass, and DRAM at 10–17% of its bandwidth. On 2B it is at
+`/data/apps/nvhpc/26.3/Linux_x86_64/26.3/profilers/13.1/Nsight_Compute/ncu` and also runs in the Glutton container.
+Moving the address arithmetic out of the block loop gave the last 20%. With many pairs, the per-pair `mma` and fold
+instructions set the time, not DRAM. Past 32 pairs per group, each further pass also decodes the codes again.
 
 Qwen3.8-27B shapes at TP=2 on H200 (moe27-14-B: 14 experts top-2 plus one zero expert; routed deltas in 4 sets), per
 decode step, summed over the 64 layers:
