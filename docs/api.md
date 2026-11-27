@@ -1,7 +1,7 @@
 # API
 
 Generated from the docstrings, one page per module, following the package layout. The package re-exports
-`DeltaMoE`, `DareDeltaMoE`, `BitDeltaMoE`, `HierDeltaMoE`, `mlp` and `random_experts`; they are documented in their
+`DeltaMoE`, `DareDeltaMoE`, `BitDeltaMoE`, `HierDeltaMoE`, `MoE`, `HierMoE`, `mlp` and `random_experts`; they are documented in their
 modules.
 
 ```{eval-rst}

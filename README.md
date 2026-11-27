@@ -8,6 +8,8 @@ src/shared_delta_moe/ops.py               stateless helpers: mlp, grouping route
 src/shared_delta_moe/triton_kernels/      fused.py: the fused parameter-aggregation forward (sort, gate_up + SiLU,
                                           down + routing weight; dense, seeded-DARE or BitDelta deltas; Hopper TMA); train.py:
                                           its backward for training (dense deltas, triton_train)
+src/shared_delta_moe/models/moe.py        MoE / HierMoE: the plain MoEs (full experts, no base), routed as DeltaMoE /
+                                          HierDeltaMoE; to_moe() of either delta form
 src/shared_delta_moe/models/hier.py       HierDeltaMoE: groups of deltas + zero experts (= the base), two-level routing
 src/shared_delta_moe/models/packed.py     PackedDeltaMoE: the common part of the packed formats (DARE, BitDelta)
 src/shared_delta_moe/models/dare.py       seeded DARE: Philox mask, its bitmap, pack, DareDeltaMoE
@@ -31,6 +33,7 @@ src/shared_delta_moe/testing.py           random_experts for tests and benchmark
 tests/test_delta_moe.py                   every forward == plain MoE, token by token (Triton part needs CUDA)
 tests/test_dare.py                        Philox known-answer, CPU == CUDA masks, bitmap == mask, DARE forwards and gradients
 tests/test_similarity.py                  Gram statistics == direct computation on tiny checkpoints, shards, fits, ulp counts
+tests/test_moe.py                         MoE / HierMoE: loop == grouped == token by token, gradients, meta + state dict
 tests/test_hier.py                        HierDeltaMoE forwards and gradients == the two-level ensemble, token by token
 tests/test_qwen3_5_hier_delta_moe.py     tiny dense Qwen3.5 upscaled == ensemble of its fine-tunes' MLPs
 tests/test_train.py                       the Triton backward == the materialised path (x, router, every weight; Hier)
@@ -52,7 +55,7 @@ uv run python benchmarks/bench.py --top-k 2 --tokens 1,32,512,8192
 ```python
 from shared_delta_moe import DeltaMoE
 m = DeltaMoE.from_experts(base, experts, router, top_k=1, num_zero_experts=1)
-y = m.forward_param(x)   # or forward_matrix(x); forward_dense(x, m.dense_experts()) is the plain-MoE baseline
+y = m.forward_param(x)   # or forward_matrix(x); m.to_moe() is the same MoE with full experts (the baseline)
 ```
 
 ## Docs

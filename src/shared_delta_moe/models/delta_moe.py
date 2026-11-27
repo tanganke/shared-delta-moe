@@ -19,12 +19,12 @@ happens:
     Per-matrix output aggregation: gate/up are :math:`W_b x` (once for all tokens) :math:`+ \Delta_e x` per slot;
     each slot has its own activation :math:`h_i`, down is :math:`W_b h_i + \Delta_e h_i`; slots summed with weights
     :math:`r`.
-``forward_dense``
-    The plain MoE baseline, from stored full experts.
+
+The plain MoE itself, with :math:`W_b + \Delta_e` written out, is ``to_moe()`` (``moe.MoE``).
 
 Each public forward picks an implementation (``_forward_*``) by hardware and input, with thresholds in
 ``constants.py``: ``forward_param`` uses the fused Triton kernel on CUDA bf16/fp16 for a moderate number of (token,
-slot) pairs, else materialised weights; ``forward_matrix`` / ``forward_dense`` use grouped GEMM (``F.grouped_mm``)
+slot) pairs, else materialised weights; ``forward_matrix`` uses grouped GEMM (``F.grouped_mm``)
 when available for the dtype and device and there is more than one pair, else a loop.
 
 Adding :math:`r \Delta_e x` into one shared activation instead (merging weights per token) is not the same function
@@ -44,8 +44,6 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from ..constants import (
-    GROUPED_DTYPES,
-    GROUPED_MIN_PAIRS,
     HAS_TRITON,
     PARAM_MIN_ROWS,
     SORT_ONE_HOT_MAX,
@@ -54,9 +52,8 @@ from ..constants import (
     TRITON_MAX_PAIRS_OLDER,
     TRITON_MIN_PAIRS,
 )
-from ..ops import gmm, groups, mlp, pow2, sort_rows
+from ..ops import gmm, groups, mlp, pow2, softmax_topk, sort_rows, use_grouped
 from ..type_hints import (
-    DenseExperts,
     Experts,
     Group,
     Hidden,
@@ -66,6 +63,7 @@ from ..type_hints import (
     RouterWeight,
     Tokens,
 )
+from .moe import MoE
 
 
 class DeltaMoE(nn.Module):
@@ -201,6 +199,17 @@ class DeltaMoE(nn.Module):
             dst.copy_(torch.stack([w[i] for w in experts]) - b)
         return m
 
+    def to_moe(self) -> "MoE":
+        r"""The equivalent plain MoE: experts :math:`[W_b + \Delta_1, \dots, W_b + \Delta_N] + [W_b] \times Z`, the
+        same router and top-k (a zero expert becomes a stored copy of :math:`W_b`). Packed formats unpack their deltas.
+
+        Returns:
+            A new ``moe.MoE`` with :math:`N + Z` experts, on this module's device and dtype.
+        """
+        with torch.no_grad():
+            experts = [self.weights(e) for e in range(self.n_delta)] + [self.weights(-1)] * self.num_zero_experts
+            return MoE.from_experts(experts, self.router.weight, self.top_k)
+
     def topk(self, x: Tokens, router: nn.Module | None = None) -> tuple[Tensor, Tensor]:
         """Route tokens: top-k router indices and their renormalised weights.
 
@@ -216,8 +225,7 @@ class DeltaMoE(nn.Module):
             A tuple (idx, r): idx (T, K) int64 router index per slot (>= ``n_delta``: a zero expert); r (T, K) float32
             routing weights, each row renormalised to sum to 1.
         """
-        r, i = (self.router if router is None else router)(x).softmax(-1, dtype=torch.float).topk(self.top_k, dim=-1)
-        return i, r / r.sum(-1, keepdim=True)
+        return softmax_topk((self.router if router is None else router)(x), self.top_k)
 
     def route(self, x: Tokens) -> tuple[Experts, RouteWeights]:
         """``topk`` with every zero expert as -1 and the weights in the model dtype (used by the PyTorch forwards).
@@ -343,34 +351,6 @@ class DeltaMoE(nn.Module):
             out = out + r[:, j, None] * o
         return out
 
-    def dense_experts(self) -> DenseExperts:
-        r"""The equivalent plain MoE's full expert weights, for ``forward_dense``.
-
-        Returns:
-            [gate (N+1, I, H), up (N+1, I, H), down (N+1, H, I)], index 0 = base, index e+1 = :math:`W_b + \Delta_e`.
-        """
-        return [
-            torch.cat((b[None], b + d))
-            for b, d in (
-                (self.gate, self.d_gate),
-                (self.up, self.d_up),
-                (self.down, self.d_down),
-            )
-        ]
-
-    def _forward_dense(self, x: Tokens, experts: DenseExperts) -> Tokens:
-        """Plain top-k MoE with stored full experts, grouped the same way (the baseline)."""
-        idx, r = self.route(x)
-        out = torch.zeros_like(x)
-        for e in idx.unique().tolist():
-            rows, slots = (idx == e).nonzero(as_tuple=True)
-            out = out.index_add(
-                0,
-                rows,
-                r[rows, slots, None] * mlp(x[rows], *(w[e + 1] for w in experts)),
-            )
-        return out
-
     def _forward_matrix_grouped(self, x: Tokens) -> Tokens:
         """``forward_matrix`` with the deltas of all (token, slot) pairs done as one grouped GEMM per projection."""
         idx, r = self.route(x)
@@ -381,19 +361,6 @@ class DeltaMoE(nn.Module):
         u = F.linear(x, self.up)[tok].index_add(0, rows, gmm(xs, self.d_up, offs))
         h: PairHidden = F.silu(g) * u  # each slot keeps its own activation
         o = F.linear(h, self.down).index_add(0, rows, gmm(h[rows], self.d_down, offs))
-        return (o.view(-1, self.top_k, x.shape[-1]) * r[..., None]).sum(1)
-
-    def _forward_dense_grouped(self, x: Tokens, experts: DenseExperts) -> Tokens:
-        """Plain top-k MoE, all (token, slot) pairs as one grouped GEMM per projection (like transformers' ``grouped_mm``)."""
-        idx, r = self.route(x)
-        tok = torch.arange(idx.numel(), device=x.device) // self.top_k
-        rows, offs = sort_rows(
-            idx.flatten() + 1, len(experts[0])
-        )  # every pair; zero experts -> 0 = base
-        xs = x[tok[rows]]
-        h = F.silu(gmm(xs, experts[0], offs)) * gmm(xs, experts[1], offs)
-        o = torch.empty(idx.numel(), x.shape[-1], dtype=x.dtype, device=x.device)
-        o[rows] = gmm(h, experts[2], offs)
         return (o.view(-1, self.top_k, x.shape[-1]) * r[..., None]).sum(1)
 
     def _forward_param_triton(self, x: Tokens) -> Tokens:
@@ -412,19 +379,7 @@ class DeltaMoE(nn.Module):
         return Delta(0, self.d_gate), Delta(0, self.d_up), Delta(0, self.d_down)
 
     def _grouped(self, x: Tokens) -> bool:
-        """Use grouped GEMM? Needs ``F.grouped_mm`` with this dtype on this device, and more than one (token, slot) pair
-        (with one pair the sort and count cost more than the loop saves)."""
-        if not hasattr(F, "grouped_mm") or x.dtype not in GROUPED_DTYPES:
-            return False
-        if x.device.type == "cuda" and torch.cuda.get_device_capability(x.device) < (
-            8,
-            0,
-        ):
-            return False
-        return (
-            x.device.type in ("cuda", "cpu")
-            and x.shape[0] * self.top_k >= GROUPED_MIN_PAIRS
-        )
+        return use_grouped(x, self.top_k)
 
     def _needs_grad(self, x: Tokens) -> bool:
         return torch.is_grad_enabled() and (x.requires_grad or any(p.requires_grad for p in self.parameters()))
@@ -508,19 +463,3 @@ class DeltaMoE(nn.Module):
             if self._grouped(x)
             else self._forward_matrix(x)
         )
-
-    def forward_dense(self, x: Tokens, experts: DenseExperts) -> Tokens:
-        """Plain MoE baseline forward from stored full experts.
-
-        Uses grouped GEMM when available and worth it, else the per-expert loop.
-
-        Args:
-            x: (T, H) tokens.
-            experts: Full expert weights as returned by ``dense_experts``, index 0 = base.
-
-        Returns:
-            (T, H) MoE output.
-        """
-        if self._grouped(x):
-            return self._forward_dense_grouped(x, experts)
-        return self._forward_dense(x, experts)

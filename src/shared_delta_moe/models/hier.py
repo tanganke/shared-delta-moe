@@ -32,6 +32,7 @@ from torch import Tensor, nn
 
 from ..type_hints import MLPWeights, RouterWeight, Tokens
 from .delta_moe import DeltaMoE
+from .moe import HierMoE, hier_tables, hier_topk
 
 
 class HierDeltaMoE(DeltaMoE):
@@ -76,22 +77,11 @@ class HierDeltaMoE(DeltaMoE):
         self.top_k = (G if group_top_k is None else group_top_k) * top_k  # DeltaMoE slots per token
         widths = [e + z for e, z in zip(group_sizes, group_zeros)]
         self.router = nn.Linear(hidden, G + sum(widths), bias=False, **factory)
-        self._table_cache: dict[torch.device, tuple[Tensor, Tensor, Tensor]] = {}
 
     def _tables(self, device: torch.device) -> tuple[Tensor, Tensor, Tensor]:
         """(G, M) group-local expert -> column of the expert logits, delta index (-1: zero expert or padding), padding.
-        Built per device on first use, not buffers: transformers builds models on the meta device."""
-        if device not in self._table_cache:
-            widths = [e + z for e, z in zip(self.group_sizes, self.group_zeros)]
-            M, col, delta, pad = max(widths), [], [], []
-            c = d = 0
-            for e, w in zip(self.group_sizes, widths):
-                col.append([c + j if j < w else 0 for j in range(M)])
-                delta.append([d + j if j < e else -1 for j in range(M)])
-                pad.append([j >= w for j in range(M)])
-                c, d = c + w, d + e
-            self._table_cache[device] = tuple(torch.tensor(v, device=device) for v in (col, delta, pad))  # type: ignore[assignment]
-        return self._table_cache[device]
+        Built once per layout and device (``moe.hier_tables``), not buffers: transformers builds models on the meta device."""
+        return hier_tables(tuple(self.group_sizes), tuple(self.group_zeros), device)
 
     @classmethod
     @torch.no_grad()
@@ -132,6 +122,20 @@ class HierDeltaMoE(DeltaMoE):
             dst.copy_(torch.stack([w[i] for w in experts]) - b if experts else dst)
         return m
 
+    def to_moe(self) -> HierMoE:  # type: ignore[override]
+        r"""The equivalent plain two-level MoE: group :math:`i` holds its :math:`E_i` experts :math:`W_b + \Delta_{ij}`
+        and then :math:`Z_i` stored copies of :math:`W_b`; the router (same layout) and top-k are unchanged.
+
+        Returns:
+            A new ``moe.HierMoE`` with group sizes :math:`E_i + Z_i`, on this module's device and dtype.
+        """
+        groups, d = [], 0
+        with torch.no_grad():
+            for e, z in zip(self.group_sizes, self.group_zeros):
+                groups.append([self.weights(j) for j in range(d, d + e)] + [self.weights(-1)] * z)
+                d += e
+            return HierMoE.from_experts(groups, self.router.weight, self.k1, self.group_top_k)
+
     def topk(self, x: Tokens, router: nn.Module | None = None) -> tuple[Tensor, Tensor]:
         r"""Route tokens to the flattened DeltaMoE slots.
 
@@ -146,18 +150,7 @@ class HierDeltaMoE(DeltaMoE):
             (idx, weight), both (T, ``top_k``): ``idx`` is the int64 delta index per slot (``n_delta``: the base),
             ``weight`` the float32 routing weight per slot.
         """
-        G = len(self.group_sizes)
         col, delta, pad = self._tables(x.device)
-        logits = (self.router if router is None else router)(x).float()
-        h = logits[:, :G].softmax(-1)
-        p = logits[:, G:][:, col].masked_fill(pad, float("-inf")).softmax(-1)  # T G M
-        pv, pj = p.topk(self.k1, dim=-1)
-        pv = pv / pv.sum(-1, keepdim=True)
-        gi = torch.arange(G, device=x.device).expand(len(x), G)
-        if self.group_top_k is not None:
-            h, gi = h.topk(self.group_top_k, dim=-1)
-            h = h / h.sum(-1, keepdim=True)
-            pick = gi[..., None].expand(-1, -1, self.k1)
-            pv, pj = pv.gather(1, pick), pj.gather(1, pick)
+        gi, pj, w = hier_topk((self.router if router is None else router)(x), col, pad, self.k1, self.group_top_k)
         e = delta[gi[..., None], pj].flatten(1)  # T S*k1
-        return torch.where(e < 0, self.n_delta, e), (h[..., None] * pv).flatten(1)
+        return torch.where(e < 0, self.n_delta, e), w

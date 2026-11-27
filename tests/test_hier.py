@@ -53,7 +53,7 @@ def forwards(m):
         "matrix": m.forward_matrix,
         "matrix loop": m._forward_matrix,
         "matrix grouped": m._forward_matrix_grouped,
-        "dense": lambda x: m.forward_dense(x, m.dense_experts()),
+        "moe": m.to_moe(),
     }
 
 

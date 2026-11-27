@@ -114,11 +114,10 @@ def test_dare_forwards_match_plain_moe():
             ), "kept values rescaled"
             assert abs(kept.float().mean().item() - keep) < 0.15
         ref = reference(d, x)
-        experts = d.dense_experts()
         for name, f in {
             "param": d._forward_param,
             "matrix grouped": d._forward_matrix_grouped,
-            "dense grouped": lambda x: d._forward_dense_grouped(x, experts),
+            "moe grouped": d.to_moe()._forward_grouped,
         }.items():
             err = (
                 (f(x) - ref).abs().max() / ref.abs().max()

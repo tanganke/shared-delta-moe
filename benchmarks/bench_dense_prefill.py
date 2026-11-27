@@ -5,7 +5,7 @@ python benchmarks/bench_dense_prefill.py [--kernels]   (--kernels: per-kernel br
 
 triton   the fused Triton kernels (route, gate_up, down)
 grouped  route + W_b + Delta materialised per call + F.grouped_mm (cuda_kernels/dense_moe.py)
-plain    F.grouped_mm on pre-materialised experts (forward_dense, incl. its routing; not a delta model)
+plain    F.grouped_mm on pre-materialised experts (MoE._forward_grouped of to_moe(), incl. its routing; not a delta model)
 """
 
 import sys
@@ -63,7 +63,7 @@ def main():
     print(f"{'config':>8} {'T':>5} {'pairs':>6} {'impl':>8} {'ms':>7} {'%FL':>5} {'%BW':>5}")
     for name, make, Ts in cases:
         m = make()
-        experts = m.dense_experts()
+        plain = m.to_moe()
         I, H = m.gate.shape
         base = (m.gate, m.up, m.down)
         dl = (m.d_gate, m.d_up, m.d_down)
@@ -76,7 +76,7 @@ def main():
             impls = {
                 "triton": lambda: F.fused_moe(x, idx, rw, m.n_delta, base, tuple(F.Delta(0, d) for d in dl)),
                 "grouped": lambda: dense_moe.grouped_moe(x, F.route(idx, rw, m.n_delta), base, dl),
-                "plain": lambda: m._forward_dense_grouped(x, experts),
+                "plain": lambda: plain._forward_grouped(x),
             }
             ref = m._forward_param(x).float()
             for impl, f in impls.items():
@@ -84,7 +84,7 @@ def main():
                 ms = device_ms(f)
                 print(f"{name:>8} {T:>5} {P:>6} {impl:>8} {ms:7.3f} {100 * 6 * P * I * H / (ms * 1e-3) / FL:5.0f} "
                       f"{100 * wbytes / (ms * 1e-3) / BW:5.0f}   (max err / max vs _forward_param {err:.1e})", flush=True)
-        del m, experts
+        del m, plain
         torch.cuda.empty_cache()
 
 

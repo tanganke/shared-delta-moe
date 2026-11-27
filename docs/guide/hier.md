@@ -100,6 +100,10 @@ y = moe.forward_param(x)  # the fused Triton kernel on CUDA; differentiable (Tri
 instead, use `HierDeltaMoE(hidden, inter, group_sizes, group_zeros, top_k, group_top_k)` and load
 `gate`/`up`/`down`, `d_gate`/`d_up`/`d_down` and `router.weight`.
 
+`moe.to_moe()` gives the plain two-level MoE (`shared_delta_moe.HierMoE`): group $i$ stores its $E_i$ experts
+$W_b+\Delta_{ij}$ in full and then $Z_i$ copies of $W_b$, with the same router layout, $k_1$ and $k_0$, and routes the
+same way. `HierMoE.from_experts(groups, router, top_k, group_top_k)` builds one from full experts.
+
 **Implementation.** `topk` flattens the routing into ordinary `DeltaMoE` slots: per token $S\cdot k_1$ slots
 ($S=G$ dense, else $k_0$) weighted $h_i\tilde p_{ij}$; a picked zero expert is a base slot. Every `DeltaMoE` forward (materialised, split, grouped, fused Triton) and the Triton training path
 ([training.md](training.md)) then compute $y$ unchanged, gradients through the two softmaxes included.

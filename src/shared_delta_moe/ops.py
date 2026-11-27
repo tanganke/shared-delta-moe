@@ -3,6 +3,7 @@
 import torch
 import torch.nn.functional as F
 
+from .constants import GROUPED_DTYPES, GROUPED_MIN_PAIRS
 from .type_hints import (
     Group,
     GroupEnds,
@@ -64,6 +65,38 @@ def mlp(x: Tokens, gate: InWeight, up: InWeight, down: OutWeight) -> Tokens:
         (T, H) MLP output.
     """
     return F.linear(F.silu(F.linear(x, gate)) * F.linear(x, up), down)
+
+
+def softmax_topk(logits: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Top-k routing: float32 softmax (as transformers' MoE routers; bf16 can flip near-ties), top-k, renormalised.
+
+    Args:
+        logits: (T, E) router output.
+        k: experts picked per token.
+
+    Returns:
+        (idx, r): idx (T, k) int64 expert indices; r (T, k) float32 weights, rows summing to 1.
+    """
+    r, i = logits.softmax(-1, dtype=torch.float).topk(k, dim=-1)
+    return i, r / r.sum(-1, keepdim=True)
+
+
+def use_grouped(x: Tokens, top_k: int) -> bool:
+    """Use grouped GEMM? Needs ``F.grouped_mm`` with this dtype on this device (CPU, or CUDA sm80+), and more than
+    one (token, slot) pair (with one pair the sort and count cost more than the loop saves).
+
+    Args:
+        x: (T, H) tokens.
+        top_k: slots per token.
+
+    Returns:
+        True to take the grouped-GEMM forward, False for the loop.
+    """
+    if not hasattr(F, "grouped_mm") or x.dtype not in GROUPED_DTYPES or x.device.type not in ("cuda", "cpu"):
+        return False
+    if x.device.type == "cuda" and torch.cuda.get_device_capability(x.device) < (8, 0):
+        return False
+    return x.shape[0] * top_k >= GROUPED_MIN_PAIRS
 
 
 def groups(e: SlotExperts, r: SlotWeights) -> list[Group]:

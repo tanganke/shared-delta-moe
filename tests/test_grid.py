@@ -44,6 +44,7 @@ def test_matches_simulated(hier, levels, symmetric, gptq):
     t = torch.randn(20, H)
     torch.testing.assert_close(p.forward_param(t), m.forward_param(t), rtol=1e-5, atol=1e-6)
     torch.testing.assert_close(p(t), m(t), rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(p.to_moe()(t), m(t), rtol=1e-5, atol=1e-6)  # the plain MoE, grid deltas unpacked
 
 
 @pytest.mark.parametrize("hier", [False, True])

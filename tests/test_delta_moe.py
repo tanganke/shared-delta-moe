@@ -24,14 +24,11 @@ def make(
 
 
 def reference(m: DeltaMoE, x: torch.Tensor) -> torch.Tensor:
+    """Token by token: sum_i r_i MLP(x; W_b + Delta_{e_i}), W_b for a zero expert."""
     idx, r = m.route(x)
-    experts = m.dense_experts()
     return torch.stack(
         [
-            sum(
-                ri * mlp(xi, *(w[ei + 1] for w in experts))
-                for ei, ri in zip(es.tolist(), rs)
-            )
+            sum(ri * mlp(xi, *m.weights(ei)) for ei, ri in zip(es.tolist(), rs))
             for xi, es, rs in zip(x, idx, r)
         ]
     )
@@ -54,12 +51,11 @@ def test_routing_covers_cases():
 def test_from_experts_and_parameter_count():
     for z, k in CASES:
         m, full, _ = make(z, k)
-        experts = m.dense_experts()
-        assert all(
-            torch.allclose(w[e], f[j])
-            for e, f in enumerate(full)
-            for j, w in enumerate(experts)
-        )
+        p = m.to_moe()
+        want = full[1:] + [full[0]] * z  # the deltas' experts, then a copy of the base per zero expert
+        assert p.n_experts == 3 + z and p.top_k == k
+        assert all(torch.allclose(w[e], f[j]) for e, f in enumerate(want) for j, w in enumerate((p.gate, p.up, p.down)))
+        assert torch.equal(p.router.weight, m.router.weight)
         n = sum(
             p.numel() for name, p in m.named_parameters() if name != "router.weight"
         )
@@ -71,7 +67,7 @@ def test_from_experts_and_parameter_count():
 def test_forwards_match_plain_moe():
     for z, k in CASES:
         m, _, x = make(z, k)
-        experts = m.dense_experts()
+        p = m.to_moe()
         ref = reference(m, x)
         forms = {
             "param": m._forward_param,
@@ -79,11 +75,11 @@ def test_forwards_match_plain_moe():
             "param mixed": lambda x: m._forward_param(x, min_rows=100),
             "matrix loop": m._forward_matrix,
             "matrix grouped": m._forward_matrix_grouped,
-            "dense loop": lambda x: m._forward_dense(x, experts),
-            "dense grouped": lambda x: m._forward_dense_grouped(x, experts),
+            "moe loop": p._forward_loop,
+            "moe grouped": p._forward_grouped,
+            "moe": p,
             "forward_param": m.forward_param,
             "forward_matrix": m.forward_matrix,
-            "forward_dense": lambda x: m.forward_dense(x, experts),
         }
         for name, f in forms.items():
             for t in (1, 200):  # 1 token takes the loop branch of the public forwards

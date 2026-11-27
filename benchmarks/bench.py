@@ -34,7 +34,7 @@ def main() -> None:
     router = torch.randn(a.deltas + 1, a.hidden, dtype=torch.bfloat16, device="cuda")
     m = DeltaMoE.from_experts(full[0], full[1:], router, a.top_k)
     del full
-    experts = m.dense_experts()
+    plain = m.to_moe()  # the same MoE with full experts stored
     dare = {
         f"dare {s}": DareDeltaMoE.from_delta_moe(
             m, float(s.split(":")[0]), int(s.split(":")[1])
@@ -43,8 +43,8 @@ def main() -> None:
         if s
     }
     forms: dict[str, Callable] = {
-        "dense loop": lambda x: m._forward_dense(x, experts),
-        "dense grouped": lambda x: m._forward_dense_grouped(x, experts),
+        "dense loop": plain._forward_loop,
+        "dense grouped": plain._forward_grouped,
         "param": m._forward_param,
         "param hybrid": lambda x: m._forward_param(x, min_rows=256),
         "param triton": m._forward_param_triton,

@@ -36,4 +36,3 @@ Group: TypeAlias = tuple[int, Rows, Coef]
 RouterWeight: TypeAlias = Annotated[
     Tensor, "N+Z H, rows N..N+Z-1 = zero experts (base)"
 ]
-DenseExperts: TypeAlias = list[Annotated[Tensor, "N+1 out in, index 0 = base"]]

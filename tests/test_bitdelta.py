@@ -52,13 +52,12 @@ def test_bitdelta_forwards_match_plain_moe():
         m, _, x = make(z, k, H, I)
         b = BitDeltaMoE.from_delta_moe(m, scale)
         ref = reference(b, x)
-        experts = b.dense_experts()
         for name, f in {
             "param": b._forward_param,
             "param split": lambda x: b._forward_param(x, min_rows=10**9),
             "matrix": b._forward_matrix,
             "matrix grouped": b._forward_matrix_grouped,
-            "dense grouped": lambda x: b._forward_dense_grouped(x, experts),
+            "moe grouped": b.to_moe()._forward_grouped,
         }.items():
             assert rel(f(x), ref) < 1e-5, (z, k, scale, name)
 
