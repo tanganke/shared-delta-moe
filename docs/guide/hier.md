@@ -113,5 +113,26 @@ refuse a `HierDeltaMoE`. The routing tables are built per device on first use (n
 as transformers' `from_pretrained` does, work. `tests/test_hier.py` checks every forward and the gradients against the ensemble
 written out token by token.
 
+**Forced routing.** For inference, `force = (g, e)` sends every token to expert $e$ of group $g$, counted in
+group-local order; $e \ge E_g$ is one of the group's zero experts, which is the base. Both the group weight and
+the in-group weight become one-hot. A flat `DeltaMoE` takes `force = e`, a router index. You can set it in three
+ways:
+
+- on the module;
+- with `delta_moe.force_route(model, force)`, which sets it on every MoE in a model and restores it afterwards;
+- in a Qwen3.5 config as `hier_delta_moe.force: [g, e]`, read by both the transformers blocks and the vLLM plugin.
+
+`topk` then returns that one expert, so the [routed attention and `lm_head` deltas](routed-deltas.md), which route
+through their layer's `topk`, follow it. The router is not run and gets no gradient. Training is unchanged with
+`force` unset, the default.
+
+Forcing makes a converted model act as one of its experts with the MoE's storage: the 2-bit grids and the averaged
+non-MLP deltas. Comparing it with the dense fine-tune measures the cost of compression and averaging. Comparing it
+with the routed MoE measures the cost of routing. The output keeps the top-k slot shape: the other slots point at the
+same expert with weight 0, so they add exactly zero. With the materialised forward, the forced MLP equals
+$\mathrm{MLP}(x; W_b + \Delta_e)$ bit for bit. `tests/test_force.py` checks this for flat and Hier modules, dense
+and grid deltas, and the zero experts. `tests/test_routed_linear.py` forces whole converted models onto their
+fine-tunes.
+
 Building one per layer from a dense model and its fine-tunes: [Converting Qwen3.5 models](qwen3_5.md); serving
 the result: [Serving with vLLM](vllm.md).

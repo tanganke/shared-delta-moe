@@ -16,6 +16,7 @@ from test_qwen3_5_hier_delta_moe import tiny  # noqa: E402
 
 from shared_delta_moe import compress as C  # noqa: E402
 from shared_delta_moe.models.grid import pack_codes  # noqa: E402
+from shared_delta_moe.models.delta_moe import force_route  # noqa: E402
 from shared_delta_moe.models.hier import HierDeltaMoE  # noqa: E402
 from shared_delta_moe.models.qwen3_5.qwen3_5_hier_delta_moe.convert import main as convert_main  # noqa: E402
 from shared_delta_moe.models.routed_linear import RoutedDeltaLinear  # noqa: E402
@@ -44,16 +45,6 @@ def test_layer_mixes_weights():
         torch.testing.assert_close(lin(x), torch.einsum("trc,tc->tr", w, x.reshape(T, Cn)).view(2, T // 2, R))
 
 
-def _forced(moe, e):
-    """Route every MoE, attention block and lm_head of ``moe`` to delta expert e (group 0 expert e here)."""
-    def topk(self, x, router=None):
-        return torch.full((len(x), 1), e), torch.ones(len(x), 1)
-
-    for m in moe.modules():
-        if isinstance(m, HierDeltaMoE):
-            m.topk = topk.__get__(m)
-
-
 def test_converted_routes_every_weight():
     base, tuned = tiny()
     # fine-tunes that differ from the base only in routed weights (MLP, attention, lm_head), so one expert is exact
@@ -75,7 +66,6 @@ def test_converted_routes_every_weight():
             routed = [m for m in moe.modules() if isinstance(m, RoutedDeltaLinear)]
             assert len(routed) == 5 + 4 + 1, "linear attention, full attention, lm_head"
             for e in range(3):
-                _forced(moe, e)
                 want = tuned[e]
                 if levels is not None:  # the fine-tune with its routed (non-MLP) deltas rounded to the grid
                     want = Qwen3_5ForCausalLM(base.config).eval()
@@ -84,7 +74,7 @@ def test_converted_routes_every_weight():
                         if b.dim() == 2 and "embed" not in k and ".mlp." not in k:
                             sd[k] = b + C.dequantize(*C.quantize(sd[k] - b, None, levels, 8))
                     want.load_state_dict(sd)
-                with torch.no_grad():
+                with torch.no_grad(), force_route(moe, (0, e)):  # the MLP, attention and lm_head deltas of expert e
                     got, ref = moe(x).logits, want(x).logits
                 err = ((got - ref).abs().max() / ref.abs().max()).item()
                 assert err < 1e-4, (levels, e, err)
@@ -122,8 +112,7 @@ def test_grid_mlp_and_routed_sets():
         assert all(isinstance(layer.mlp, Qwen3_5GridHierDeltaMoeBlock) for layer in moe.model.layers)
         assert moe.lm_head.n_delta == 2 and moe.lm_head.sets == [2, 1]
         sd0 = base.state_dict()
-        for e, s_ in ((0, (0, 1)), (1, (0, 1)), (2, (2,))):
-            _forced(moe, e)
+        for e, s_, ge in ((0, (0, 1), (0, 0)), (1, (0, 1), (0, 1)), (2, (2,), (1, 0))):  # ge: (group, expert in it)
             want = Qwen3_5ForCausalLM(base.config).eval()
             sd = {}
             for k, b in sd0.items():
@@ -134,7 +123,7 @@ def test_grid_mlp_and_routed_sets():
                 else:
                     sd[k] = b + q(torch.stack([tuned[i].state_dict()[k] - b for i in s_]).mean(0))
             want.load_state_dict(sd)
-            with torch.no_grad():
+            with torch.no_grad(), force_route(moe, ge):
                 got, ref = moe(x).logits, want(x).logits
             err = ((got - ref).abs().max() / ref.abs().max()).item()
             assert err < 1e-4, (e, err)

@@ -36,7 +36,8 @@ aggregation that adds :math:`W_b + \Delta_e` tile by tile in registers instead o
 (``triton_kernels/``).
 """
 
-from collections.abc import Sequence
+import contextlib
+from collections.abc import Iterator, Sequence
 from typing import Any
 
 import torch
@@ -64,6 +65,46 @@ from ..type_hints import (
     Tokens,
 )
 from .moe import MoE
+
+
+def forced_slots(x: Tokens, e: int, k: int) -> tuple[Tensor, Tensor]:
+    """Forced routing (``DeltaMoE.force``): every token's first slot on index e with weight 1, the other k - 1 slots
+    on e with weight 0 (the shapes of a top-k routing; their terms add exactly 0).
+
+    Args:
+        x: (T, H) tokens.
+        e: The index ``topk`` returns for the expert.
+        k: Slots per token.
+
+    Returns:
+        (idx, r): (T, k) int64 and float32, as ``DeltaMoE.topk``.
+    """
+    idx = torch.full((x.shape[0], k), e, dtype=torch.int64, device=x.device)
+    r = torch.zeros(x.shape[0], k, dtype=torch.float32, device=x.device)
+    r[:, 0] = 1.0
+    return idx, r
+
+
+@contextlib.contextmanager
+def force_route(model: nn.Module, force: Any) -> Iterator[None]:
+    """Inside: every DeltaMoE in ``model`` routes every token to one expert (``DeltaMoE.force``), and so do the
+    attention and lm_head routed deltas, which route through their layer's ``topk``. Inference only: the router gets no
+    gradient.
+
+    Args:
+        model: Any module containing DeltaMoE / HierDeltaMoE modules.
+        force: Flat: the router index (>= n_delta: a zero expert). Hier: (g, e), expert e of group g in group-local
+            order (e >= E_g: one of the group's zero experts, the base). None: routed as usual.
+    """
+    mods = [m for m in model.modules() if isinstance(m, DeltaMoE)]
+    old = [m.force for m in mods]
+    for m in mods:
+        m.force = force
+    try:
+        yield
+    finally:
+        for m, f in zip(mods, old):
+            m.force = f
 
 
 class DeltaMoE(nn.Module):
@@ -103,6 +144,7 @@ class DeltaMoE(nn.Module):
     # holds no W_b + Delta_e and no per-pair activations for the backward, but measured slower (docs/internals/benchmarks.md, Training)
     triton_train: bool = False
     remat: bool = True  # recompute W_b + Delta_e in the materialised backward (_mlp_remat)
+    force: Any = None  # inference: route every token to one expert (topk; force_route): router index, Hier (g, e)
     gate: nn.Parameter  # I H
     up: nn.Parameter  # I H
     down: nn.Parameter  # H I
@@ -226,10 +268,18 @@ class DeltaMoE(nn.Module):
             A tuple (idx, r): idx (T, K) int64 router index per slot (>= ``n_delta``: a zero expert); r (T, K) float32
             routing weights, each row renormalised to sum to 1.
         """
+        if self.force is not None:
+            return forced_slots(x, self._forced_index(), self.top_k)
         router = self.router if router is None else router
         logits = router(x)
         pick = replay(router, logits, lambda: softmax_topk(logits.detach(), self.top_k)[0])
         return softmax_topk(logits, self.top_k, pick)
+
+    def _forced_index(self) -> int:
+        """``topk``'s index for ``force``: the router index itself (>= ``n_delta``: a zero expert)."""
+        e = int(self.force)
+        assert 0 <= e < self.n_delta + self.num_zero_experts, f"force {self.force}: {self.n_delta} + {self.num_zero_experts} experts"
+        return e
 
     def route(self, x: Tokens) -> tuple[Experts, RouteWeights]:
         """``topk`` with every zero expert as -1 and the weights in the model dtype (used by the PyTorch forwards).

@@ -31,7 +31,7 @@ import torch
 from torch import Tensor, nn
 
 from ..type_hints import MLPWeights, RouterWeight, Tokens
-from .delta_moe import DeltaMoE
+from .delta_moe import DeltaMoE, forced_slots
 from ..ops import replay
 from .moe import HierMoE, hier_tables, hier_topk
 
@@ -125,6 +125,13 @@ class HierDeltaMoE(DeltaMoE):
             dst.copy_(torch.stack([w[i] for w in experts]) - b if experts else dst)
         return m
 
+    def _forced_index(self) -> int:
+        """``topk``'s delta index for ``force`` = (g, e): group g's e-th expert, or ``n_delta`` (the base) for one of
+        its zero experts (group weight and in-group weight both 1)."""
+        g, e = (int(v) for v in self.force)
+        assert 0 <= g < len(self.group_sizes) and 0 <= e < self.group_sizes[g] + self.group_zeros[g], f"force {self.force}"
+        return sum(self.group_sizes[:g]) + e if e < self.group_sizes[g] else self.n_delta
+
     def to_moe(self) -> HierMoE:  # type: ignore[override]
         r"""The equivalent plain two-level MoE: group :math:`i` holds its :math:`E_i` experts :math:`W_b + \Delta_{ij}`
         and then :math:`Z_i` stored copies of :math:`W_b`; the router (same layout) and top-k are unchanged.
@@ -153,6 +160,8 @@ class HierDeltaMoE(DeltaMoE):
             (idx, weight), both (T, ``top_k``): ``idx`` is the int64 delta index per slot (``n_delta``: the base),
             ``weight`` the float32 routing weight per slot.
         """
+        if self.force is not None:
+            return forced_slots(x, self._forced_index(), self.top_k)
         col, delta, pad = self._tables(x.device)
         router = self.router if router is None else router
         logits = router(x)

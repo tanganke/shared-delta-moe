@@ -29,13 +29,14 @@ class Qwen3_5HierDeltaMoeBlock(HierDeltaMoE):
     Args:
         config: a text config with ``hidden_size``, ``intermediate_size`` and the ``hier_delta_moe`` dict
             (``group_sizes``, ``group_zeros``, ``top_k``; optional ``group_top_k``, default None = dense group
-            routing).
+            routing; optional ``force`` [g, e], every token to expert e of group g, ``DeltaMoE.force``).
     """
 
     def __init__(self, config: Any) -> None:
         c = config.hier_delta_moe
         super().__init__(config.hidden_size, config.intermediate_size, c["group_sizes"], c["group_zeros"], c["top_k"],
                          c.get("group_top_k"))  # fmt: skip
+        self.force = c.get("force")  # [g, e]: every token to expert e of group g (DeltaMoE.force)
 
 
 class Qwen3_5GridHierDeltaMoeBlock(GridHierDeltaMoE):
@@ -51,6 +52,7 @@ class Qwen3_5GridHierDeltaMoeBlock(GridHierDeltaMoE):
         super().__init__(config.hidden_size, config.intermediate_size, c["group_sizes"], c["group_zeros"], c["top_k"],
                          c.get("group_top_k"), levels=c["levels"], group=c.get("group", 128),
                          symmetric=c.get("symmetric", False))  # fmt: skip
+        self.force = c.get("force")
 
 
 def _block(config: Any) -> HierDeltaMoE:

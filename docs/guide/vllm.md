@@ -40,6 +40,9 @@ vLLM finds plugins only through package metadata, in every process, workers incl
 
 torch.compile and CUDA graphs work: the MLP and the routed deltas are registered custom ops.
 
+`hier_delta_moe.force: [g, e]` in the text config serves the model with every token forced to one expert
+([forced routing](hier.md)). For example, a directory of symlinks to the checkpoint with an edited `config.json`.
+
 ## Checks
 
 A tiny Qwen3.5 (4 layers, 3 fine-tunes in 2 groups, random routers), converted as dense, grid MLP, routed, and grid

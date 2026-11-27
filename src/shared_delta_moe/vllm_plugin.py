@@ -90,7 +90,7 @@ class VllmHierDeltaMoeBlock(_VllmBlock, HierDeltaMoE):
         assert inter % tp == 0, f"intermediate_size {inter} does not split over {tp} ranks"
         HierDeltaMoE.__init__(self, config.hidden_size, inter // tp, c["group_sizes"], c["group_zeros"], c["top_k"],
                               c.get("group_top_k"))  # fmt: skip
-        self.tp = tp
+        self.tp, self.force = tp, c.get("force")  # [g, e]: forced routing (DeltaMoE.force)
         for name, dim in SHARD_DIM.items():
             getattr(self, name).weight_loader = partial(_load_shard, dim=dim, rank=rank, tp=tp)
         self._tables(self.gate.device)  # built now, not while vLLM traces the forward
@@ -113,7 +113,7 @@ class VllmGridHierDeltaMoeBlock(_VllmBlock, GridHierDeltaMoE):
                                   c["top_k"], c.get("group_top_k"), levels=c["levels"], group=g,
                                   symmetric=c.get("symmetric", False))  # fmt: skip
         assert self.kernel_ok(), "vllm_plugin: grid MLP deltas need 2-bit codes and a power-of-2 group"
-        self.tp, self.grid = tp, True
+        self.tp, self.grid, self.force = tp, True, c.get("force")
         for name, dim in GRID_SHARD_DIM.items():
             if hasattr(self, name):  # symmetric grids have no z_
                 getattr(self, name).weight_loader = partial(_load_shard, dim=dim, rank=rank, tp=tp)
