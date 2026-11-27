@@ -30,3 +30,24 @@ the K loop only does bit arithmetic before gathering the kept values; longer row
   and `torch.compile` (custom op `shared_delta_moe::fused_moe_bit`).
 - **No TMA.** The sign words are not loaded through TMA.
 
+
+## Group grids (delta mode 3)
+
+`forward_param` of `GridDeltaMoE` / `GridHierDeltaMoE` reads the 2-bit codes directly (`Delta(3, codes, steps, lows,
+block=g)`; [group grids](../guide/grid.md)): 2-bit codes (3 or 4 levels) and a power-of-2 group $g$ only, others use the
+materialised forward.
+
+- **Loads.** Each K tile loads BK / 16 words per row and expands entry $c$ to $q = (w \gg 2 (c \bmod 16))\,\&\,3$,
+  then $\hat\delta = \ell + s q$ with the step $s$ and lowest level $\ell$ of group $\lfloor c / g \rfloor$: one per row
+  when $g \ge$ BK, else BK / $g$ per row, each spread over its group. Symmetric grids pass
+  $\ell = -s (L - 1) / 2$, built per call.
+- **Rounding.** $\ell + s q$ is computed in float32 and rounded once to the model dtype, as the materialised forward's
+  `addcmul`; then $W_b + \hat\delta$ in the model dtype.
+- **What carries over.** Split-K for decode, the persistent tile order, CUDA graphs and `torch.compile` (custom op
+  `shared_delta_moe::fused_moe_grid`); no TMA. Forward only: with a gradient the materialised path runs.
+- **Routed linear layers.** `RoutedDeltaLinear` ([per-expert attention deltas](../guide/routed-deltas.md)) reuses the
+  down kernel for its deltas alone, $\sum_i r_i \Delta_{e_i} x$, over a stride-0 zero base (every base load is the
+  same cached zero), and adds $W_b x$ from cuBLAS.
+- **Tests.** `tests/test_grid_kernel.py` (GPU): against the materialised forward for flat and two-level routing,
+  $k_1$ wider than a group, symmetric grids and groups 32-128, every config and split-K, CUDA graphs and
+  `torch.compile`.

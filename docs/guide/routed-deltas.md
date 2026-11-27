@@ -46,8 +46,11 @@ The deltas are stored in one of two ways:
   Each entry is $\hat\delta = \ell + s\,q$ with $q \in \{0, \dots, L-1\}$. At 2 bits with $g = 128$, that is 2.25 bits
   per entry.
 
-The forward is $W_b x$ for all tokens, plus a loop over the routed experts: `index_add` of
-$r \cdot \Delta_e x$ over that expert's rows. It is differentiable in the routing weights, the grid steps and lowest
+The forward is $W_b x$ for all tokens (cuBLAS) plus the routed deltas. With 2-bit grids on CUDA in bf16 / fp16 and
+no gradient needed anywhere, the deltas take one fused Triton launch: the MoE down kernel (mode 3 of
+`triton_kernels/fused.py`) over a zero base, decoding $\ell + s q$ tile by tile, with no host sync. Otherwise, or past
+$2^{28}$ (pair, output) entries (e.g. `lm_head` over a whole sequence), a loop over the routed experts: `index_add` of
+$r \cdot \Delta_e x$ over that expert's rows, differentiable in the routing weights, the grid steps and lowest
 levels, and dense deltas.
 
 ## Routing
@@ -168,5 +171,6 @@ with dense MLP deltas and 2-bit routed deltas. Its KL from that expert:
 This is 0.0002-0.0004 above the offline estimate for the same storage. The cause is not found yet; computing
 $W_b + \Delta_e$ first instead of the two products gives the same numbers.
 
-There is no fused kernel yet: the expert loop syncs with the host and makes a forward about twice as slow as the
-dense expert. The vLLM plugin refuses `routed_deltas` and grid MLP checkpoints ([vLLM](vllm.md)).
+Inference with 2-bit grids uses the fused kernels (MLP and routed deltas); the timing above is from the earlier
+loop. Training goes through the differentiable loop. The vLLM plugin refuses `routed_deltas` and grid MLP
+checkpoints ([vLLM](vllm.md)).

@@ -47,6 +47,8 @@ entry.
 
 ## Kernels and tensor parallelism
 
-Every forward is the materialised one for now: no fused or CUDA kernel reads the codes yet, and the vLLM plugin takes
+Without a gradient, 2-bit grids (3 or 4 levels) with a power-of-2 group run the fused Triton forward, which reads the
+codes directly ([fused Triton kernel](../internals/fused-triton.md), mode 3); other grids, and every forward that
+needs a gradient, run the materialised one. No CUDA (`packed_ops`) kernel reads the codes, and the vLLM plugin takes
 dense deltas only. For tensor parallelism over the intermediate dimension, the group must divide each rank's share of
 it (Qwen3.5-27B, I = 17408 over 8 ranks: 2176 columns, so group 128 or 64, not 256).
