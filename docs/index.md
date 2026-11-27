@@ -17,6 +17,7 @@ getting-started
 
 guide/deltamoe
 guide/hier
+guide/moe
 guide/delta-formats
 guide/qwen3_5
 guide/vllm

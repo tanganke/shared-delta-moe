@@ -68,11 +68,7 @@ Build one from a plain MoE with `DeltaMoE.from_experts(base, experts, router, to
 - `router`: the original router weight `(n+Z, H)`, with rows n..n+Z-1 routing to the base (if the base is expert 0 in the original MoE, move its row to the end first).
 - `num_zero_experts`: Z, default 1.
 
-The other way, `m.to_moe()` gives the plain MoE (`shared_delta_moe.MoE`): $N+Z$ full experts
-$[W_b+\Delta_1, \dots, W_b+\Delta_N] + [W_b]\times Z$ in `gate`/`up` `(E, I, H)` and `down` `(E, H, I)`, the same
-router and top-k, so it computes the same function (it is the baseline in the tests and benchmarks). Build one directly
-with `MoE.from_experts(experts, router, top_k)`; its forward is one `F.grouped_mm` per projection or a loop over the
-routed experts, both differentiable.
+The other way, `m.to_moe()` gives the same MoE with full experts stored: [Plain MoE](moe.md).
 
 transformers' fused layout maps over as `gate, up = gate_up_proj[e].chunk(2)` and `down = down_proj[e]`. In bf16, $W_b + (W_e - W_b)$ is not always exactly $W_e$ (about 0.6% of elements in our model).
 

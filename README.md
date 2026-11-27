@@ -84,7 +84,7 @@ main (pull requests build only).
 
 - [getting-started.md](docs/getting-started.md): install, one MoE layer, a whole model
 - User guide (`docs/guide/`): [deltamoe.md](docs/guide/deltamoe.md) (the delta form, zero experts, storage),
-  [hier.md](docs/guide/hier.md) (two-level routing), [delta-formats.md](docs/guide/delta-formats.md) with
+  [hier.md](docs/guide/hier.md) (two-level routing), [moe.md](docs/guide/moe.md) (the plain MoE / HierMoE, `to_moe()`), [delta-formats.md](docs/guide/delta-formats.md) with
   [dare.md](docs/guide/dare.md) and [bitdelta.md](docs/guide/bitdelta.md), [qwen3_5.md](docs/guide/qwen3_5.md)
   (converting Qwen3.5 models), [vllm.md](docs/guide/vllm.md), [training.md](docs/guide/training.md)
 - Internals (`docs/internals/`): [dispatch.md](docs/internals/dispatch.md) (which forward runs when),
