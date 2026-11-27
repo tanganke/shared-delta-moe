@@ -69,8 +69,24 @@ weights would round small updates away.
 - **Init.** $A$ is kaiming uniform, as `nn.Linear` initialises; $B$ is zero, so the output is unchanged at init.
 - **Zero experts.** A zero expert (the base alone) gets no LoRA. To give the base its own LoRA, store it as an
   all-zero delta.
-- **Forward path.** With LoRA, the block always runs the materialised per-expert loop on `weights(e)`. The fused
-  Triton, grouped and matrix forwards read the deltas directly, so they would skip the LoRA.
+- **Forward path.** With LoRA, the block runs the materialised per-expert loop on `weights(e)`. The fused Triton,
+  grouped and matrix forwards read the deltas directly, so they would skip the LoRA. The exception is a 2-bit
+  `GridDeltaMoE` on CUDA whose base and grids are frozen (only the router and the LoRA train). It decodes every
+  expert's $W_b + \Delta_e$ (`GridDeltaMoE._decoded`) and runs `lora.grouped_lora_moe`: grouped GEMMs over the
+  routed pairs, plus each projection's LoRA as a separate low-rank branch in the LoRA's dtype. The decoded weights
+  take no gradient. This path runs with or without grad, because a reentrant checkpoint's forward has no grad and
+  its recompute must take the same path. `tests/test_lora_grouped.py` checks it against the per-expert loop,
+  forward and gradients.
+Step time of M3_fixed (Qwen3.8-27B, layers 28-31 looped 3 times, 4 experts with r16 LoRA, top-2, fixed routing)
+on one H200, one row, gradient checkpointing:
+
+| Tokens | Materialised loop | Grouped |
+|---:|---:|---:|
+| 4096 | 2.24 s, 66.1 GiB | 2.02 s, 66.2 GiB |
+| 16384 | 8.38 s, 110.0 GiB | 8.20 s, 110.1 GiB |
+
+The MLPs of the 12 looped layer passes are a small part of the step, so the grouped path saves about 10% at 4096
+tokens and 2% at 16384.
 
 `tests/test_looped.py` checks the following:
 
