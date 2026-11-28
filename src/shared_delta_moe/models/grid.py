@@ -156,10 +156,13 @@ class GridDeltaMoE(PackedDeltaMoE):
         return self.kernel_ok() and super()._use_triton(x)
 
     def _use_decoded(self, x: Tensor) -> bool:
+        return self._needs_grad(x) and self._decodable(x)
+
+    def _decodable(self, x: Tensor) -> bool:
         # x in the weights' dtype, or (an fp32 residual stream) under autocast to it, which the GEMMs would cast to
         same = x.dtype == self.gate.dtype or (x.is_cuda and torch.is_autocast_enabled("cuda")
                                               and torch.get_autocast_dtype("cuda") == self.gate.dtype)  # fmt: skip
-        return (self._needs_grad(x) and self.kernel_ok() and self._router_only() and HAS_TRITON and x.is_cuda
+        return (self.kernel_ok() and self._router_only() and HAS_TRITON and x.is_cuda
                 and self.gate.dtype in GROUPED_DTYPES and same)  # fmt: skip
 
     def _decoded(self) -> list[Tensor]:
